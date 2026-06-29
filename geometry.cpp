@@ -1,4 +1,5 @@
 #include "MDL.h"
+#include <cmath>
 
 AxisAngle operator*(AxisAngle aa, const double & f){
     aa *= f;
@@ -58,7 +59,16 @@ double dot(const Vector & v, const Vector & v2){ //dot product
 }
 
 double Angle(const Vector & v, const Vector & v2){
-    return acos((v*v2)/(v.GetLength() * v2.GetLength()));
+    double fLength1 = v.GetLength();
+    double fLength2 = v2.GetLength();
+    double fDenominator = fLength1 * fLength2;
+    if(fDenominator <= 0.000000000001 || !std::isfinite(fDenominator)) return 0.0;
+
+    double fCos = (v * v2) / fDenominator;
+    if(fCos > 1.0) fCos = 1.0;
+    else if(fCos < -1.0) fCos = -1.0;
+
+    return acos(fCos);
 }
 
 Vector operator/(Vector v, const Vector & v2){ //cross product
@@ -137,8 +147,10 @@ void Vector::print(const std::string & sMsg){
     std::cout << sMsg << " fX=" << fX << ", fY=" << fY << ".\n";
 }
 Vector & Vector::operator*=(const Matrix22 & m){
-    fX = m.f11 * fX + m.f12 * fY;
-    fY = m.f21 * fX + m.f22 * fY;
+    double fOldX = fX;
+    double fOldY = fY;
+    fX = m.f11 * fOldX + m.f12 * fOldY;
+    fY = m.f21 * fOldX + m.f22 * fOldY;
     return *this;
 }
 Vector & Vector::operator*=(const double & f){
@@ -176,23 +188,17 @@ Vector & Vector::operator/=(const Vector & v){ //cross product
 }
 bool Vector::operator==(const Vector & v){
     //if(fX == v.fX && fY == v.fY && fZ == v.fZ) return true;
-    if(abs(fX-v.fX) < 0.001 && abs(fY-v.fY) < 0.001 && abs(fZ-v.fZ) < 0.001) return true;
+    if(abs(fX-v.fX) < 0.0001 && abs(fY-v.fY) < 0.0001 && abs(fZ-v.fZ) < 0.0001) return true;
     return false;
 }
 Vector & Vector::Rotate(const Quaternion & q){
     if(fX == 0.0 && fY == 0.0 && fZ == 0.0) return *this;
 
-    /// Optimization by Laurent Couvidou
-    *this = 2.0 * dot(q.vAxis, *this) * q.vAxis
-          + (q.fW * q.fW - dot(q.vAxis, q.vAxis)) * *this
-          + 2.0 * q.fW * cross(q.vAxis, *this);
-    /*
+    /// Use quaternion sandwich rotation with q.inverse(); the closed-form
+    /// unit-quaternion shortcut is not equivalent for non-unit data.
     Quaternion qVec (fX, fY, fZ, 0.0);
-    //std::cout << "Multiplication quaternion: " << q.Print() << "\n";
     qVec = (q * qVec) * q.inverse();
-    //std::cout << "Rotated Quaternion: " << qVec.vAxis.Print() << "\n";
     *this = qVec.vAxis;
-    */
     return *this;
 }
 double Vector::GetLength() const {
@@ -201,21 +207,13 @@ double Vector::GetLength() const {
 void Vector::Normalize(){
     double fNorm = GetLength();
     if(fNorm < 0.000001 || !std::isfinite(fNorm)){
-        /// 1.0 0.0 0.0 based on vanilla normals (in 003ebof for example, or p_g0t0) ?????????
-        *this = Vector(1.0, 0.0, 0.0);
+        /// Degenerate-vector handling.
+        *this = Vector(0.0, 0.0, 0.0);
     }
     else *this /= fNorm;
 }
 bool Vector::Compare(const Vector & v1, double fDiff){
-    /* */
-    if(abs(fX - v1.fX) < fDiff &&
-       abs(fY - v1.fY) < fDiff &&
-       abs(fZ - v1.fZ) < fDiff ) return true;
-    /* */
-
-    /// Alternative:
-    //if((*this - v1).GetLength() < fDiff) return true;
-    return false;
+    return ((*this - v1).GetLength() < fDiff);
 }
 bool Vector::Null(double fDiff){
     if(abs(fX) <= fDiff &&
@@ -269,10 +267,12 @@ Quaternion::Quaternion(const AxisAngle & aa){
 Quaternion & Quaternion::operator+=(const Quaternion & q){
     vAxis += q.vAxis;
     fW += q.fW;
+    return *this;
 }
 Quaternion & Quaternion::operator-=(const Quaternion & q){
     vAxis -= q.vAxis;
     fW -= q.fW;
+    return *this;
 }
 Quaternion & Quaternion::operator*=(const Quaternion & q){
     //double fW2 = fW * q.fW - dot(vAxis, q.vAxis);
@@ -308,6 +308,11 @@ double Quaternion::norm(){
 }
 Quaternion & Quaternion::normalize(){
     double fNorm = norm();
+    if(fNorm <= 0.000000000001 || !std::isfinite(fNorm)){
+        fW = 1.0;
+        vAxis = Vector(0.0, 0.0, 0.0);
+        return *this;
+    }
     fW/=fNorm;
     vAxis/=fNorm;
     return *this;
@@ -398,6 +403,14 @@ const Quaternion & Orientation::GetQuaternion(){
         return quaternion;
     }
 }
+
+Quaternion Orientation::GetQuaternionValue() const{
+    if(bQuaternion) return quaternion;
+    if(bAxisAngle) return Quaternion(axisangle);
+    std::cout << "WARNING! Getting quaternion value of an undetermined orientation!\n";
+    return quaternion;
+}
+
 const AxisAngle & Orientation::GetAxisAngle(){
     if(bAxisAngle) return axisangle;
     else if(bQuaternion){

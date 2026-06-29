@@ -1,10 +1,7 @@
 #ifndef GENERAL_H_INCLUDED
 #define GENERAL_H_INCLUDED
 
-#define _WIN32_WINNT 0x0501 //0x0602
-#define _WIN32_IE 0x0500 //0x601
-#include <windows.h>
-#include <commctrl.h>
+#include "win32_compat.h"
 #include <math.h>
 #include <array> //for std::array
 #include <iostream> //for std::cout
@@ -16,6 +13,8 @@
 
 #include "bead_winctrl.h"
 #include "resource.h"
+#include <cmath>
+#include <cctype>
 
 #define DEBUG_LEVEL 0
 
@@ -28,10 +27,8 @@ extern HWND hDisplayEdit;
 extern double PI;
 extern bool bShowHex;
 char DecToHexDigit(int nDec);
-void CharsToHex(char * cOutput, std::vector<char> & cInput, int nOffset, int nNumber);
-void CharsToHex(std::string & sOutput, std::vector<char> & cInput, int nOffset, int nNumber);
+void CharsToHex(char * cOutput, const std::vector<char> & cInput, int nOffset, int nNumber);
 void AddSignificantZeroes(char * cInt, int nSignificant);
-void AddSignificantZeroes(std::string & sInt, int nSignificant);
 void TruncateDec(TCHAR * tcString);
 std::string TruncateDec(std::string sCopy);
 void PrepareCharForDisplay(char * cChar);
@@ -42,11 +39,13 @@ double deg(double rad);
 double rad(double deg);
 double RoundDec(double fNumber, int nDecPlaces);
 double RoundDec(float fNumber, int nDecPlaces);
+unsigned int FloatBits(float value);
+float FloatFromBits(unsigned int bits);
 bool bCursorOnLine(POINT pt, POINT ptLine1, POINT ptLine2, int nOffset);
 std::string PrepareFloat(double fFloat, bool bFiniteOnly = true);
-unsigned int stou(std::string const & str, size_t * idx = 0, int base = 10);
-std::string safesubstr(const std::string & sParam, size_t nStart, size_t nLen = std::string::npos);
-std::wstring safesubstr(const std::wstring & sParam, size_t nStart, size_t nLen = std::wstring::npos);
+unsigned int stou(std::string const & str, unsigned int * idx = nullptr, int base = 10);
+std::string safesubstr(const std::string & sParam, unsigned int nStart, unsigned int nLen = ~0u);
+std::wstring safesubstr(const std::wstring & sParam, unsigned int nStart, unsigned int nLen = ~0u);
 int Error(std::string sErrorMessage);
 int WarningCancel(std::string sWarningMessage);
 int WarningYesNo(std::string sWarningMessage);
@@ -60,6 +59,11 @@ int Warning(std::wstring sWarningMessage);
 void ClearStringstream(std::stringstream & ssClearMe);
 std::string to_ansi(const std::wstring & wString);
 std::wstring to_wide(const std::string & sString);
+void ToLowerInPlace(std::string & s);
+void PrepareFileDialogBuffer(std::wstring & sBuffer, unsigned int nMaxChars = MAX_PATH);
+void TrimFileDialogBuffer(std::wstring & sBuffer);
+std::wstring ParentPath(const std::wstring & sPath);
+std::wstring JoinPath(const std::wstring & sDirectory, const std::wstring & sFilename);
 bool StringEqual(const std::string & s1, const std::string & s2, bool bCaseSensitive = false);
 
 struct MenuLineAdder{
@@ -73,50 +77,24 @@ struct Version{
     unsigned int nPatch;
     bool bBeta = false;
     Version(unsigned int n1, unsigned int n2, unsigned int n3, bool bB): nMajor(n1), nMinor(n2), nPatch(n3), bBeta(bB) {}
-    std::string Print(){
-        return (std::string("v") + std::to_string(nMajor) + "." + std::to_string(nMinor) + "." + std::to_string(nPatch) + (bBeta ? " - BETA" : ""));
-    }
+    std::string Print();
 };
 
 class Timer{
     DWORD nReferenceTime = 0;
   public:
     Timer(){
-        nReferenceTime = timeGetTime();
+        nReferenceTime = GetTickCount();
     }
-    void StartTimer(){
-        nReferenceTime = timeGetTime();
-    }
-    std::string GetTime(bool bRestart = false){
-        DWORD nNewTime = timeGetTime();
-        int nSeconds = 0;
-        int nMiliseconds = 0;
-        if(nNewTime < nReferenceTime){
-            DWORD dwMaxVal = 0;
-            dwMaxVal = ~dwMaxVal;
-            nSeconds = ((dwMaxVal - nReferenceTime) + nNewTime)/1000;
-            nMiliseconds = ((dwMaxVal - nReferenceTime) + nNewTime)%1000;
-        }
-        else{
-            nSeconds = (nNewTime - nReferenceTime)/1000;
-            nMiliseconds = (nNewTime - nReferenceTime)%1000;
-        }
-        if(bRestart) nReferenceTime = nNewTime;
-        return (std::to_string(nSeconds) + "." + (nMiliseconds < 100 ? "0" : "") + (nMiliseconds < 10 ? "0" : "") + std::to_string(nMiliseconds) + "s");
-    }
+    std::string GetTime(bool bRestart = false);
 };
 
 class mdlexception: public std::exception {
     std::string sException;
   public:
-    mdlexception() {}
-    mdlexception(const std::string & sNew): sException(sNew) {}
-    virtual const char* what() const throw() {
-        return sException.c_str();
-    }
-    void SetText(const std::string & sNew){
-        sException = sNew;
-    }
+    mdlexception(const std::string & sNew);
+    virtual ~mdlexception();
+    virtual const char* what() const throw();
 };
 
 #endif // GENERAL_H_INCLUDED

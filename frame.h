@@ -63,10 +63,6 @@ class Frame{
     static LRESULT CALLBACK FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     Frame(HINSTANCE hInstanceCreate);
     bool Run(int nCmdShow);
-    HWND GetHwnd(){
-        return hMe;
-    }
-
 };
 
 class Edits{
@@ -92,7 +88,6 @@ class Edits{
     std::vector<int> * nKnownArray = nullptr;
     std::vector<char> * sCompareBuffer = nullptr;
     std::vector<char> * sBuffer = nullptr;
-    HTREEITEM htHoverItem = NULL;
 
   public:
     static HWND hIntEdit;
@@ -102,8 +97,7 @@ class Edits{
     Edits();
     bool Run(HWND hParent, UINT nID);
     friend LRESULT CALLBACK EditsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
-    void ScrollEdit();
-
+    friend void ScrollToData(MDL & Mdl, std::vector<std::string> cItem, LPARAM lParam, int nFile);
     int Compare(unsigned nPos);
     void Cleanup();
     void LoadData();
@@ -114,7 +108,9 @@ class Edits{
     void Resize();
     void DetermineSelection();
     void UpdateStatusBar(bool bCheck = true);
-    void UpdateStatusPosition();
+    void UpdateStatusPositionModel();
+    void UpdateStatusPositionMdx();
+    void UpdateStatusPositionBwm(const std::string & sType);
     void PrintValues(bool bCheck = true);
 };
 
@@ -128,14 +124,13 @@ extern MDL Model;
 extern ReportObject ReportModel;
 extern bool bSaveReport;
 extern bool bShowDiff;
-extern bool bShowCmpHilite;
 extern bool bShowDataStruct;
 extern bool bShowGroup;
 extern bool bHexLocation;
 extern bool bModelHierarchy;
 extern HFONT hMonospace, hShell, hTimes;
 void ManageIni(IniConst Action);
-std::vector<DataRegion> * GetDataRegions(const std::vector<std::string> & cItem, LPARAM lParam);
+void ScrollToData(MDL & Mdl, std::vector<std::string> cItem, LPARAM lParam, int nFile);
 void ProcessTreeAction(HTREEITEM hItem, const int & nAction, void * Pointer = NULL);
 
 /// edits.cpp
@@ -145,13 +140,10 @@ COLORREF DataColor(int nDataKnown, bool bHilite);
 extern bool bDotAsciiDefault;
 bool FileEditor(HWND hwnd, int nID, std::wstring & cFile);
 void ProgressSize(int nMin, int nMax);
-void ProgressSetStep(int nStep);
-void ProgressStepIt();
 void ProgressPos(int nPos);
 void Report(std::string sMessage);
 INT_PTR CALLBACK ProgressProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 INT_PTR CALLBACK ProgressMassProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
-void ProcessCommandLineCall(int argc, LPSTR* argv);
 
 /// Settings.cpp
 INT_PTR CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);

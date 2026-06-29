@@ -21,7 +21,7 @@ DialogWindow::DialogWindow(){
     // #1 Basics
     WindowClass.cbSize = sizeof(WNDCLASSEX); // Must always be sizeof(WNDCLASSEX)
     WindowClass.lpszClassName = cClassName; // Name of this class
-    WindowClass.hInstance = GetModuleHandle(NULL); // Instance of the application
+    WindowClass.hInstance = GetModuleHandle(nullptr); // Instance of the application
     WindowClass.lpfnWndProc = DialogWindowProc; // Pointer to callback procedure
 
     // #2 Class styles
@@ -34,8 +34,8 @@ DialogWindow::DialogWindow(){
     WindowClass.hCursor = LoadCursor(NULL, IDC_ARROW); // Class cursor
 
     // #5 Icon
-    WindowClass.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Class Icon
-    WindowClass.hIconSm = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Small icon for this class
+    WindowClass.hIcon = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Class Icon
+    WindowClass.hIconSm = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Small icon for this class
 
     // #6 Menu
     WindowClass.lpszMenuName = NULL; // Menu Resource
@@ -55,9 +55,9 @@ bool DialogWindow::Run(){
         bRegistered = true;
     }
     //HMENU HAS to be NULL!!!!! Otherwise the function fails to create the window!
-    hMe = CreateWindowEx(NULL, WindowClass.lpszClassName, "", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    hMe = CreateWindowEx(0, WindowClass.lpszClassName, "", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                          CW_USEDEFAULT, CW_USEDEFAULT, 600, 300,
-                         HWND_DESKTOP, NULL, GetModuleHandle(NULL), NULL);
+                         HWND_DESKTOP, nullptr, GetModuleHandle(nullptr), nullptr);
     if(!hMe) return false;
     ShowWindow(hMe, true);
     return true;
@@ -89,15 +89,15 @@ LRESULT CALLBACK DialogWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
                 "Consolas" 	// pointer to typeface name string
             );
             GetClientRect(hwnd, &rcClient);
-            hEdit = CreateWindowEx(NULL, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOHSCROLL | ES_AUTOVSCROLL | WS_VSCROLL,
+            hEdit = CreateWindowEx(0, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOHSCROLL | ES_AUTOVSCROLL | WS_VSCROLL,
                            rcClient.left+3, rcClient.top, rcClient.right-3, rcClient.bottom,
-                           hwnd, (HMENU) IDDB_EDIT, GetModuleHandle(NULL), NULL);
+                           hwnd, (HMENU) IDDB_EDIT, GetModuleHandle(nullptr), nullptr);
             SendMessage(hEdit, WM_SETFONT, (WPARAM) hFont1, MAKELPARAM(TRUE, 0));
         }
         break;
         case WM_SIZE:
         {
-            SetWindowPos(hEdit, NULL, rcClient.left+3, rcClient.top, rcClient.right-3, rcClient.bottom, NULL);
+            SetWindowPos(hEdit, nullptr, rcClient.left+3, rcClient.top, rcClient.right-3, rcClient.bottom, 0);
             //InvalidateRect(hwnd, &rcClient, false);
         }
         break;
@@ -158,8 +158,8 @@ void OpenViewer(MDL & Mdl, std::vector<std::string>cItem, LPARAM lParam){
         else{
             sLocation = "Animations > " + std::string(Data.Animations[ctrl->nAnimation].sName.c_str()) + " > ";
         }
-        MdlInteger<unsigned short> nNodeIndex = Mdl.GetNodeIndexByNameIndex(ctrl->nNameIndex);
-        if(!nNodeIndex.Valid()) throw mdlexception("Vertex normal and tangent space vector calculation error: dealing with a name index that does not have a node in geometry.");
+        int nNodeIndex = Mdl.GetNodeIndexByNameIndex(ctrl->nNameIndex);
+        if(nNodeIndex == -1) throw mdlexception("Vertex normal and tangent space vector calculation error: dealing with a name index that does not have a node in geometry.");
         std::string sController = ReturnControllerName(ctrl->nControllerType, Data.ArrayOfNodes.at(nNodeIndex).Head.nType);
         if(ctrl->nColumnCount & 16) sController += "bezierkey";
         else if(ctrl->nAnimation.Valid()) sController += "key";

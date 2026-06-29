@@ -1,6 +1,6 @@
 #include "general.h"
 #include "MDL.h"
-#include <Shlwapi.h>
+#include <shlwapi.h>
 #include <fstream>
 #include <regex>
 #include <algorithm>
@@ -27,7 +27,7 @@ HelpDlgWindow::HelpDlgWindow(){
     // #1 Basics
     WindowClass.cbSize = sizeof(WNDCLASSEX); // Must always be sizeof(WNDCLASSEX)
     WindowClass.lpszClassName = cClassName; // Name of this class
-    WindowClass.hInstance = GetModuleHandle(NULL); // Instance of the application
+    WindowClass.hInstance = GetModuleHandle(nullptr); // Instance of the application
     WindowClass.lpfnWndProc = HelpDlgWindowProc; // Pointer to callback procedure
 
     // #2 Class styles
@@ -40,8 +40,8 @@ HelpDlgWindow::HelpDlgWindow(){
     WindowClass.hCursor = LoadCursor(NULL, IDC_ARROW); // Class cursor
 
     // #5 Icon
-    WindowClass.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Class Icon
-    WindowClass.hIconSm = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_DLG_ICON)); // Small icon for this class
+    WindowClass.hIcon = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Class Icon
+    WindowClass.hIconSm = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_DLG_ICON)); // Small icon for this class
 
     // #6 Menu
     WindowClass.lpszMenuName = NULL; // Menu Resource
@@ -61,9 +61,9 @@ bool HelpDlgWindow::Run(){
         bRegistered = true;
     }
     //HMENU *has* to be NULL!!!!! Otherwise the function fails to create the window!
-    hMe = CreateWindowEx(NULL, WindowClass.lpszClassName, "", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    hMe = CreateWindowEx(0, WindowClass.lpszClassName, "", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                          CW_USEDEFAULT, CW_USEDEFAULT, 400, 600,
-                         HWND_DESKTOP, NULL, GetModuleHandle(NULL), this);
+                         HWND_DESKTOP, nullptr, GetModuleHandle(nullptr), this);
     if(!hMe) return false;
     ShowWindow(hMe, true);
     return true;
@@ -76,15 +76,12 @@ LRESULT CALLBACK HelpDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
     GetClientRect(hwnd, &rcClient);
     HWND hTabs = GetDlgItem(hwnd, IDC_TABS);
     HWND hEdit = GetDlgItem(hwnd, IDDB_EDIT);
-    HelpDlgWindow* helpdlg = nullptr;
-    if(GetWindowLongPtr(hwnd, GWLP_USERDATA) != 0) helpdlg = (HelpDlgWindow*) GetWindowLongPtr(hwnd, GWLP_USERDATA);
 
     /* handle the messages */
     switch(message){
         case WM_CREATE:
         {
             SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR) ((CREATESTRUCT*) lParam)->lpCreateParams);
-            helpdlg = (HelpDlgWindow*) ((CREATESTRUCT*) lParam)->lpCreateParams;
 
             std::string sMonospace = "Consolas";
             if(!Font_IsInstalled(sMonospace)){
@@ -95,22 +92,6 @@ LRESULT CALLBACK HelpDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
                 }
             }
 
-            HFONT hFont1 = CreateFont(
-                14, //Size
-                0,  //??
-                0,  //??
-                0,  //??
-                FW_REGULAR, // font weight
-                FALSE,	    // italic attribute flag
-                FALSE,	    // underline attribute flag
-                FALSE,	    // strikeout attribute flag
-                DEFAULT_CHARSET,	    // character set identifier
-                OUT_DEFAULT_PRECIS	,	// output precision
-                CLIP_DEFAULT_PRECIS	,	// clipping precision
-                DEFAULT_QUALITY	,	    // output quality
-                DEFAULT_PITCH | FF_DONTCARE	,	// pitch and family
-                sMonospace.c_str() 	// pointer to typeface name string
-            );
             HFONT hFont4 = CreateFont(
                 12,  //Height
                 0,  //Width
@@ -129,13 +110,13 @@ LRESULT CALLBACK HelpDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
             );
 
             GetClientRect(hwnd, &rcClient);
-            hTabs = CreateWindowEx(NULL, WC_TABCONTROL, "", WS_VISIBLE | WS_CHILD | TCS_FOCUSNEVER | TCS_MULTILINE,
+            hTabs = CreateWindowEx(0, WC_TABCONTROL, "", WS_VISIBLE | WS_CHILD | TCS_FOCUSNEVER | TCS_MULTILINE,
                                    rcClient.left, rcClient.top, rcClient.right + 2, rcClient.bottom + 1,
-                                   hwnd, (HMENU) IDC_TABS, GetModuleHandle(NULL), NULL);
+                                   hwnd, (HMENU) IDC_TABS, GetModuleHandle(nullptr), nullptr);
             SendMessage(hTabs, WM_SETFONT, (WPARAM) hFont4, MAKELPARAM(TRUE, 0));
-            hEdit= CreateWindowEx(NULL, "EDIT", "", WS_VISIBLE | WS_CHILD | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
+            hEdit= CreateWindowEx(0, "EDIT", "", WS_VISIBLE | WS_CHILD | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
                                    rcClient.left + 5, rcClient.top + 18 * TabCtrl_GetRowCount(hTabs) + 6, rcClient.right - 8, rcClient.bottom - 18 * TabCtrl_GetRowCount(hTabs) - 9,
-                                   hwnd, (HMENU) IDDB_EDIT, GetModuleHandle(NULL), NULL);
+                                   hwnd, (HMENU) IDDB_EDIT, GetModuleHandle(nullptr), nullptr);
             SendMessage(hEdit, WM_SETFONT, (WPARAM) hFont4, MAKELPARAM(TRUE, 0));
 
             TabCtrl_AppendTab(hTabs, "Basics");
@@ -155,9 +136,8 @@ LRESULT CALLBACK HelpDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         case WM_NOTIFY:
         {
             NMHDR * nmhdr = (NMHDR *) lParam;
-            HWND hControl = nmhdr->hwndFrom;
             int nID = nmhdr->idFrom;
-            int nNotification = nmhdr->code;
+            UINT nNotification = nmhdr->code;
             switch(nID){
                 case IDC_TABS:
                 {
@@ -171,9 +151,7 @@ LRESULT CALLBACK HelpDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         break;
         case WM_COMMAND:
         {
-            int nNotification = HIWORD(wParam);
             int nID = LOWORD(wParam);
-            HWND hControl = (HWND) lParam;
             switch(nID){
                 case IDDB_SAVE:
                 {
@@ -184,8 +162,8 @@ LRESULT CALLBACK HelpDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARA
         break;
         case WM_SIZE:
         {
-            SetWindowPos(hTabs, NULL, rcClient.left, rcClient.top, rcClient.right + 2, rcClient.bottom + 1, NULL);
-            SetWindowPos(hEdit, NULL, rcClient.left + 5, rcClient.top + 18 * TabCtrl_GetRowCount(hTabs) + 6, rcClient.right - 8, rcClient.bottom - 18 * TabCtrl_GetRowCount(hTabs) - 9, NULL);
+            SetWindowPos(hTabs, nullptr, rcClient.left, rcClient.top, rcClient.right + 2, rcClient.bottom + 1, 0);
+            SetWindowPos(hEdit, nullptr, rcClient.left + 5, rcClient.top + 18 * TabCtrl_GetRowCount(hTabs) + 6, rcClient.right - 8, rcClient.bottom - 18 * TabCtrl_GetRowCount(hTabs) - 9, 0);
         }
         break;
         case WM_CTLCOLORSTATIC:
@@ -228,7 +206,6 @@ void OpenHelpDlg(){
 std::string GetHelpData(const std::string & sTab){
     std::stringstream ssHelp;
     //char nl [] = "\r\n"; /// New Line
-    char sl [] = ""; /// Same Line
     if(sTab == "Basics"){
         ssHelp <<
            "MDLedit allows you to compile and decompile models for the games:"
@@ -412,8 +389,8 @@ std::string GetHelpData(const std::string & sTab){
            "Vertex normals are calculated by putting together the face normals vectors of all the faces that the vertex either belongs to or smooths to "
            "(the faces the vertex smooths to maybe be in other elements or meshes as well). "
            "Whether the vertex smooths to that face is determined from the smoothing groups that are given for every face. If a face the vertex belongs to "
-           "has at least one matching smoothing group with another face, then the other face's normal is calculated in as well, provided the other face has "
-           "a vertex in the same position as our vertex under consideration."
+           "has at least one matching smoothing group with another face, then this other face's normal is calculated in as well. "
+           "Provided the other face has a vertex in the same position as our vertex under consideration, of course."
         nl ""
         nl "There are "
            "three options that affect the vertex normal calculation at this point. They can be found in Edit -> Settings."
@@ -432,7 +409,7 @@ std::string GetHelpData(const std::string & sTab){
            "because of it's smoothing group setup the vertex normal may be unwantedly affected by certain faces which may cause it to point in a wrong direction. "
            "In the game, this will appear as a black or shaded spot around the problematic vertex."
         nl ""
-        nl "When loading a binary model, MDLedit will try to calculate the smoothing groups from the vertex normals (if the option 'Recalculate vectors' is enabled under Edit -> Settings). "
+        nl "When loading a binary model, MDLedit will try to calculate the smoothing groups from the vertex normals (if this is enabled under Edit -> Settings). "
            "It does that by calculating the vertex normal "
            "based on every possible combination of smoothing groups on the surrounding faces and looks for a match. "
            "Since this vertex normal calculation also uses the options under "
@@ -456,7 +433,7 @@ std::string GetHelpData(const std::string & sTab){
 
 
 #define nl "\r\n"
-INT_PTR CALLBACK AboutProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam){
+INT_PTR CALLBACK AboutProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM /*lParam*/){
     switch(message){
         case WM_INITDIALOG:
         {

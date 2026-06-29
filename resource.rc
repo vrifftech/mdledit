@@ -1,7 +1,7 @@
 #include <windows.h>
 #include "resource.h"
 
-1 RT_MANIFEST "/manifest.xml"
+1 RT_MANIFEST "manifest.xml"
 
 ID_CUR_DRAG CURSOR "cursor.cur"
 
@@ -9,14 +9,39 @@ IDI_ICON ICON "mdleditico4_64_24.ico"
 IDI_ICON2 ICON "mdleditico4_64_16.ico"
 IDI_DLG_ICON ICON "mdleditdlgico.ico"
 
-MdleditAccel ACCELERATORS
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION MDLEDIT_VERSION_MAJOR,MDLEDIT_VERSION_MINOR,MDLEDIT_VERSION_PATCH,MDLEDIT_VERSION_BUILD
+ PRODUCTVERSION MDLEDIT_VERSION_MAJOR,MDLEDIT_VERSION_MINOR,MDLEDIT_VERSION_PATCH,MDLEDIT_VERSION_BUILD
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x9L
+#else
+ FILEFLAGS 0x8L
+#endif
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
 BEGIN
-    "O", IDM_MDL_OPEN,      CONTROL, VIRTKEY
-    "S", IDM_ASCII_SAVE,    CONTROL, VIRTKEY
-    "B", IDM_BIN_SAVE,      CONTROL, VIRTKEY
-    "D", IDM_SHOW_DIFF,     CONTROL, VIRTKEY
-    "H", IDM_VIEW_HEX,      CONTROL, VIRTKEY
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "MDLedit"
+            VALUE "FileDescription", "MDLedit"
+            VALUE "FileVersion", MDLEDIT_VERSION_STRING
+            VALUE "InternalName", "mdledit"
+            VALUE "OriginalFilename", "mdledit.exe"
+            VALUE "ProductName", "MDLedit"
+            VALUE "ProductVersion", MDLEDIT_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
 END
+
+
 
 DLG_SETTINGS DIALOGEX  20, 10, 390, 135
 STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
@@ -31,7 +56,7 @@ BEGIN
     EDITTEXT DLG_ID_CREASE_ANGLE_DEG, 72, 56, 18, 11, ES_NUMBER
 
     GROUPBOX "Reading Model", DLG_ID_STATIC, 10, 76, 180, 49 // y-size (last) is 13 + n * 12
-    AUTOCHECKBOX "Recalculate vectors (Reading binary)", DLG_ID_CALC_SMOOTHING, 15, 88, 160, 8
+    AUTOCHECKBOX "Calculate Smoothing Groups (Reading binary)", DLG_ID_CALC_SMOOTHING, 15, 88, 160, 8
     AUTOCHECKBOX "Minimize (weld) vertices (Reading ascii)", DLG_ID_MIN_VERT, 15, 100, 160, 8
     AUTOCHECKBOX "Save report automatically", DLG_ID_SAVE_REPORT, 15, 112, 160, 8
 
@@ -88,11 +113,11 @@ IDM_MAIN MENU DISCARDABLE
 BEGIN
     POPUP " &File "
         BEGIN
-        MENUITEM "&Load ...\tCtrl+O", IDM_MDL_OPEN
+        MENUITEM "&Load ...", IDM_MDL_OPEN
         POPUP "Save", GRAYED
             BEGIN
-            MENUITEM "&Binary ...\tCtrl+B", IDM_BIN_SAVE
-            MENUITEM "&ASCII ...\tCtrl+S", IDM_ASCII_SAVE
+            MENUITEM "&Binary ...", IDM_BIN_SAVE
+            MENUITEM "&ASCII ...", IDM_ASCII_SAVE
             END
         POPUP "Batch"
             BEGIN
@@ -110,17 +135,15 @@ BEGIN
         END
     POPUP " &View "
         BEGIN
-        MENUITEM "&Hex Mode\tCtrl+H", IDM_VIEW_HEX
-        MENUITEM SEPARATOR
+        MENUITEM "&Hex Mode", IDM_VIEW_HEX
         MENUITEM "&Group Bytes by Data Type", IDM_SHOW_GROUP
         MENUITEM "&Show Data Struct Boundaries", IDM_SHOW_DATASTRUCT
-        MENUITEM "&Auto Scroll to Binary Data", IDM_AUTO_SCROLL
         MENUITEM SEPARATOR
         MENUITEM "&Tree View: Linear", IDM_TREE_SORT_LIN
         MENUITEM "&Tree View: Hierarchical", IDM_TREE_SORT_HIE
         MENUITEM SEPARATOR
         MENUITEM "&Compare to ...", IDM_BIN_COMPARE, GRAYED
-        MENUITEM "&Show Differences\tCtrl+D", IDM_SHOW_DIFF, GRAYED, CHECKED
+        MENUITEM "&Show Differences", IDM_SHOW_DIFF, GRAYED, CHECKED
         MENUITEM SEPARATOR
         MENUITEM "&Show Report", IDM_SHOW_REPORT, GRAYED
         END

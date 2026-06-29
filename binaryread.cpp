@@ -1,5 +1,7 @@
 #include "MDL.h"
+#include <limits>
 #include <algorithm>
+#include <utility>
 
 /**
     Functions:
@@ -8,27 +10,165 @@
     MDL::DecompileModel()
     MDL::ParseAabb()
     MDL::ParseNode()
-/**/
+*/
 
 bool bReadSmoothing = false;
 
+namespace {
+    unsigned int MdlDataOffset(unsigned int relativeOffset, const std::string & context){
+        if(relativeOffset > std::numeric_limits<unsigned int>::max() - MDL_OFFSET){
+            throw mdlexception(context + " offset is outside the MDL data buffer.");
+        }
+        return static_cast<unsigned int>(MDL_OFFSET + relativeOffset);
+    }
+
+    unsigned int MdlArrayDataOffset(const ArrayHead & array, const std::string & context){
+        if(array.nCount != array.nCount2){
+            throw mdlexception(context + " array header count fields do not match; refusing to guess which count is authoritative.");
+        }
+        if(array.nCount == 0){
+            return 0;
+        }
+        if(array.nOffset == 0){
+            throw mdlexception(context + " array has a non-zero count but a zero data offset; refusing to read data from the wrong region.");
+        }
+        return MdlDataOffset(array.nOffset, context);
+    }
+
+    unsigned int RequiredMdlDataOffset(unsigned int relativeOffset, const std::string & context){
+        if(relativeOffset == 0){
+            throw mdlexception(context + " offset is zero even though data is required; refusing to read from the wrong region.");
+        }
+        return MdlDataOffset(relativeOffset, context);
+    }
+
+    MdlInteger<unsigned short> SignedIntToUShortOrInvalid(int nValue, const std::string & context){
+        if(nValue == -1) return MdlInteger<unsigned short>();
+        if(nValue < -1){
+            throw mdlexception(context + " contains a negative value other than -1; refusing to reinterpret it as a valid 16-bit index.");
+        }
+        const int nInvalid = static_cast<int>(std::numeric_limits<unsigned short>::max());
+        if(nValue >= nInvalid){
+            throw mdlexception(context + " is outside the valid 16-bit MDL index range.");
+        }
+        return MdlInteger<unsigned short>(static_cast<unsigned short>(nValue));
+    }
+
+    std::string DebugCStringAt(const std::vector<char> & buffer, unsigned offset){
+        if(offset >= buffer.size()) return std::string("<out of range>");
+        auto begin = buffer.begin() + offset;
+        auto end = std::find(begin, buffer.end(), '\0');
+        return std::string(begin, end);
+    }
+
+    template <class F>
+    class ScopeExit{
+        F fn;
+        bool active = true;
+      public:
+        explicit ScopeExit(F f) : fn(std::move(f)) {}
+        ScopeExit(const ScopeExit&) = delete;
+        ScopeExit& operator=(const ScopeExit&) = delete;
+        ScopeExit(ScopeExit && other) : fn(std::move(other.fn)), active(other.active) { other.active = false; }
+        ScopeExit& operator=(ScopeExit &&) = delete;
+        void Dismiss(){ active = false; }
+        ~ScopeExit(){ if(active) fn(); }
+    };
+
+    template <class F>
+    ScopeExit<F> MakeScopeExit(F f){
+        return ScopeExit<F>(std::move(f));
+    }
+
+    template <class T>
+    void ResizeBinaryVector(std::vector<T> & values, unsigned int nCount, const std::string & context){
+        if(static_cast<std::size_t>(nCount) > values.max_size()){
+            throw mdlexception(context + " count is too large to allocate safely.");
+        }
+        values.resize(static_cast<std::size_t>(nCount));
+    }
+
+    unsigned int BwmArrayOffset(unsigned int nCount, unsigned int nOffset, unsigned int nStride, std::size_t nBufferSize, const std::string & context){
+        if(nCount == 0) return 0;
+        if(nOffset == 0){
+            throw mdlexception(context + " has a non-zero count but a zero data offset; refusing to read data from the header/unknown region.");
+        }
+        if(nStride != 0 && nCount > std::numeric_limits<unsigned int>::max() / nStride){
+            throw mdlexception(context + " byte size overflows 32-bit BWM offsets.");
+        }
+        const std::size_t nBytes = static_cast<std::size_t>(nCount) * static_cast<std::size_t>(nStride);
+        if(static_cast<std::size_t>(nOffset) > nBufferSize || nBytes > nBufferSize - static_cast<std::size_t>(nOffset)){
+            throw mdlexception(context + " data range points outside the binary buffer; refusing to allocate or read malformed data.");
+        }
+        return nOffset;
+    }
+
+    unsigned short MaxNameIndexInTree(const Node & node){
+        if(!node.Head.nNameIndex.Valid()){
+            throw mdlexception("Binary node tree contains a node with an invalid name index.");
+        }
+
+        unsigned short nMax = static_cast<unsigned short>(node.Head.nNameIndex);
+        for(const Node & child : node.Head.Children){
+            if(child.nOffset == 0) continue;
+            const unsigned short nChildMax = MaxNameIndexInTree(child);
+            if(nChildMax > nMax) nMax = nChildMax;
+        }
+        return nMax;
+    }
+
+    void EnsureFlattenedNodeSlotAvailable(const std::vector<Node> & nodes, unsigned short nNameIndex){
+        if(nNameIndex >= nodes.size()){
+            throw mdlexception("LinearizeGeometry() error: node name index is outside the flattened node array.");
+        }
+        if(nodes.at(nNameIndex).Head.nNameIndex.Valid() || nodes.at(nNameIndex).Head.nType != 0 || nodes.at(nNameIndex).nOffset != 0){
+            throw mdlexception("LinearizeGeometry() error: duplicate geometry node name index would overwrite an existing node.");
+        }
+    }
+}
+
+
 /// Linearize the nodes from being contained inside one another to the ArrayOfNodes in Name Index order.
 void MDL::LinearizeGeometry(Node & node, std::vector<Node> & ArrayOfNodes){
-    for(Node & child : node.Head.Children){
+    if(!node.Head.nNameIndex.Valid()){
+        throw mdlexception("LinearizeGeometry() error: node name index is invalid.");
+    }
+
+    const unsigned short nNameIndex = static_cast<unsigned short>(node.Head.nNameIndex);
+    if(nNameIndex >= ArrayOfNodes.size()){
+        throw mdlexception("LinearizeGeometry() error: node name index is outside the flattened node array.");
+    }
+
+    // Detach the parsed child tree before moving this node into the flat output.
+    // The flat model uses ChildIndices for hierarchy; keeping moved-from child
+    // vectors in the flattened nodes wastes memory and can expose stale state.
+    std::vector<Node> children = std::move(node.Head.Children);
+    node.Head.Children.clear();
+
+    for(Node & child : children){
         if(child.nOffset != 0) LinearizeGeometry(child, ArrayOfNodes);
     }
-    ArrayOfNodes.at(node.Head.nNameIndex) = std::move(node);
+
+    // Check at assignment time too, so a descendant or sibling with the same
+    // name index cannot be silently overwritten.
+    EnsureFlattenedNodeSlotAvailable(ArrayOfNodes, nNameIndex);
+    ArrayOfNodes.at(nNameIndex) = std::move(node);
 }
 
 /// Linearize the nodes from being contained inside one another to the ArrayOfNodes in Node Index order (root first, then first child, its first child, etc.).
-void MDL::LinearizeAnimation(Node & node, std::vector<Node> & ArrayOfNodes){
-    ModelHeader & Data = FH->MH;
+void MDL::LinearizeAnimation(Node & node, std::vector<Node> & ArrayOfNodes, int nChildIndex){
+    (void)nChildIndex;
+
+    // Do not recurse through references inside ArrayOfNodes after push_back().
+    // Appending descendants can reallocate the vector and invalidate those
+    // references. Detach children first and recurse over the stable local tree.
+    std::vector<Node> children = std::move(node.Head.Children);
+    node.Head.Children.clear();
 
     ArrayOfNodes.push_back(std::move(node));
-    Node & node1 = ArrayOfNodes.back();
-    for(unsigned int n = 0; n < node1.Head.Children.size(); n++){
-        Node & child = node1.Head.Children.at(n);
-        if(child.nOffset != 0) LinearizeAnimation(child, ArrayOfNodes);
+    for(unsigned int n = 0; n < children.size(); n++){
+        Node & child = children.at(n);
+        if(child.nOffset != 0) LinearizeAnimation(child, ArrayOfNodes, n);
     }
 }
 
@@ -37,38 +177,53 @@ void MDL::LinearizeAnimation(Node & node, std::vector<Node> & ArrayOfNodes){
 void MDL::DecompileModel(bool bMinimal){
     if(sBuffer.empty()) return;
 
+    std::unique_ptr<FileHeader> pNewFileData(new FileHeader());
+    std::unique_ptr<FileHeader> pOldFileData = std::move(FH);
+    const ModelSource oldSource = src;
+    const bool oldK2 = bK2;
+    const bool oldXbox = bXbox;
+    const int oldSupermodel = nSupermodel;
+    const bool oldReadSmoothing = bReadSmoothing;
+    const BufferState oldBufferState = CaptureBufferState();
+    FH = std::move(pNewFileData);
     src = BinarySource;
+    auto restoreReadState = MakeScopeExit([&](){
+        RestoreBufferState(oldBufferState);
+        FH = std::move(pOldFileData);
+        src = oldSource;
+        bK2 = oldK2;
+        bXbox = oldXbox;
+        nSupermodel = oldSupermodel;
+        bReadSmoothing = oldReadSmoothing;
+    });
+
     ReportObject ReportMdl (*this);
 
     /// Start timer
     Timer tDecompile;
 
-    int nNodeCounter;
     nPosition = 0; /// Set reading position to beginning of file.
 
-    FH.reset(new FileHeader());
     if(!bMinimal) ReportMdl << "Begin decompiling ";
     Report("Decompiling...");
 
     FileHeader & Data = *FH;
     //std::cout << "Data ready.\n";
-    std::string sFileHeader = "File Header > ";
+    std::string sFileHeader = "File Header";
 
-    /// Setting up the pointer to the model header data
-    Data.MH.dataRegions.emplace_back("MDL", 0, 208);
 
     //First read the file header, geometry header and model header
-    ReadNumber(&Data.nZero, 8, sFileHeader + "Padding");
+    ReadNumber(&Data.nZero, 8, sFileHeader + " > Padding");
     //std::cout << "Read first value, pos " << nPosition << ".\n";
-    ReadNumber(&Data.nMdlLength, 1, sFileHeader + "MDL Length");
-    ReadNumber(&Data.nMdxLength, 1, sFileHeader + "MDX Length");
+    ReadNumber(&Data.nMdlLength, 1, sFileHeader + " > MDL File Size");
+    ReadNumber(&Data.nMdxLength, 1, sFileHeader + " > MDX File Size");
     MarkDataBorder(nPosition - 1);
     //if(!bMinimal) ReportMdl << "File header read, pos " << nPosition << ".\n";
 
-    std::string sGeometryHeader = "Geometry Header > ";
+    std::string sGeometryHeader = "Geometry Header";
 
-    ReadNumber(&Data.MH.GH.nFunctionPointer0, 9, sGeometryHeader + "Function Pointer 1");
-    ReadNumber(&Data.MH.GH.nFunctionPointer1, 9, sGeometryHeader + "Function Pointer 2");
+    ReadNumber(&Data.MH.GH.nFunctionPointer0, 9, sGeometryHeader + " > Function Pointers");
+    ReadNumber(&Data.MH.GH.nFunctionPointer1, 9, sGeometryHeader + " > Function Pointers");
     //std::cout << "Read function pointers, now pos is: " << nPosition << ".\n";
 
     //Get game and platform
@@ -80,62 +235,62 @@ void MDL::DecompileModel(bool bMinimal){
     else throw mdlexception("Cannot interpret model function pointer (" + std::to_string(Data.MH.GH.nFunctionPointer0) + "), so cannot determine game and platform.");
     //std::cout << "Determined game.\n";
 
-    ReadString(&Data.MH.GH.sName, 32, 3, sGeometryHeader + "Model Name");
+    ReadString(&Data.MH.GH.sName, 32, 3, sGeometryHeader + " > Name");
     if(!bMinimal) ReportMdl << Data.MH.GH.sName.c_str() << ".\n";
-    ReadNumber(&Data.MH.GH.nOffsetToRootNode, 6, sGeometryHeader + "Offset To Root Node");
-    ReadNumber(&Data.MH.GH.nTotalNumberOfNodes, 1, sGeometryHeader + "Total Number Of Nodes");
+    ReadNumber(&Data.MH.GH.nOffsetToRootNode, 6, sGeometryHeader + " > Offset to Root Node");
+    ReadNumber(&Data.MH.GH.nTotalNumberOfNodes, 1, sGeometryHeader + " > Number of Nodes");
 
-    ReadNumber(&Data.MH.GH.RuntimeArray1.nOffset, 8, sGeometryHeader + "Runtime Array 1 > Offset");
-    ReadNumber(&Data.MH.GH.RuntimeArray1.nCount, 8, sGeometryHeader + "Runtime Array 1 > Count 1");
-    ReadNumber(&Data.MH.GH.RuntimeArray1.nCount2, 8, sGeometryHeader + "Runtime Array 1 > Count 2");
-    ReadNumber(&Data.MH.GH.RuntimeArray2.nOffset, 8, sGeometryHeader + "Runtime Array 2 > Offset");
-    ReadNumber(&Data.MH.GH.RuntimeArray2.nCount, 8, sGeometryHeader + "Runtime Array 2 > Count 1");
-    ReadNumber(&Data.MH.GH.RuntimeArray2.nCount2, 8, sGeometryHeader + "Runtime Array 2 > Count 2");
-    ReadNumber(&Data.MH.GH.nRefCount, 8, sGeometryHeader + "Reference Count");
+    ReadNumber(&Data.MH.GH.RuntimeArray1.nOffset, 8, sGeometryHeader + " > Runtime Arrays");
+    ReadNumber(&Data.MH.GH.RuntimeArray1.nCount, 8, sGeometryHeader + " > Runtime Arrays");
+    ReadNumber(&Data.MH.GH.RuntimeArray1.nCount2, 8, sGeometryHeader + " > Runtime Arrays");
+    ReadNumber(&Data.MH.GH.RuntimeArray2.nOffset, 8, sGeometryHeader + " > Runtime Arrays");
+    ReadNumber(&Data.MH.GH.RuntimeArray2.nCount, 8, sGeometryHeader + " > Runtime Arrays");
+    ReadNumber(&Data.MH.GH.RuntimeArray2.nCount2, 8, sGeometryHeader + " > Runtime Arrays");
+    ReadNumber(&Data.MH.GH.nRefCount, 8, sGeometryHeader + " > Reference Count");
 
-    ReadNumber(&Data.MH.GH.nModelType, 7, sGeometryHeader + "Model Type");
-    ReadNumber(&Data.MH.GH.nPadding[0], 11, sGeometryHeader + "Padding");
-    ReadNumber(&Data.MH.GH.nPadding[1], 11, sGeometryHeader + "Padding");
-    ReadNumber(&Data.MH.GH.nPadding[2], 11, sGeometryHeader + "Padding");
+    ReadNumber(&Data.MH.GH.nModelType, 7, sGeometryHeader + " > Type");
+    ReadNumber(&Data.MH.GH.nPadding[0], 11, sGeometryHeader + " > Padding");
+    ReadNumber(&Data.MH.GH.nPadding[1], 11, sGeometryHeader + " > Padding");
+    ReadNumber(&Data.MH.GH.nPadding[2], 11, sGeometryHeader + " > Padding");
     MarkDataBorder(nPosition - 1);
     //if(!bMinimal) ReportMdl << "Geometry header read.\n";
 
-    std::string sModelHeader = "Model Header > ";
+    std::string sModelHeader = "Model Header";
 
-    ReadNumber(&Data.MH.nClassification, 7, sModelHeader + "Classification");
-    ReadNumber(&Data.MH.nSubclassification, 10, sModelHeader + "\"Subclassification\"");
-    ReadNumber(&Data.MH.nUnknown, 8, sModelHeader + "Unknown");
-    ReadNumber(&Data.MH.nAffectedByFog, 7, sModelHeader + "Affected By Fog");
+    ReadNumber(&Data.MH.nClassification, 7, sModelHeader + " > Classification");
+    ReadNumber(&Data.MH.nSubclassification, 10, sModelHeader + " > Unknown1");
+    ReadNumber(&Data.MH.nUnknown, 8, sModelHeader + " > Unknown1");
+    ReadNumber(&Data.MH.nAffectedByFog, 7, sModelHeader + " > Affected By Fog");
 
     /// If the proper flags are on, enable SG reading
     bReadSmoothing = (bWriteSmoothing && Data.MH.nUnknown == 1) ? true : false;
 
-    ReadNumber(&Data.MH.nChildModelCount, 8, sModelHeader + "Child Model Count");
+    ReadNumber(&Data.MH.nChildModelCount, 8, sModelHeader + " > Number of Child Models");
 
-    ReadNumber(&Data.MH.AnimationArray.nOffset, 6, sModelHeader + "Animation Array > Offset");
-    ReadNumber(&Data.MH.AnimationArray.nCount, 1, sModelHeader + "Animation Array > Count 1");
-    ReadNumber(&Data.MH.AnimationArray.nCount2, 1, sModelHeader + "Animation Array > Count 2");
-    ReadNumber(&Data.MH.nSupermodelReference, 11, sModelHeader + "Supermodel Reference");
+    ReadNumber(&Data.MH.AnimationArray.nOffset, 6, sModelHeader + " > Offset to Animation Array");
+    ReadNumber(&Data.MH.AnimationArray.nCount, 1, sModelHeader + " > Number of Animations");
+    ReadNumber(&Data.MH.AnimationArray.nCount2, 1, sModelHeader + " > Number of Animations");
+    ReadNumber(&Data.MH.nSupermodelReference, 11, sModelHeader + " > Supermodel Reference");
 
-    Data.MH.vBBmin.fX = ReadNumber<float>(nullptr, 2, sModelHeader + "Bounding Box Min > X");
-    Data.MH.vBBmin.fY = ReadNumber<float>(nullptr, 2, sModelHeader + "Bounding Box Min > Y");
-    Data.MH.vBBmin.fZ = ReadNumber<float>(nullptr, 2, sModelHeader + "Bounding Box Min > Z");
-    Data.MH.vBBmax.fX = ReadNumber<float>(nullptr, 2, sModelHeader + "Bounding Box Max > X");
-    Data.MH.vBBmax.fY = ReadNumber<float>(nullptr, 2, sModelHeader + "Bounding Box Max > Y");
-    Data.MH.vBBmax.fZ = ReadNumber<float>(nullptr, 2, sModelHeader + "Bounding Box Max > Z");
-    Data.MH.fRadius = ReadNumber<float>(nullptr, 2, sModelHeader + "Radius");
-    Data.MH.fScale = ReadNumber<float>(nullptr, 2, sModelHeader + "Scale");
+    Data.MH.vBBmin.fX = ReadNumber<float>(nullptr, 2, sModelHeader + " > Bounding Box Min");
+    Data.MH.vBBmin.fY = ReadNumber<float>(nullptr, 2, sModelHeader + " > Bounding Box Min");
+    Data.MH.vBBmin.fZ = ReadNumber<float>(nullptr, 2, sModelHeader + " > Bounding Box Min");
+    Data.MH.vBBmax.fX = ReadNumber<float>(nullptr, 2, sModelHeader + " > Bounding Box Max");
+    Data.MH.vBBmax.fY = ReadNumber<float>(nullptr, 2, sModelHeader + " > Bounding Box Max");
+    Data.MH.vBBmax.fZ = ReadNumber<float>(nullptr, 2, sModelHeader + " > Bounding Box Max");
+    Data.MH.fRadius = ReadNumber<float>(nullptr, 2, sModelHeader + " > Radius");
+    Data.MH.fScale = ReadNumber<float>(nullptr, 2, sModelHeader + " > Animation Scale");
 
-    ReadString(&Data.MH.cSupermodelName, 32, 3, sModelHeader + "Supermodel Name");
+    ReadString(&Data.MH.cSupermodelName, 32, 3, sModelHeader + " > Supermodel Name");
 
-    ReadNumber(&Data.MH.nOffsetToHeadRootNode, 6, sModelHeader + "Offset To Head Root Node");
-    ReadNumber(&Data.MH.nPadding, 8, sModelHeader + "Padding");
-    ReadNumber(&Data.MH.nMdxLength2, 1, sModelHeader + "MDX Length");
-    ReadNumber(&Data.MH.nOffsetIntoMdx, 8, sModelHeader + "MDX Offset");
+    ReadNumber(&Data.MH.nOffsetToHeadRootNode, 6, sModelHeader + " > Offset to Head Root");
+    ReadNumber(&Data.MH.nPadding, 8, sModelHeader + " > Padding");
+    ReadNumber(&Data.MH.nMdxLength2, 1, sModelHeader + " > MDX File Size");
+    ReadNumber(&Data.MH.nOffsetIntoMdx, 8, sModelHeader + " > MDX Data Offset");
 
-    ReadNumber(&Data.MH.NameArray.nOffset, 6, sModelHeader + "Name Array > Offset");
-    ReadNumber(&Data.MH.NameArray.nCount, 1, sModelHeader + "Name Array > Count 1");
-    ReadNumber(&Data.MH.NameArray.nCount2, 1, sModelHeader + "Name Array > Count 2");
+    ReadNumber(&Data.MH.NameArray.nOffset, 6, sModelHeader + " > Offset to Name Array");
+    ReadNumber(&Data.MH.NameArray.nCount, 1, sModelHeader + " > Number of Names");
+    ReadNumber(&Data.MH.NameArray.nCount2, 1, sModelHeader + " > Number of Names");
     MarkDataBorder(nPosition - 1);
     //if(!bMinimal) ReportMdl << "Model header read.\n";
 
@@ -144,14 +299,15 @@ void MDL::DecompileModel(bool bMinimal){
     /// First index names array
     //if(!bMinimal) ReportMdl << "Reading names.\n";
     if(Data.MH.NameArray.nCount > 0){
-        std::string sNames = "Names > ";
+        std::string sNameArrayPointers = "Name Array > Pointers > Pointer ";
+        std::string sNameArrayStrings = "Name Array > Strings > \"";
         Data.MH.Names.resize(Data.MH.NameArray.nCount);
-        nPosition = MDL_OFFSET + Data.MH.NameArray.nOffset;
-        for(int n = 0; n < Data.MH.NameArray.nCount; n++){
-            ReadNumber(&Data.MH.Names[n].nOffset, 6, sNames + "Offset " + std::to_string(n));
+        nPosition = MdlArrayDataOffset(Data.MH.NameArray, "name array");
+        for(unsigned int n = 0; n < Data.MH.NameArray.nCount; n++){
+            ReadNumber(&Data.MH.Names[n].nOffset, 6, sNameArrayPointers + std::to_string(n));
             MarkDataBorder(nPosition - 1);
-            unsigned nPosData = MDL_OFFSET + Data.MH.Names[n].nOffset;
-            ReadString(&Data.MH.Names[n].sName, 0, 3, sNames + "Name " + std::to_string(n) + " (" + std::string(reinterpret_cast<const char*>(&GetBuffer().at(nPosData))) + ")", &nPosData);
+            unsigned nPosData = RequiredMdlDataOffset(Data.MH.Names[n].nOffset, "name string");
+            ReadString(&Data.MH.Names[n].sName, 0, 3, sNameArrayStrings + DebugCStringAt(GetBuffer(), nPosData) + "\"", &nPosData);
             MarkDataBorder(nPosData - 1);
         }
     }
@@ -162,63 +318,62 @@ void MDL::DecompileModel(bool bMinimal){
     /// Next, animations. Skip them if we're reading minimally
     if(Data.MH.AnimationArray.nCount > 0 && !bMinimal){
         Data.MH.Animations.resize(Data.MH.AnimationArray.nCount);
-        nPosition = MDL_OFFSET + Data.MH.AnimationArray.nOffset;
-        SavePosition(0);
-        for(int n = 0; n < Data.MH.AnimationArray.nCount; n++){
-            RestorePosition(0);
-            std::string sAnimation = "Anim " + std::to_string(n) + " > ";
+        nPosition = MdlArrayDataOffset(Data.MH.AnimationArray, "animation array");
+        unsigned nAnimationPointerPosition = nPosition;
+        for(unsigned int n = 0; n < Data.MH.AnimationArray.nCount; n++){
+            nPosition = nAnimationPointerPosition;
+            std::string sAnimationPointer = "Animations > Pointers > Pointer" + std::to_string(n);
 
             Animation & anim = Data.MH.Animations.at(n);
-            ReadNumber(&anim.nOffset, 6, sAnimation + "Offset");
+            ReadNumber(&anim.nOffset, 6, sAnimationPointer);
             MarkDataBorder(nPosition - 1);
 
-            /// Setting up the pointer to the data
-            anim.dataRegions.emplace_back("MDL", anim.nOffset + 12, 136);
 
-            SavePosition(0);
-            nPosition = MDL_OFFSET + anim.nOffset;
-            sAnimation = "Anim "  + std::string(reinterpret_cast<const char*>(&GetBuffer().at(nPosition + 8))) + " (" + std::to_string(n) + ") > ";
-            ReadNumber(&anim.nFunctionPointer0, 9, sAnimation + "Function Pointer 1");
-            ReadNumber(&anim.nFunctionPointer1, 9, sAnimation + "Function Pointer 2");
+            nAnimationPointerPosition = nPosition;
+            nPosition = RequiredMdlDataOffset(anim.nOffset, "animation header");
+            std::string sAnimation = "Animations > "  + DebugCStringAt(GetBuffer(), nPosition + 8) + " > ";
+            std::string sAnimationGeometryHeader = sAnimation + "Geometry Header";
+            ReadNumber(&anim.nFunctionPointer0, 9, sAnimationGeometryHeader + " > Function Pointers");
+            ReadNumber(&anim.nFunctionPointer1, 9, sAnimationGeometryHeader + " > Function Pointers");
 
-            ReadString(&anim.sName, 32, 3, sAnimation + "Name");
+            ReadString(&anim.sName, 32, 3, sAnimationGeometryHeader + " > Name");
 
-            ReadNumber(&anim.nOffsetToRootAnimationNode, 6, sAnimation + "Offset To Root Node");
-            ReadNumber(&anim.nNumberOfNames, 1, sAnimation + "Total Number Of Nodes");
+            ReadNumber(&anim.nOffsetToRootAnimationNode, 6, sAnimationGeometryHeader + " > Offset to Root Node");
+            ReadNumber(&anim.nNumberOfNames, 1, sAnimationGeometryHeader + " > Number of Nodes");
 
-            ReadNumber(&anim.RuntimeArray1.nOffset, 8, sAnimation + "Runtime Array 1 > Offset");
-            ReadNumber(&anim.RuntimeArray1.nCount, 8, sAnimation + "Runtime Array 1 > Count 1");
-            ReadNumber(&anim.RuntimeArray1.nCount2, 8, sAnimation + "Runtime Array 1 > Count 2");
-            ReadNumber(&anim.RuntimeArray2.nOffset, 8, sAnimation + "Runtime Array 2 > Offset");
-            ReadNumber(&anim.RuntimeArray2.nCount, 8, sAnimation + "Runtime Array 2 > Count 1");
-            ReadNumber(&anim.RuntimeArray2.nCount2, 8, sAnimation + "Runtime Array 2 > Count 2");
-            ReadNumber(&anim.nRefCount, 8, sAnimation + "Reference Count");
+            ReadNumber(&anim.RuntimeArray1.nOffset, 8, sAnimationGeometryHeader + " > Runtime Arrays");
+            ReadNumber(&anim.RuntimeArray1.nCount, 8, sAnimationGeometryHeader + " > Runtime Arrays");
+            ReadNumber(&anim.RuntimeArray1.nCount2, 8, sAnimationGeometryHeader + " > Runtime Arrays");
+            ReadNumber(&anim.RuntimeArray2.nOffset, 8, sAnimationGeometryHeader + " > Runtime Arrays");
+            ReadNumber(&anim.RuntimeArray2.nCount, 8, sAnimationGeometryHeader + " > Runtime Arrays");
+            ReadNumber(&anim.RuntimeArray2.nCount2, 8, sAnimationGeometryHeader + " > Runtime Arrays");
+            ReadNumber(&anim.nRefCount, 8, sAnimationGeometryHeader + " > Reference Count");
 
-            ReadNumber(&anim.nModelType, 7, sAnimation + "Model Type");
-            ReadNumber(&anim.nPadding[0], 11, sAnimation + "Padding");
-            ReadNumber(&anim.nPadding[1], 11, sAnimation + "Padding");
-            ReadNumber(&anim.nPadding[2], 11, sAnimation + "Padding");
+            ReadNumber(&anim.nModelType, 7, sAnimationGeometryHeader + " > Type");
+            ReadNumber(&anim.nPadding[0], 11, sAnimationGeometryHeader + " > Padding");
+            ReadNumber(&anim.nPadding[1], 11, sAnimationGeometryHeader + " > Padding");
+            ReadNumber(&anim.nPadding[2], 11, sAnimationGeometryHeader + " > Padding");
             MarkDataBorder(nPosition - 1);
 
-            anim.fLength = ReadNumber<float>(nullptr, 2, sAnimation + "Length");
-            anim.fTransition = ReadNumber<float>(nullptr, 2, sAnimation + "Transition");
+            anim.fLength = ReadNumber<float>(nullptr, 2, sAnimation + "Header");
+            anim.fTransition = ReadNumber<float>(nullptr, 2, sAnimation + "Header");
 
-            ReadString(&anim.sAnimRoot, 32, 3, sAnimation + "AnimRoot");
+            ReadString(&anim.sAnimRoot, 32, 3, sAnimation + "Header");
 
-            ReadNumber(&anim.EventArray.nOffset, 6, sAnimation + "Event Array > Offset");
-            ReadNumber(&anim.EventArray.nCount, 1, sAnimation + "Event Array > Count 1");
-            ReadNumber(&anim.EventArray.nCount2, 1, sAnimation + "Event Array > Count 2");
-            ReadNumber(&anim.nPadding2, 8, sAnimation + "Padding");
+            ReadNumber(&anim.EventArray.nOffset, 6, sAnimation + "Header");
+            ReadNumber(&anim.EventArray.nCount, 1, sAnimation + "Header");
+            ReadNumber(&anim.EventArray.nCount2, 1, sAnimation + "Header");
+            ReadNumber(&anim.nPadding2, 8, sAnimation + "Header");
             MarkDataBorder(nPosition - 1);
 
             if(anim.EventArray.nCount > 0){
                 anim.Events.resize(anim.EventArray.nCount);
-                nPosition = MDL_OFFSET + anim.EventArray.nOffset; /// No need to save the previous position because we've finished the header
+                nPosition = MdlArrayDataOffset(anim.EventArray, "animation event array"); /// No need to save the previous position because we've finished the header
                 //std::cout << string_format("Offset to Animation Events is %i\n", anim.EventArray.nOffset);
-                for(int e = 0; e < anim.Events.size(); e++){
+                for(int e = 0; e < static_cast<int>(anim.Events.size()); e++){
                     Event & event = anim.Events.at(e);
-                    event.fTime = ReadNumber<float>(nullptr, 2, sAnimation + "Event " + std::to_string(e) + " > Time");
-                    ReadString(&event.sName, 32, 3, sAnimation + "Event " + std::to_string(e) + " > Name (" + std::string(reinterpret_cast<const char*>(&GetBuffer().at(nPosition))) + ")");
+                    event.fTime = ReadNumber<float>(nullptr, 2, sAnimation + "Header");
+                    ReadString(&event.sName, 32, 3, sAnimation + "Header");
                     MarkDataBorder(nPosition - 1);
                 }
             }
@@ -226,6 +381,9 @@ void MDL::DecompileModel(bool bMinimal){
             /// We're done with the header, now we delve into animation nodes. It's a bit scary :(
 
             /// Prepare root node
+            if(anim.nOffsetToRootAnimationNode == 0){
+                throw mdlexception("Animation '" + anim.sName + "' has a zero root-node offset; refusing to read the animation header as a node.");
+            }
             anim.RootAnimationNode.nOffset = anim.nOffsetToRootAnimationNode;
             anim.RootAnimationNode.nAnimation = n;
 
@@ -233,13 +391,12 @@ void MDL::DecompileModel(bool bMinimal){
             std::vector<unsigned int> offsets;
             offsets.reserve(Data.MH.nNodeCount);
             Vector vFromRoot;
-            Quaternion qFromRoot;
-            ParseNode(anim.RootAnimationNode, offsets, vFromRoot, qFromRoot, sAnimation);
+            ParseNode(anim.RootAnimationNode, offsets, vFromRoot);
 
             /// Prepare for linearization and linearize
             anim.ArrayOfNodes.clear();
             anim.ArrayOfNodes.reserve(Data.MH.Names.size());
-            LinearizeAnimation(anim.RootAnimationNode, anim.ArrayOfNodes);
+            LinearizeAnimation(anim.RootAnimationNode, anim.ArrayOfNodes, -1);
         }
     }
     //if(!bMinimal) ReportMdl << "Animation array read.\n";
@@ -247,17 +404,17 @@ void MDL::DecompileModel(bool bMinimal){
     //if(!bMinimal) ReportMdl << "Reading geometry.\n";
     if(Data.MH.Names.size() > 0){
         /// Set offset and animation
+        if(Data.MH.GH.nOffsetToRootNode == 0){
+            throw mdlexception("Geometry root-node offset is zero; refusing to read the geometry header as a node.");
+        }
         Data.MH.RootNode.nOffset = Data.MH.GH.nOffsetToRootNode;
         Data.MH.RootNode.nAnimation = -1;
-
-        std::string sGeometry = "Geometry > ";
 
         /// Prepare variables for parsing nodes and then parse the nodes.
         std::vector<unsigned int> offsets;
         offsets.reserve(Data.MH.nNodeCount);
         Vector vFromRoot;
-        Quaternion qFromRoot;
-        ParseNode(Data.MH.RootNode, offsets, vFromRoot, qFromRoot, sGeometry, bMinimal);
+        ParseNode(Data.MH.RootNode, offsets, vFromRoot, bMinimal);
 
         /// Record total real node count
         Data.MH.nNodeCount = offsets.size();
@@ -265,25 +422,62 @@ void MDL::DecompileModel(bool bMinimal){
         //Data.MH.ArrayOfNodes.clear();
 
         /// Linearize read geometry into an Array Of Nodes
-        Data.MH.ArrayOfNodes.resize(Data.MH.nNodeCount); /// Only create as many nodes as there actually are, ignore the extra names
+        const MdlInteger<unsigned short> nRootNameIndex = Data.MH.RootNode.Head.nNameIndex;
+        if(!nRootNameIndex.Valid()){
+            throw mdlexception("Binary read root node name index is invalid.");
+        }
+        const unsigned short nMaxGeometryNameIndex = MaxNameIndexInTree(Data.MH.RootNode);
+        const std::size_t nFlattenedNodeCount = std::max<std::size_t>(Data.MH.nNodeCount, static_cast<std::size_t>(nMaxGeometryNameIndex) + 1u);
+        Data.MH.ArrayOfNodes.clear();
+        Data.MH.ArrayOfNodes.resize(nFlattenedNodeCount);
         LinearizeGeometry(Data.MH.RootNode, Data.MH.ArrayOfNodes);
 
         /// Build Array of Indices By Tree Order
+        if(Data.MH.ArrayOfNodes.empty()){
+            throw mdlexception("Binary read produced no geometry nodes.");
+        }
+        if(static_cast<unsigned short>(nRootNameIndex) >= Data.MH.ArrayOfNodes.size() ||
+           !Data.MH.ArrayOfNodes.at(static_cast<unsigned short>(nRootNameIndex)).Head.nNameIndex.Valid()){
+            throw mdlexception("Binary read root node name index is outside the flattened node array.");
+        }
         Data.MH.NameIndicesInTreeOrder.reserve(Data.MH.ArrayOfNodes.size());
-        Data.MH.BuildTreeOrderArray(Data.MH.ArrayOfNodes.front());
+        Data.MH.BuildTreeOrderArray(Data.MH.ArrayOfNodes.at(static_cast<unsigned short>(nRootNameIndex)));
 
         /// Immediately fix all the skin bone->name maps
         for(Node & node : Data.MH.ArrayOfNodes){
             if(node.Head.nType & NODE_SKIN){
-                int nBoneCount = 0;
-                for(Bone & bone : node.Skin.Bones){
-                    if(bone.nBonemap.Valid()) nBoneCount++;
-                }
-                node.Skin.BoneNameIndices.resize(nBoneCount);
-                for(int n = 0; n < node.Skin.Bones.size(); n++){
+                int nMaxBonemapSlot = -1;
+                for(unsigned int n = 0; n < node.Skin.Bones.size(); n++){
                     Bone & bone = node.Skin.Bones.at(n);
                     if(bone.nBonemap.Valid()){
-                        node.Skin.BoneNameIndices.at(bone.nBonemap) = Data.MH.NameIndicesInTreeOrder.at(n);
+                        const unsigned int nSlot = bone.nBonemap;
+                        const unsigned int nMaxCompactSlot = bK2 ? 16u : 15u;
+                        if(nSlot > nMaxCompactSlot){
+                            throw mdlexception("Skin bone map slot is outside the compact-slot range for this game.");
+                        }
+                        if(nSlot > static_cast<unsigned int>(std::numeric_limits<int>::max())){
+                            throw mdlexception("Skin bone map slot is too large.");
+                        }
+                        if(static_cast<int>(nSlot) > nMaxBonemapSlot) nMaxBonemapSlot = static_cast<int>(nSlot);
+                    }
+                }
+
+                node.Skin.BoneNameIndices.clear();
+                if(nMaxBonemapSlot >= 0){
+                    node.Skin.BoneNameIndices.resize(static_cast<std::size_t>(nMaxBonemapSlot) + 1u);
+                }
+
+                for(unsigned int n = 0; n < node.Skin.Bones.size(); n++){
+                    if(n >= Data.MH.NameIndicesInTreeOrder.size()){
+                        throw mdlexception("Skin bone table references a node outside the tree-order name table.");
+                    }
+                    Bone & bone = node.Skin.Bones.at(n);
+                    if(bone.nBonemap.Valid()){
+                        const unsigned int nSlot = bone.nBonemap;
+                        if(nSlot >= node.Skin.BoneNameIndices.size()){
+                            throw mdlexception("Skin bone map slot is outside the compact bone-name table.");
+                        }
+                        node.Skin.BoneNameIndices.at(nSlot) = Data.MH.NameIndicesInTreeOrder.at(n);
                     }
                     bone.nNameIndex = Data.MH.NameIndicesInTreeOrder.at(n);
                 }
@@ -346,114 +540,116 @@ void MDL::DecompileModel(bool bMinimal){
         */
     }
 
-    positions.shrink_to_fit();
 
     if(!bMinimal) ReportMdl << "Decompiled model in " << tDecompile.GetTime() << ".\n";
-    if(!bReadSmoothing && bBinaryPostProcess && Mdx && !bMinimal) BinaryPostProcess();
+    if(!bReadSmoothing && bDetermineSmoothing && Mdx && !bMinimal) DetermineSmoothing();
+    restoreReadState.Dismiss();
 }
 
 static unsigned nAabbCount = 0;
-void MDL::ParseAabb(Aabb & aabb, unsigned int nHighestOffset, const std::string & sPrefix){
-    std::string sAabb = sPrefix + "AABB " + std::to_string(nAabbCount) + " > ";
+static std::string sAabbNodePrefix;
+void MDL::ParseAabb(Aabb & aabb, std::vector<unsigned int> & visitedOffsets){
+    std::string sAabb = sAabbNodePrefix + "Data > Aabb > Aabb Tree > Aabb Struct " + std::to_string(nAabbCount);
     nAabbCount++;
-    if(aabb.nOffset > nHighestOffset) nHighestOffset = aabb.nOffset;
-    else{
-        MessageBox(NULL, "The aabb (walkmesh) tree seems to be looping, the .mdl might be broken. =(", "Error", MB_OK | MB_ICONERROR);
-        return;
+
+    if(aabb.nOffset == 0) throw mdlexception("An aabb node has offset 0; refusing to read the MDL header as AABB data.");
+    if(aabb.nOffset == std::numeric_limits<unsigned int>::max()) throw mdlexception("An aabb node has offset -1.");
+    if(std::find(visitedOffsets.begin(), visitedOffsets.end(), aabb.nOffset) != visitedOffsets.end()){
+        throw mdlexception("The aabb (walkmesh) tree loops or reuses child offset " + std::to_string(aabb.nOffset) + "; refusing to duplicate or malform the preserved tree.");
     }
-
-    if(aabb.nOffset == -1) throw mdlexception("An aabb node has offset -1.");
-
-    /// Setting up the pointer to the data
-    aabb.dataRegions.emplace_back("MDL", aabb.nOffset + 12, 40);
-
-    unsigned int nPosData = aabb.nOffset + MDL_OFFSET;
-    aabb.vBBmin.fX = ReadNumber<float>(nullptr, 2, sAabb + "Bounding Box Min > X", &nPosData);
-    aabb.vBBmin.fY = ReadNumber<float>(nullptr, 2, sAabb + "Bounding Box Min > Y", &nPosData);
-    aabb.vBBmin.fZ = ReadNumber<float>(nullptr, 2, sAabb + "Bounding Box Min > Z", &nPosData);
-    aabb.vBBmax.fX = ReadNumber<float>(nullptr, 2, sAabb + "Bounding Box Max > X", &nPosData);
-    aabb.vBBmax.fY = ReadNumber<float>(nullptr, 2, sAabb + "Bounding Box Max > Y", &nPosData);
-    aabb.vBBmax.fZ = ReadNumber<float>(nullptr, 2, sAabb + "Bounding Box Max > Z", &nPosData);
-    ReadNumber(&aabb.nChild1, 6, sAabb + "Child 1 Offset", &nPosData);
-    ReadNumber(&aabb.nChild2, 6, sAabb + "Child 2 Offset", &nPosData);
-    aabb.nID = ReadNumber<signed int>(nullptr, 4, sAabb + "Face Index", &nPosData);
-    aabb.nProperty = ReadNumber<unsigned>(nullptr, 4, sAabb + "Second Child Property", &nPosData);
+    visitedOffsets.push_back(aabb.nOffset);
+    unsigned int nPosData = MdlDataOffset(aabb.nOffset, "AABB node");
+    aabb.vBBmin.fX = ReadNumber<float>(nullptr, 2, sAabb, &nPosData);
+    aabb.vBBmin.fY = ReadNumber<float>(nullptr, 2, sAabb, &nPosData);
+    aabb.vBBmin.fZ = ReadNumber<float>(nullptr, 2, sAabb, &nPosData);
+    aabb.vBBmax.fX = ReadNumber<float>(nullptr, 2, sAabb, &nPosData);
+    aabb.vBBmax.fY = ReadNumber<float>(nullptr, 2, sAabb, &nPosData);
+    aabb.vBBmax.fZ = ReadNumber<float>(nullptr, 2, sAabb, &nPosData);
+    ReadNumber(&aabb.nChild1, 6, sAabb, &nPosData);
+    ReadNumber(&aabb.nChild2, 6, sAabb, &nPosData);
+    aabb.nID = SignedIntToUShortOrInvalid(ReadNumber<signed int>(nullptr, 4, sAabb, &nPosData), sAabb + " face id");
+    aabb.nProperty = ReadNumber<unsigned>(nullptr, 4, sAabb, &nPosData);
     MarkDataBorder(nPosData - 1);
 
-    if(aabb.nChild1 > 0){
+    if(aabb.nChild1.Valid() && aabb.nChild1 > 0){
         aabb.Child1.resize(1);
         aabb.Child1[0].nOffset = aabb.nChild1;
-        ParseAabb(aabb.Child1[0], nHighestOffset, sPrefix);
+        ParseAabb(aabb.Child1[0], visitedOffsets);
     }
-    if(aabb.nChild2 > 0){
+    if(aabb.nChild2.Valid() && aabb.nChild2 > 0){
         aabb.Child2.resize(1);
         aabb.Child2[0].nOffset = aabb.nChild2;
-        ParseAabb(aabb.Child2[0], nHighestOffset, sPrefix);
+        ParseAabb(aabb.Child2[0], visitedOffsets);
     }
 }
 
-void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFromRoot, Quaternion qFromRoot, const std::string & sPrefix, bool bMinimal){
-    SavePosition(1);
-    nPosition = MDL_OFFSET + node.nOffset;
+void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFromRoot, bool bMinimal){
+    if(node.nOffset == 0) throw mdlexception("ParseNode(): node offset is 0; refusing to read the MDL header as a node.");
+    if(node.nOffset == std::numeric_limits<unsigned int>::max()) throw mdlexception("ParseNode(): node offset is -1; refusing to read invalid node data.");
+    nPosition = RequiredMdlDataOffset(node.nOffset, "node header");
     unsigned int nPosData = 0;
 
     offsets.push_back(node.nOffset);
 
-    std::string sNode = sPrefix + std::string(GetFileData()->MH.Names.at(*(unsigned short*) &sBuffer.at(nPosition + 4)).sName.c_str()) + " (" + std::to_string(offsets.size() - 1) + ") > ";
+    if(nPosition > sBuffer.size() || 4 + sizeof(unsigned short) > sBuffer.size() - nPosition){
+        throw mdlexception("ParseNode(): node header is truncated before the name index field.");
+    }
+    unsigned short nNodeNameIndex = 0;
+    std::memcpy(&nNodeNameIndex, &sBuffer.at(nPosition + 4), sizeof(nNodeNameIndex));
+    if(nNodeNameIndex >= GetFileData()->MH.Names.size()){
+        throw mdlexception("ParseNode(): node name index " + std::to_string(nNodeNameIndex) +
+                           " is outside the model name table; refusing to read from the wrong name/string data.");
+    }
+    std::string sNodeName = std::string(GetFileData()->MH.Names.at(nNodeNameIndex).sName.c_str());
+    std::string sNodePrefix = "Geometry > ";
+    if(node.nAnimation.Valid() && static_cast<unsigned>(node.nAnimation) < GetFileData()->MH.Animations.size()){
+        sNodePrefix = "Animations > " + GetFileData()->MH.Animations.at(static_cast<unsigned>(node.nAnimation)).sName + " > ";
+    }
+    std::string sNode = sNodePrefix + sNodeName + " > ";
 
-    ReadNumber(node.Head.nType.GetPtr(), 5, sNode + "Type");
-    ReadNumber(node.Head.nSupernodeNumber.GetPtr(), 5, sNode + "Supernode Index");
-    ReadNumber(node.Head.nNameIndex.GetPtr(), 5, sNode + "Name Index");
-    ReadNumber(&node.Head.nPadding1, 8, sNode + "Padding");
+    ReadNumber(node.Head.nType.GetPtr(), 5, sNode + "Node Type");
+    ReadNumber(node.Head.nSupernodeNumber.GetPtr(), 5, sNode + "Supernode Number");
+    ReadNumber(node.Head.nNameIndex.GetPtr(), 5, sNode + "Node Number");
+    ReadNumber(&node.Head.nPadding1, 8, sNode + (node.nAnimation.Valid() ? "Header" : "Header > Basic"));
 
-    /// Setting up the pointer to the data
-    node.dataRegions.emplace_back("MDL", node.nOffset + 12, node.GetSize());
 
     ReportObject ReportMdl (*this);
     //ReportMdl << "Reading " << (node.nAnimation.Valid() ? "animation" : "geometry") << " node " << GetNodeName(node) << " at offset " << nPosition - 8 << ".\n";
 
     if(!(node.Head.nType & NODE_HEADER)) throw mdlexception(std::string("The ") + (node.nAnimation.Valid() ? "animation" : "geometry") + " node " + GetNodeName(node) + " does not have a NODE_HEADER.");
 
-    ReadNumber(node.Head.nOffsetToRoot.GetPtr(), 6, sNode + "Offset To Root");
-    ReadNumber(node.Head.nOffsetToParent.GetPtr(), 6, sNode + "Offset To Parent");
-    node.Head.vPos.fX = ReadNumber<float>(nullptr, 2, sNode + "Position > X");
-    node.Head.vPos.fY = ReadNumber<float>(nullptr, 2, sNode + "Position > Y");
-    node.Head.vPos.fZ = ReadNumber<float>(nullptr, 2, sNode + "Position > Z");
+    ReadNumber(node.Head.nOffsetToRoot.GetPtr(), 6, sNode + "Offset to Root");
+    ReadNumber(node.Head.nOffsetToParent.GetPtr(), 6, sNode + "Offset to Parent");
+    node.Head.vPos.fX = ReadNumber<float>(nullptr, 2, sNode + "Position");
+    node.Head.vPos.fY = ReadNumber<float>(nullptr, 2, sNode + "Position");
+    node.Head.vPos.fZ = ReadNumber<float>(nullptr, 2, sNode + "Position");
 
-    double fQW = ReadNumber<float>(nullptr, 2, sNode + "Orientation > W");
-    double fQX = ReadNumber<float>(nullptr, 2, sNode + "Orientation > X");
-    double fQY = ReadNumber<float>(nullptr, 2, sNode + "Orientation > Y");
-    double fQZ = ReadNumber<float>(nullptr, 2, sNode + "Orientation > Z");
+    double fQW = ReadNumber<float>(nullptr, 2, sNode + "Orientation");
+    double fQX = ReadNumber<float>(nullptr, 2, sNode + "Orientation");
+    double fQY = ReadNumber<float>(nullptr, 2, sNode + "Orientation");
+    double fQZ = ReadNumber<float>(nullptr, 2, sNode + "Orientation");
     node.Head.oOrient.SetQuaternion(fQX, fQY, fQZ, fQW);
 
-    /// Let's do the transformations/translations here. First orientation, then translation.
-    Vector vAdd = node.Head.vPos;
-    vAdd.Rotate(qFromRoot);
-    vFromRoot += vAdd;
-    qFromRoot *= node.Head.oOrient.GetQuaternion();
+    ReadNumber(&node.Head.ChildrenArray.nOffset, 6, sNode + "Child Array");
+    ReadNumber(&node.Head.ChildrenArray.nCount, 1, sNode + "Child Array");
+    ReadNumber(&node.Head.ChildrenArray.nCount2, 1, sNode + "Child Array");
 
-    node.Head.vFromRoot = vFromRoot;
-    node.Head.qFromRoot = qFromRoot;
+    ReadNumber(&node.Head.ControllerArray.nOffset, 6, sNode + "Controller Array");
+    ReadNumber(&node.Head.ControllerArray.nCount, 1, sNode + "Controller Array");
+    ReadNumber(&node.Head.ControllerArray.nCount2, 1, sNode + "Controller Array");
 
-    ReadNumber(&node.Head.ChildrenArray.nOffset, 6, sNode + "Child Array > Offset");
-    ReadNumber(&node.Head.ChildrenArray.nCount, 1, sNode + "Child Array > Count 1");
-    ReadNumber(&node.Head.ChildrenArray.nCount2, 1, sNode + "Child Array > Count 2");
-
-    ReadNumber(&node.Head.ControllerArray.nOffset, 6, sNode + "Controller Array > Offset");
-    ReadNumber(&node.Head.ControllerArray.nCount, 1, sNode + "Controller Array > Count 1");
-    ReadNumber(&node.Head.ControllerArray.nCount2, 1, sNode + "Controller Array > Count 2");
-
-    ReadNumber(&node.Head.ControllerDataArray.nOffset, 6, sNode + "Controller Data Array > Offset");
-    ReadNumber(&node.Head.ControllerDataArray.nCount, 1, sNode + "Controller Data Array > Count 1");
-    ReadNumber(&node.Head.ControllerDataArray.nCount2, 1, sNode + "Controller Data Array > Count 2");
+    ReadNumber(&node.Head.ControllerDataArray.nOffset, 6, sNode + "Controller Data Array");
+    ReadNumber(&node.Head.ControllerDataArray.nCount, 1, sNode + "Controller Data Array");
+    ReadNumber(&node.Head.ControllerDataArray.nCount2, 1, sNode + "Controller Data Array");
     MarkDataBorder(nPosition - 1);
 
     if(node.Head.ControllerDataArray.nCount > 0 && !bMinimal){
         /// We gots controll data!
         node.Head.ControllerData.resize(node.Head.ControllerDataArray.nCount);
-        nPosData = MDL_OFFSET + node.Head.ControllerDataArray.nOffset;
-        for(int n = 0; n < node.Head.ControllerDataArray.nCount; n++){
-            node.Head.ControllerData[n] = ReadNumber<float>(nullptr, 2, sNode + "Controller Data " + std::to_string(n), &nPosData);
+        nPosData = MdlArrayDataOffset(node.Head.ControllerDataArray, "controller data array");
+        for(unsigned int n = 0; n < node.Head.ControllerDataArray.nCount; n++){
+            std::string sControllerData = sNode + (node.nAnimation.Valid() ? "Controller Data > Float " : "Data > Controller Data > Float ") + std::to_string(n);
+            node.Head.ControllerData[n] = ReadNumber<float>(nullptr, 2, sControllerData, &nPosData);
             MarkDataBorder(nPosData - 1);
             //if(n == node.Head.ControllerDataArray.nCount) std::cout << string_format("Just filled %i floats of Controller Data\n", n);
         }
@@ -461,24 +657,22 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
 
     if(node.Head.ControllerArray.nCount > 0 && !bMinimal){
         node.Head.Controllers.resize(node.Head.ControllerArray.nCount);
-        nPosData = MDL_OFFSET + node.Head.ControllerArray.nOffset;
-        for(int n = 0; n < node.Head.ControllerArray.nCount; n++){
+        nPosData = MdlArrayDataOffset(node.Head.ControllerArray, "controller array");
+        for(unsigned int n = 0; n < node.Head.ControllerArray.nCount; n++){
             Controller & ctrl = node.Head.Controllers.at(n);
 
-            /// Setting up the pointer to the data
-            ctrl.dataRegions.emplace_back("MDL", nPosData, 16);
 
-            std::string sController = sNode + "Controller " + std::to_string(n) + " > ";
-            ReadNumber(&ctrl.nControllerType, 4, sController + "Type", &nPosData);
-            ReadNumber(&ctrl.nUnknown2, 10, sController + "Unknown", &nPosData);
-            ReadNumber(&ctrl.nValueCount, 5, sController + "Value Count", &nPosData);
-            ReadNumber(&ctrl.nTimekeyStart, 5, sController + "Timekey Start", &nPosData);
-            ReadNumber(&ctrl.nDataStart, 5, sController + "Data Start", &nPosData);
+            std::string sController = sNode + (node.nAnimation.Valid() ? "Controllers > Controller " : "Data > Controllers > Controller ") + std::to_string(n);
+            ReadNumber(&ctrl.nControllerType, 4, sController, &nPosData);
+            ReadNumber(&ctrl.nUnknown2, 10, sController, &nPosData);
+            ReadNumber(&ctrl.nValueCount, 5, sController, &nPosData);
+            ReadNumber(&ctrl.nTimekeyStart, 5, sController, &nPosData);
+            ReadNumber(&ctrl.nDataStart, 5, sController, &nPosData);
 
-            ReadNumber(&ctrl.nColumnCount, 5, sController + "Column Count", &nPosData);
-            ReadNumber(&ctrl.nPadding[0], 11, sController + "Padding", &nPosData);
-            ReadNumber(&ctrl.nPadding[1], 11, sController + "Padding", &nPosData);
-            ReadNumber(&ctrl.nPadding[2], 11, sController + "Padding", &nPosData);
+            ReadNumber(&ctrl.nColumnCount, 5, sController, &nPosData);
+            ReadNumber(&ctrl.nPadding[0], 11, sController, &nPosData);
+            ReadNumber(&ctrl.nPadding[1], 11, sController, &nPosData);
+            ReadNumber(&ctrl.nPadding[2], 11, sController, &nPosData);
             MarkDataBorder(nPosData - 1);
 
             ctrl.nNameIndex = node.Head.nNameIndex;
@@ -493,16 +687,36 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
             if(ctrl.nControllerType == CONTROLLER_HEADER_ORIENTATION && nCount == 2) nCount = 1;
             if(ctrl.nColumnCount & 0x10) nCount *= 3;
 
-            /// Setting up the pointer to the data
-            ctrl.dataRegions.emplace_back("MDL", MDL_OFFSET + node.Head.ControllerDataArray.nOffset + (ctrl.nTimekeyStart * 4),
-                                          ctrl.nValueCount * 4);
-            ctrl.dataRegions.emplace_back("MDL", MDL_OFFSET + node.Head.ControllerDataArray.nOffset + (ctrl.nDataStart * 4),
-                                          nCount * ctrl.nValueCount * 4);
+            const std::size_t nColumns = static_cast<std::size_t>(std::max(nCount, 0));
+            const std::size_t nValues = static_cast<std::size_t>(ctrl.nValueCount);
+            const std::size_t nStart = static_cast<std::size_t>(ctrl.nDataStart);
+            bool bMissingControllerData = false;
+            if(nValues != 0 && nColumns > (std::numeric_limits<std::size_t>::max() - nStart) / nValues){
+                bMissingControllerData = true;
+            }
+            else if(nStart + nColumns * nValues > node.Head.ControllerData.size()){
+                bMissingControllerData = true;
+            }
 
-            if(nCount * ctrl.nValueCount + ctrl.nDataStart > node.Head.ControllerData.size())
-                Warning("Missing controller data on an animation controller on node '" + GetNodeName(node) + "' in animation '" + FH->MH.Animations.at(node.nAnimation).sName.c_str() + "'.");
+            if(bMissingControllerData){
+                std::string sAnimName = "<geometry>";
+                if(node.nAnimation.Valid() && static_cast<std::size_t>(static_cast<unsigned int>(node.nAnimation)) < FH->MH.Animations.size()){
+                    sAnimName = FH->MH.Animations.at(static_cast<unsigned int>(node.nAnimation)).sName;
+                }
+                Warning("Missing controller data on a controller on node '" + GetNodeName(node) + "' in animation '" + sAnimName + "'.");
+            }
         }
     }
+
+    /// Calculate transforms after controller data has been read: rotate the
+    /// incoming offset by the current node orientation, then add the current
+    /// node position.
+    Location location = node.GetLocation();
+    Quaternion qNode = location.oOrientation.GetQuaternion();
+    vFromRoot.Rotate(qNode);
+    vFromRoot += location.vPosition;
+
+    node.Head.vFromRoot = vFromRoot;
 
     unsigned nSavePosition = nPosition;
 
@@ -510,10 +724,11 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
         /// We gots children!
         node.Head.Children.resize(node.Head.ChildrenArray.nCount);
         node.Head.ChildIndices.clear();
-        nPosData = MDL_OFFSET + node.Head.ChildrenArray.nOffset;
-        for(int n = 0; n < node.Head.Children.size(); n++){
+        nPosData = MdlArrayDataOffset(node.Head.ChildrenArray, "child array");
+        for(int n = 0; n < static_cast<int>(node.Head.Children.size()); n++){
             Node & child = node.Head.Children.at(n);
-            ReadNumber(&child.nOffset, 6, sNode + "Child Offset" + std::to_string(n), &nPosData);
+            std::string sChildPointer = sNode + (node.nAnimation.Valid() ? "Child Pointers > Pointer " : "Data > Child Array > Pointer ") + std::to_string(n);
+            ReadNumber(&child.nOffset, 6, sChildPointer, &nPosData);
             MarkDataBorder(nPosData - 1);
             child.nAnimation = node.nAnimation;
 
@@ -522,8 +737,13 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
             /// and then use it later to find the correct name index.
             child.Head.nParentIndex = !node.nAnimation.Valid() ? node.Head.nNameIndex : node.Head.nSupernodeNumber;
 
-            if(std::find(offsets.begin(), offsets.end(), child.nOffset) == offsets.end()){
-                ParseNode(child, offsets, vFromRoot, qFromRoot, sPrefix, bMinimal);
+            if(child.nOffset == 0 || child.nOffset == std::numeric_limits<unsigned int>::max()){
+                ReportMdl << "Warning: node '" << GetNodeName(node) << "' has an invalid child pointer ("
+                          << child.nOffset << "); ignoring that child entry.\n";
+                child.nOffset = 0;
+            }
+            else if(std::find(offsets.begin(), offsets.end(), child.nOffset) == offsets.end()){
+                ParseNode(child, offsets, vFromRoot, bMinimal);
             }
             else{
                 /**
@@ -531,11 +751,13 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
                     I will solve this loop now by not parsing this child. So this will break the loop, but it will leave this unread child behind.
                     It is now the job of the linearization functions to ignore this child. I will mark this child by setting its offset to 0.
                     So, when the offset of a node is 0, linearization of that node should not take place.
-                /**/
+                */
                 child.nOffset = 0;
             }
 
-            node.Head.ChildIndices.push_back(child.Head.nNameIndex); /// Sorting based on child indices? Does that even work for animations?
+            if(child.nOffset != 0 && child.Head.nNameIndex.Valid()){
+                node.Head.ChildIndices.push_back(child.Head.nNameIndex); /// Sorting based on child indices? Does that even work for animations?
+            }
         }
     }
 
@@ -546,233 +768,220 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
     nPosition = nSavePosition;
 
     if(node.Head.nType & NODE_LIGHT){
-        std::string sLight = sNode + "Light > ";
-        node.Light.fFlareRadius = ReadNumber<float>(nullptr, 2, sLight + "Flare Radius");
-        ReadNumber(&node.Light.UnknownArray.nOffset, 8, sLight + "Unknown Array > Offset");
-        ReadNumber(&node.Light.UnknownArray.nCount, 8, sLight + "Unknown Array > Count 1");
-        ReadNumber(&node.Light.UnknownArray.nCount2, 8, sLight + "Unknown Array > Count 2");
-        ReadNumber(&node.Light.FlareSizeArray.nOffset, 6, sLight + "Flare Sizes > Offset");
-        ReadNumber(&node.Light.FlareSizeArray.nCount, 1, sLight + "Flare Sizes > Count 1");
-        ReadNumber(&node.Light.FlareSizeArray.nCount2, 1, sLight + "Flare Sizes > Count 2");
-        ReadNumber(&node.Light.FlarePositionArray.nOffset, 6, sLight + "Flare Positions > Offset");
-        ReadNumber(&node.Light.FlarePositionArray.nCount, 1, sLight + "Flare Positions > Count 1");
-        ReadNumber(&node.Light.FlarePositionArray.nCount2, 1, sLight + "Flare Positions > Count 2");
-        ReadNumber(&node.Light.FlareColorShiftArray.nOffset, 6, sLight + "Flare Color Shifts > Offset");
-        ReadNumber(&node.Light.FlareColorShiftArray.nCount, 1, sLight + "Flare Color Shifts > Count 1");
-        ReadNumber(&node.Light.FlareColorShiftArray.nCount2, 1, sLight + "Flare Color Shifts > Count 2");
-        ReadNumber(&node.Light.FlareTextureNameArray.nOffset, 6, sLight + "Flare Texture Names > Offset");
-        ReadNumber(&node.Light.FlareTextureNameArray.nCount, 1, sLight + "Flare Texture Names > Count 1");
-        ReadNumber(&node.Light.FlareTextureNameArray.nCount2, 1, sLight + "Flare Texture Names > Count 2");
+        std::string sLight = sNode.substr(0, sNode.size() - 3) + " > Header > Light";
+        node.Light.fFlareRadius = ReadNumber<float>(nullptr, 2, sLight);
+        ReadNumber(&node.Light.UnknownArray.nOffset, 8, sLight);
+        ReadNumber(&node.Light.UnknownArray.nCount, 8, sLight);
+        ReadNumber(&node.Light.UnknownArray.nCount2, 8, sLight);
+        ReadNumber(&node.Light.FlareSizeArray.nOffset, 6, sLight);
+        ReadNumber(&node.Light.FlareSizeArray.nCount, 1, sLight);
+        ReadNumber(&node.Light.FlareSizeArray.nCount2, 1, sLight);
+        ReadNumber(&node.Light.FlarePositionArray.nOffset, 6, sLight);
+        ReadNumber(&node.Light.FlarePositionArray.nCount, 1, sLight);
+        ReadNumber(&node.Light.FlarePositionArray.nCount2, 1, sLight);
+        ReadNumber(&node.Light.FlareColorShiftArray.nOffset, 6, sLight);
+        ReadNumber(&node.Light.FlareColorShiftArray.nCount, 1, sLight);
+        ReadNumber(&node.Light.FlareColorShiftArray.nCount2, 1, sLight);
+        ReadNumber(&node.Light.FlareTextureNameArray.nOffset, 6, sLight);
+        ReadNumber(&node.Light.FlareTextureNameArray.nCount, 1, sLight);
+        ReadNumber(&node.Light.FlareTextureNameArray.nCount2, 1, sLight);
 
-        ReadNumber(node.Light.nLightPriority.GetPtr(), 4, sLight + "Light Priority");
-        ReadNumber(node.Light.nAmbientOnly.GetPtr(), 4, sLight + "Ambient Only");
-        ReadNumber(node.Light.nDynamicType.GetPtr(), 4, sLight + "Dynamic Type");
-        ReadNumber(node.Light.nAffectDynamic.GetPtr(), 4, sLight + "Affect Dynamic");
-        ReadNumber(node.Light.nShadow.GetPtr(), 4, sLight + "Shadow");
-        ReadNumber(node.Light.nFlare.GetPtr(), 4, sLight + "Flare");
-        ReadNumber(node.Light.nFadingLight.GetPtr(), 4, sLight + "Fading Light");
+        ReadNumber(node.Light.nLightPriority.GetPtr(), 4, sLight);
+        ReadNumber(node.Light.nAmbientOnly.GetPtr(), 4, sLight);
+        ReadNumber(node.Light.nDynamicType.GetPtr(), 4, sLight);
+        ReadNumber(node.Light.nAffectDynamic.GetPtr(), 4, sLight);
+        ReadNumber(node.Light.nShadow.GetPtr(), 4, sLight);
+        ReadNumber(node.Light.nFlare.GetPtr(), 4, sLight);
+        ReadNumber(node.Light.nFadingLight.GetPtr(), 4, sLight);
         MarkDataBorder(nPosition - 1);
 
-        node.Light.v_dataRegions.resize(std::max(node.Light.FlareSizeArray.nCount,
-                                        std::max(node.Light.FlarePositionArray.nCount,
-                                        std::max(node.Light.FlareColorShiftArray.nCount,
-                                        node.Light.FlareTextureNameArray.nCount))));
 
         if(node.Light.FlareTextureNameArray.nCount > 0){
             node.Light.FlareTextureNames.resize(node.Light.FlareTextureNameArray.nCount);
-            nPosData = MDL_OFFSET + node.Light.FlareTextureNameArray.nOffset;
-            for(int n = 0; n < node.Light.FlareTextureNameArray.nCount; n++){
-                /// Setting up the pointer to the data
-                node.Light.v_dataRegions.at(n).emplace_back("MDL", nPosData, 4);
+            nPosData = MdlArrayDataOffset(node.Light.FlareTextureNameArray, "light flare texture-name array");
+            for(unsigned int n = 0; n < node.Light.FlareTextureNameArray.nCount; n++){
 
-                ReadNumber(&node.Light.FlareTextureNames[n].nOffset, 6, sLight + "Flare Texture Name Offset " + std::to_string(n), &nPosData);
+                ReadNumber(&node.Light.FlareTextureNames[n].nOffset, 6, sLight, &nPosData);
                 MarkDataBorder(nPosData - 1);
 
-                unsigned nPosData2 = MDL_OFFSET + node.Light.FlareTextureNames[n].nOffset;
+                unsigned nPosData2 = RequiredMdlDataOffset(node.Light.FlareTextureNames[n].nOffset, "light flare texture name");
 
-                /// Setting up the pointer to the data
-                node.Light.v_dataRegions.at(n).emplace_back("MDL", nPosData2, strlen(reinterpret_cast<const char *>(&sBuffer.at(nPosData2))) + 1);
 
-                ReadString(&node.Light.FlareTextureNames[n].sName, 0, 3, sLight + "Flare Texture Name String " + std::to_string(n), &nPosData2);
+                ReadString(&node.Light.FlareTextureNames[n].sName, 0, 3, sLight, &nPosData2);
             }
         }
         if(node.Light.FlareSizeArray.nCount > 0){
             node.Light.FlareSizes.resize(node.Light.FlareSizeArray.nCount);
-            nPosData = MDL_OFFSET + node.Light.FlareSizeArray.nOffset;
-            for(int n = 0; n < node.Light.FlareSizeArray.nCount; n++){
-                /// Setting up the pointer to the data
-                node.Light.v_dataRegions.at(n).emplace_back("MDL", nPosData, 4);
+            nPosData = MdlArrayDataOffset(node.Light.FlareSizeArray, "light flare size array");
+            for(unsigned int n = 0; n < node.Light.FlareSizeArray.nCount; n++){
 
-                node.Light.FlareSizes[n] = ReadNumber<float>(nullptr, 2, sLight + "Flare Size " + std::to_string(n), &nPosData);
+                node.Light.FlareSizes[n] = ReadNumber<float>(nullptr, 2, sLight, &nPosData);
                 MarkDataBorder(nPosData - 1);
             }
         }
         if(node.Light.FlarePositionArray.nCount > 0){
             node.Light.FlarePositions.resize(node.Light.FlarePositionArray.nCount);
-            nPosData = MDL_OFFSET + node.Light.FlarePositionArray.nOffset;
-            for(int n = 0; n < node.Light.FlarePositionArray.nCount; n++){
-                /// Setting up the pointer to the data
-                node.Light.v_dataRegions.at(n).emplace_back("MDL", nPosData, 4);
+            nPosData = MdlArrayDataOffset(node.Light.FlarePositionArray, "light flare position array");
+            for(unsigned int n = 0; n < node.Light.FlarePositionArray.nCount; n++){
 
-                node.Light.FlarePositions[n] = ReadNumber<float>(nullptr, 2, sLight + "Flare Position " + std::to_string(n), &nPosData);
+                node.Light.FlarePositions[n] = ReadNumber<float>(nullptr, 2, sLight, &nPosData);
                 MarkDataBorder(nPosData - 1);
             }
         }
         if(node.Light.FlareColorShiftArray.nCount > 0){
             node.Light.FlareColorShifts.resize(node.Light.FlareColorShiftArray.nCount);
-            nPosData = MDL_OFFSET + node.Light.FlareColorShiftArray.nOffset;
-            for(int n = 0; n < node.Light.FlareColorShiftArray.nCount; n++){
-                /// Setting up the pointer to the data
-                node.Light.v_dataRegions.at(n).emplace_back("MDL", nPosData, 12);
+            nPosData = MdlArrayDataOffset(node.Light.FlareColorShiftArray, "light flare color-shift array");
+            for(unsigned int n = 0; n < node.Light.FlareColorShiftArray.nCount; n++){
 
-                node.Light.FlareColorShifts[n].fR = ReadNumber<float>(nullptr, 2, sLight + "Flare Color Shift " + std::to_string(n) + " > R", &nPosData);
-                node.Light.FlareColorShifts[n].fG = ReadNumber<float>(nullptr, 2, sLight + "Flare Color Shift " + std::to_string(n) + " > G", &nPosData);
-                node.Light.FlareColorShifts[n].fB = ReadNumber<float>(nullptr, 2, sLight + "Flare Color Shift " + std::to_string(n) + " > B", &nPosData);
+                node.Light.FlareColorShifts[n].fR = ReadNumber<float>(nullptr, 2, sLight, &nPosData);
+                node.Light.FlareColorShifts[n].fG = ReadNumber<float>(nullptr, 2, sLight, &nPosData);
+                node.Light.FlareColorShifts[n].fB = ReadNumber<float>(nullptr, 2, sLight, &nPosData);
                 MarkDataBorder(nPosData - 1);
             }
         }
     }
 
     if(node.Head.nType & NODE_EMITTER){
-        std::string sEmitter = sNode + "Emitter > ";
-        node.Emitter.fDeadSpace = ReadNumber<float>(nullptr, 2, sEmitter + "Dead Space");
-        node.Emitter.fBlastRadius = ReadNumber<float>(nullptr, 2, sEmitter + "Blast Radius");
-        node.Emitter.fBlastLength = ReadNumber<float>(nullptr, 2, sEmitter + "Blast Length");
+        std::string sEmitter = sNode.substr(0, sNode.size() - 3) + " > Header > Emitter";
+        node.Emitter.fDeadSpace = ReadNumber<float>(nullptr, 2, sEmitter);
+        node.Emitter.fBlastRadius = ReadNumber<float>(nullptr, 2, sEmitter);
+        node.Emitter.fBlastLength = ReadNumber<float>(nullptr, 2, sEmitter);
 
-        ReadNumber(&node.Emitter.nBranchCount, 1, sEmitter + "Branch Count");
-        node.Emitter.fControlPointSmoothing = ReadNumber<float>(nullptr, 2, sEmitter + "Control Point Smoothing");
+        ReadNumber(&node.Emitter.nBranchCount, 1, sEmitter);
+        node.Emitter.fControlPointSmoothing = ReadNumber<float>(nullptr, 2, sEmitter);
 
-        ReadNumber(&node.Emitter.nxGrid, 4, sEmitter + "xGrid");
-        ReadNumber(&node.Emitter.nyGrid, 4, sEmitter + "yGrid");
+        ReadNumber(&node.Emitter.nxGrid, 4, sEmitter);
+        ReadNumber(&node.Emitter.nyGrid, 4, sEmitter);
 
-        ReadNumber(&node.Emitter.nSpawnType, 4, sEmitter + "SpawnType");
+        ReadNumber(&node.Emitter.nSpawnType, 4, sEmitter);
 
-        ReadString(&node.Emitter.cUpdate, 32, 3, sEmitter + "Update");
-        ReadString(&node.Emitter.cRender, 32, 3, sEmitter + "Render");
-        ReadString(&node.Emitter.cBlend, 32, 3, sEmitter + "Blend");
-        ReadString(&node.Emitter.cTexture, 32, 3, sEmitter + "Texture");
-        ReadString(&node.Emitter.cChunkName, 16, 3, sEmitter + "Chunk Name");
+        ReadString(&node.Emitter.cUpdate, 32, 3, sEmitter);
+        ReadString(&node.Emitter.cRender, 32, 3, sEmitter);
+        ReadString(&node.Emitter.cBlend, 32, 3, sEmitter);
+        ReadString(&node.Emitter.cTexture, 32, 3, sEmitter);
+        ReadString(&node.Emitter.cChunkName, 16, 3, sEmitter);
 
-        ReadNumber(&node.Emitter.nTwosidedTex, 4, sEmitter + "Twosided Tex");
-        ReadNumber(&node.Emitter.nLoop, 4, sEmitter + "Loop");
-        ReadNumber(&node.Emitter.nRenderOrder, 5, sEmitter + "Render Order");
-        ReadNumber(&node.Emitter.nFrameBlending, 7, sEmitter + "Frame Blending");
-        ReadString(&node.Emitter.cDepthTextureName, 32, 3, sEmitter + "Depth Texture Name");
-        ReadNumber(&node.Emitter.nPadding1, 11, sEmitter + "Padding");
-        ReadNumber(&node.Emitter.nFlags, 4, sEmitter + "Flags");
+        ReadNumber(&node.Emitter.nTwosidedTex, 4, sEmitter);
+        ReadNumber(&node.Emitter.nLoop, 4, sEmitter);
+        ReadNumber(&node.Emitter.nRenderOrder, 5, sEmitter);
+        ReadNumber(&node.Emitter.nFrameBlending, 7, sEmitter);
+        ReadString(&node.Emitter.cDepthTextureName, 32, 3, sEmitter);
+        ReadNumber(&node.Emitter.nPadding1, 11, sEmitter);
+        ReadNumber(&node.Emitter.nFlags, 4, sEmitter);
         MarkDataBorder(nPosition - 1);
     }
 
     if(node.Head.nType & NODE_REFERENCE){
-        std::string sReference = sNode + "Reference > ";
-        ReadString(&node.Reference.sRefModel, 32, 3, sReference + "Reference Model");
-        ReadNumber(&node.Reference.nReattachable, 4, sReference + "Reattachable");
+        std::string sReference = sNode.substr(0, sNode.size() - 3) + " > Header > Reference";
+        ReadString(&node.Reference.sRefModel, 32, 3, sReference);
+        ReadNumber(&node.Reference.nReattachable, 4, sReference);
         MarkDataBorder(nPosition - 1);
     }
 
     if(node.Head.nType & NODE_MESH){
-        std::string sMesh = sNode + "Mesh > ";
+        std::string sMesh = sNode.substr(0, sNode.size() - 3) + " > Header > Mesh";
+        std::string sMeshData = sNode.substr(0, sNode.size() - 3);
       try{
-        ReadNumber(&node.Mesh.nFunctionPointer0, 9, sMesh + "Function Pointer 1");
-        ReadNumber(&node.Mesh.nFunctionPointer1, 9, sMesh + "Function Pointer 2");
+        ReadNumber(&node.Mesh.nFunctionPointer0, 9, sMesh);
+        ReadNumber(&node.Mesh.nFunctionPointer1, 9, sMesh);
 
-        ReadNumber(&node.Mesh.FaceArray.nOffset, 6, sMesh + "Face Array > Offset");
-        ReadNumber(&node.Mesh.FaceArray.nCount, 1, sMesh + "Face Array > Count 1");
-        ReadNumber(&node.Mesh.FaceArray.nCount2, 1, sMesh + "Face Array > Count 2");
+        ReadNumber(&node.Mesh.FaceArray.nOffset, 6, sMesh);
+        ReadNumber(&node.Mesh.FaceArray.nCount, 1, sMesh);
+        ReadNumber(&node.Mesh.FaceArray.nCount2, 1, sMesh);
 
-        node.Mesh.vBBmin.fX = ReadNumber<float>(nullptr, 2, sMesh + "Bounding Box Min > X");
-        node.Mesh.vBBmin.fY = ReadNumber<float>(nullptr, 2, sMesh + "Bounding Box Min > Y");
-        node.Mesh.vBBmin.fZ = ReadNumber<float>(nullptr, 2, sMesh + "Bounding Box Min > Z");
-        node.Mesh.vBBmax.fX = ReadNumber<float>(nullptr, 2, sMesh + "Bounding Box Max > X");
-        node.Mesh.vBBmax.fY = ReadNumber<float>(nullptr, 2, sMesh + "Bounding Box Max > Y");
-        node.Mesh.vBBmax.fZ = ReadNumber<float>(nullptr, 2, sMesh + "Bounding Box Max > Z");
-        node.Mesh.fRadius = ReadNumber<float>(nullptr, 2, sMesh + "Radius");
-        node.Mesh.vAverage.fX = ReadNumber<float>(nullptr, 2, sMesh + "Average > X");
-        node.Mesh.vAverage.fY = ReadNumber<float>(nullptr, 2, sMesh + "Average > Y");
-        node.Mesh.vAverage.fZ = ReadNumber<float>(nullptr, 2, sMesh + "Average > Z");
-        node.Mesh.fDiffuse.fR = ReadNumber<float>(nullptr, 2, sMesh + "Diffuse > R");
-        node.Mesh.fDiffuse.fG = ReadNumber<float>(nullptr, 2, sMesh + "Diffuse > G");
-        node.Mesh.fDiffuse.fB = ReadNumber<float>(nullptr, 2, sMesh + "Diffuse > B");
-        node.Mesh.fAmbient.fR = ReadNumber<float>(nullptr, 2, sMesh + "Ambient > R");
-        node.Mesh.fAmbient.fG = ReadNumber<float>(nullptr, 2, sMesh + "Ambient > G");
-        node.Mesh.fAmbient.fB = ReadNumber<float>(nullptr, 2, sMesh + "Ambient > B");
+        node.Mesh.vBBmin.fX = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.vBBmin.fY = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.vBBmin.fZ = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.vBBmax.fX = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.vBBmax.fY = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.vBBmax.fZ = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.fRadius = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.vAverage.fX = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.vAverage.fY = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.vAverage.fZ = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.fDiffuse.fR = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.fDiffuse.fG = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.fDiffuse.fB = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.fAmbient.fR = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.fAmbient.fG = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.fAmbient.fB = ReadNumber<float>(nullptr, 2, sMesh);
 
-        ReadNumber(&node.Mesh.nTransparencyHint, 4, sMesh + "Transparency Hint");
+        ReadNumber(&node.Mesh.nTransparencyHint, 4, sMesh);
 
-        ReadString(&node.Mesh.cTexture1, 32, 3, sMesh + "Bitmap 1");
-        ReadString(&node.Mesh.cTexture2, 32, 3, sMesh + "Bitmap 2");
-        ReadString(&node.Mesh.cTexture3, 12, 3, sMesh + "Texture 0");
-        ReadString(&node.Mesh.cTexture4, 12, 3, sMesh + "Texture 1");
+        ReadString(&node.Mesh.cTexture1, 32, 3, sMesh);
+        ReadString(&node.Mesh.cTexture2, 32, 3, sMesh);
+        ReadString(&node.Mesh.cTexture3, 12, 3, sMesh);
+        ReadString(&node.Mesh.cTexture4, 12, 3, sMesh);
 
-        ReadNumber(&node.Mesh.IndexCounterArray.nOffset, 6, sMesh + "Index Count Array > Offset");
-        ReadNumber(&node.Mesh.IndexCounterArray.nCount, 1, sMesh + "Index Count Array > Count 1");
-        ReadNumber(&node.Mesh.IndexCounterArray.nCount2, 1, sMesh + "Index Count Array > Count 2");
+        ReadNumber(&node.Mesh.IndexCounterArray.nOffset, 6, sMesh);
+        ReadNumber(&node.Mesh.IndexCounterArray.nCount, 1, sMesh);
+        ReadNumber(&node.Mesh.IndexCounterArray.nCount2, 1, sMesh);
 
-        ReadNumber(&node.Mesh.IndexLocationArray.nOffset, 6, sMesh + "Index Loc Array > Offset");
-        ReadNumber(&node.Mesh.IndexLocationArray.nCount, 1, sMesh + "Index Loc Array > Count 1");
-        ReadNumber(&node.Mesh.IndexLocationArray.nCount2, 1, sMesh + "Index Loc Array > Count 2");
+        ReadNumber(&node.Mesh.IndexLocationArray.nOffset, 6, sMesh);
+        ReadNumber(&node.Mesh.IndexLocationArray.nCount, 1, sMesh);
+        ReadNumber(&node.Mesh.IndexLocationArray.nCount2, 1, sMesh);
 
-        ReadNumber(&node.Mesh.MeshInvertedCounterArray.nOffset, 6, sMesh + "Inv Counter Array > Offset");
-        ReadNumber(&node.Mesh.MeshInvertedCounterArray.nCount, 1, sMesh + "Inv Counter Array > Count 1");
-        ReadNumber(&node.Mesh.MeshInvertedCounterArray.nCount2, 1, sMesh + "Inv Counter Array > Count 2");
+        ReadNumber(&node.Mesh.MeshInvertedCounterArray.nOffset, 6, sMesh);
+        ReadNumber(&node.Mesh.MeshInvertedCounterArray.nCount, 1, sMesh);
+        ReadNumber(&node.Mesh.MeshInvertedCounterArray.nCount2, 1, sMesh);
 
-        ReadNumber(&node.Mesh.nUnknown3[0], 11, sMesh + "Unknown");
-        ReadNumber(&node.Mesh.nUnknown3[1], 8, sMesh + "Unknown");
-        ReadNumber(&node.Mesh.nUnknown3[2], 8, sMesh + "Unknown");
+        ReadNumber(&node.Mesh.nUnknown3[0], 11, sMesh);
+        ReadNumber(&node.Mesh.nUnknown3[1], 8, sMesh);
+        ReadNumber(&node.Mesh.nUnknown3[2], 8, sMesh);
 
-        ReadNumber(&node.Mesh.nSaberUnknown1, 11, sMesh + "Unknown");
-        ReadNumber(&node.Mesh.nSaberUnknown2, 11, sMesh + "Unknown");
-        ReadNumber(&node.Mesh.nSaberUnknown3, 11, sMesh + "Unknown");
-        ReadNumber(&node.Mesh.nSaberUnknown4, 11, sMesh + "Unknown");
-        ReadNumber(&node.Mesh.nSaberUnknown5, 11, sMesh + "Unknown");
-        ReadNumber(&node.Mesh.nSaberUnknown6, 11, sMesh + "Unknown");
-        ReadNumber(&node.Mesh.nSaberUnknown7, 11, sMesh + "Unknown");
-        ReadNumber(&node.Mesh.nSaberUnknown8, 11, sMesh + "Unknown");
+        ReadNumber(&node.Mesh.nSaberUnknown1, 11, sMesh);
+        ReadNumber(&node.Mesh.nSaberUnknown2, 11, sMesh);
+        ReadNumber(&node.Mesh.nSaberUnknown3, 11, sMesh);
+        ReadNumber(&node.Mesh.nSaberUnknown4, 11, sMesh);
+        ReadNumber(&node.Mesh.nSaberUnknown5, 11, sMesh);
+        ReadNumber(&node.Mesh.nSaberUnknown6, 11, sMesh);
+        ReadNumber(&node.Mesh.nSaberUnknown7, 11, sMesh);
+        ReadNumber(&node.Mesh.nSaberUnknown8, 11, sMesh);
 
-        ReadNumber(&node.Mesh.nAnimateUV, 4, sMesh + "Animate UV");
-        node.Mesh.fUVDirectionX = ReadNumber<float>(nullptr, 2, sMesh + "UV Direction X");
-        node.Mesh.fUVDirectionY = ReadNumber<float>(nullptr, 2, sMesh + "UV Direction Y");
-        node.Mesh.fUVJitter = ReadNumber<float>(nullptr, 2, sMesh + "UV Jitter");
-        node.Mesh.fUVJitterSpeed = ReadNumber<float>(nullptr, 2, sMesh + "UV Jitter Speed");
+        ReadNumber(&node.Mesh.nAnimateUV, 4, sMesh);
+        node.Mesh.fUVDirectionX = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.fUVDirectionY = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.fUVJitter = ReadNumber<float>(nullptr, 2, sMesh);
+        node.Mesh.fUVJitterSpeed = ReadNumber<float>(nullptr, 2, sMesh);
 
-        ReadNumber(&node.Mesh.nMdxDataSize, 1, sMesh + "MDX Data Size");
-        ReadNumber(&node.Mesh.nMdxDataBitmap, 4, sMesh + "MDX Data Bitmap");
+        ReadNumber(&node.Mesh.nMdxDataSize, 1, sMesh);
+        ReadNumber(&node.Mesh.nMdxDataBitmap, 4, sMesh);
 
-        ReadNumber(node.Mesh.nOffsetToMdxVertex.GetPtr(), 6, sMesh + "Offset To MDX Verts");
-        ReadNumber(node.Mesh.nOffsetToMdxNormal.GetPtr(), 6, sMesh + "Offset To MDX Normals");
-        ReadNumber(node.Mesh.nOffsetToMdxColor.GetPtr(), 6, sMesh + "Offset To MDX Colors");
-        ReadNumber(node.Mesh.nOffsetToMdxUV1.GetPtr(), 6, sMesh + "Offset To MDX UVs 1");
-        ReadNumber(node.Mesh.nOffsetToMdxUV2.GetPtr(), 6, sMesh + "Offset To MDX UVs 2");
-        ReadNumber(node.Mesh.nOffsetToMdxUV3.GetPtr(), 6, sMesh + "Offset To MDX UVs 3");
-        ReadNumber(node.Mesh.nOffsetToMdxUV4.GetPtr(), 6, sMesh + "Offset To MDX UVs 4");
-        ReadNumber(node.Mesh.nOffsetToMdxTangent1.GetPtr(), 6, sMesh + "Offset To MDX Tangent Space 1");
-        ReadNumber(node.Mesh.nOffsetToMdxTangent2.GetPtr(), 6, sMesh + "Offset To MDX Tangent Space 2");
-        ReadNumber(node.Mesh.nOffsetToMdxTangent3.GetPtr(), 6, sMesh + "Offset To MDX Tangent Space 3");
-        ReadNumber(node.Mesh.nOffsetToMdxTangent4.GetPtr(), 6, sMesh + "Offset To MDX Tangent Space 4");
+        ReadNumber(node.Mesh.nOffsetToMdxVertex.GetPtr(), 6, sMesh);
+        ReadNumber(node.Mesh.nOffsetToMdxNormal.GetPtr(), 6, sMesh);
+        ReadNumber(node.Mesh.nOffsetToMdxColor.GetPtr(), 6, sMesh);
+        ReadNumber(node.Mesh.nOffsetToMdxUV1.GetPtr(), 6, sMesh);
+        ReadNumber(node.Mesh.nOffsetToMdxUV2.GetPtr(), 6, sMesh);
+        ReadNumber(node.Mesh.nOffsetToMdxUV3.GetPtr(), 6, sMesh);
+        ReadNumber(node.Mesh.nOffsetToMdxUV4.GetPtr(), 6, sMesh);
+        ReadNumber(node.Mesh.nOffsetToMdxTangent1.GetPtr(), 6, sMesh);
+        ReadNumber(node.Mesh.nOffsetToMdxTangent2.GetPtr(), 6, sMesh);
+        ReadNumber(node.Mesh.nOffsetToMdxTangent3.GetPtr(), 6, sMesh);
+        ReadNumber(node.Mesh.nOffsetToMdxTangent4.GetPtr(), 6, sMesh);
 
-        ReadNumber(&node.Mesh.nNumberOfVerts, 1, sMesh + "Vert Number");
-        ReadNumber(&node.Mesh.nTextureNumber, 1, sMesh + "Texure Number");
+        ReadNumber(&node.Mesh.nNumberOfVerts, 1, sMeshData + " > Data > Mesh > Pointer to Vert Number");
+        ReadNumber(&node.Mesh.nTextureNumber, 1, sMesh);
 
-        ReadNumber(&node.Mesh.nHasLightmap, 7, sMesh + "Has Lightmap");
-        ReadNumber(&node.Mesh.nRotateTexture, 7, sMesh + "Rotate Texture");
-        ReadNumber(&node.Mesh.nBackgroundGeometry, 7, sMesh + "Background Geometry");
-        ReadNumber(&node.Mesh.nShadow, 7, sMesh + "Shadow");
-        ReadNumber(&node.Mesh.nBeaming, 7, sMesh + "Beaming");
-        ReadNumber(&node.Mesh.nRender, 7, sMesh + "Render");
+        ReadNumber(&node.Mesh.nHasLightmap, 7, sMesh);
+        ReadNumber(&node.Mesh.nRotateTexture, 7, sMesh);
+        ReadNumber(&node.Mesh.nBackgroundGeometry, 7, sMesh);
+        ReadNumber(&node.Mesh.nShadow, 7, sMesh);
+        ReadNumber(&node.Mesh.nBeaming, 7, sMesh);
+        ReadNumber(&node.Mesh.nRender, 7, sMesh);
 
-        if(bK2) ReadNumber(&node.Mesh.nDirtEnabled, 7, sMesh + "Dirt Enabled");
-        if(bK2) ReadNumber(&node.Mesh.nPadding1, 11, sMesh + "Padding");
-        if(bK2) ReadNumber(&node.Mesh.nDirtTexture, 5, sMesh + "Dirt Texture");
-        if(bK2) ReadNumber(&node.Mesh.nDirtCoordSpace, 5, sMesh + "Dirt Coord Space");
-        if(bK2) ReadNumber(&node.Mesh.nHideInHolograms, 7, sMesh + "Hide In Holograms");
-        if(bK2) ReadNumber(&node.Mesh.nPadding2, 11, sMesh + "Padding");
+        if(bK2) ReadNumber(&node.Mesh.nDirtEnabled, 7, sMesh);
+        if(bK2) ReadNumber(&node.Mesh.nPadding1, 11, sMesh);
+        if(bK2) ReadNumber(&node.Mesh.nDirtTexture, 5, sMesh);
+        if(bK2) ReadNumber(&node.Mesh.nDirtCoordSpace, 5, sMesh);
+        if(bK2) ReadNumber(&node.Mesh.nHideInHolograms, 7, sMesh);
+        if(bK2) ReadNumber(&node.Mesh.nPadding2, 11, sMesh);
 
-        ReadNumber(&node.Mesh.nPadding3, 11, sMesh + "Padding");
+        ReadNumber(&node.Mesh.nPadding3, 11, sMesh);
 
-        node.Mesh.fTotalArea = ReadNumber<float>(nullptr, 2, sMesh + "Total Area");
-        ReadNumber(&node.Mesh.nPadding, 8, sMesh + "Padding");
-        ReadNumber(&node.Mesh.nOffsetIntoMdx, 6, sMesh + "Offset Into MDX");
-        if(!bXbox) ReadNumber(&node.Mesh.nOffsetToVertArray, 6, sMesh + "Offset To Vert Array");
+        node.Mesh.fTotalArea = ReadNumber<float>(nullptr, 2, sMesh);
+        ReadNumber(&node.Mesh.nPadding, 8, sMesh);
+        ReadNumber(&node.Mesh.nOffsetIntoMdx, 6, sMesh);
+        if(!bXbox) ReadNumber(&node.Mesh.nOffsetToVertArray, 6, sMesh);
         MarkDataBorder(nPosition - 1);
       }
       catch(const std::exception & e){
@@ -781,24 +990,24 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
 
         if(node.Mesh.IndexCounterArray.nCount > 0){
             //I am assuming here that the pointer can only ever be a single one
-            nPosData = MDL_OFFSET + node.Mesh.IndexCounterArray.nOffset;
-            ReadNumber(&node.Mesh.nVertIndicesCount, 1, sMesh + "Vert Indices Count", &nPosData);
+            nPosData = MdlArrayDataOffset(node.Mesh.IndexCounterArray, "mesh index-counter array");
+            ReadNumber(&node.Mesh.nVertIndicesCount, 1, sMeshData + " > Data > Mesh > Inverted Counter", &nPosData);
             MarkDataBorder(nPosData - 1);
         }
         else node.Mesh.nVertIndicesCount = 0;
 
         if(node.Mesh.IndexLocationArray.nCount > 0){
             //I am assuming here that the pointer can only ever be a single one
-            nPosData = MDL_OFFSET + node.Mesh.IndexLocationArray.nOffset;
-            ReadNumber(&node.Mesh.nVertIndicesLocation, 6, sMesh + "Vert Indices Loc", &nPosData);
+            nPosData = MdlArrayDataOffset(node.Mesh.IndexLocationArray, "mesh index-location array");
+            ReadNumber(&node.Mesh.nVertIndicesLocation, 6, sMeshData + " > Data > Mesh > Pointer to Vert Indices", &nPosData);
             MarkDataBorder(nPosData - 1);
         }
         else node.Mesh.nVertIndicesLocation = 0;
 
         if(node.Mesh.MeshInvertedCounterArray.nCount > 0){
             //I am assuming here that the pointer can only ever be a single one
-            nPosData = MDL_OFFSET + node.Mesh.MeshInvertedCounterArray.nOffset;
-            ReadNumber(node.Mesh.nMeshInvertedCounter.GetPtr(), 4, sMesh + "Inverted Counter", &nPosData);
+            nPosData = MdlArrayDataOffset(node.Mesh.MeshInvertedCounterArray, "mesh inverted-counter array");
+            ReadNumber(node.Mesh.nMeshInvertedCounter.GetPtr(), 4, sMeshData + " > Data > Mesh > Inverted Counter", &nPosData);
             MarkDataBorder(nPosData - 1);
         }
         else node.Mesh.nMeshInvertedCounter = 0;
@@ -806,42 +1015,40 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
         if(node.Mesh.FaceArray.nCount > 0){
             node.Mesh.Faces.resize(node.Mesh.FaceArray.nCount);
             if(node.Mesh.IndexLocationArray.nCount > 0) node.Mesh.VertIndices.resize(node.Mesh.FaceArray.nCount);
-            nPosData = MDL_OFFSET + node.Mesh.FaceArray.nOffset;
+            nPosData = MdlArrayDataOffset(node.Mesh.FaceArray, "mesh face array");
             unsigned int nPosData2;
-            if(node.Mesh.IndexLocationArray.nCount > 0) nPosData2 = MDL_OFFSET + node.Mesh.nVertIndicesLocation;
-            for(int n = 0; n < node.Mesh.FaceArray.nCount; n++){
+            if(node.Mesh.IndexLocationArray.nCount > 0) nPosData2 = RequiredMdlDataOffset(node.Mesh.nVertIndicesLocation, "mesh inverted-index data");
+            for(unsigned int n = 0; n < node.Mesh.FaceArray.nCount; n++){
                 node.Mesh.Faces.at(n).nNameIndex = node.Head.nNameIndex;
 
-                /// Setting up the pointer to the data
-                node.Mesh.Faces.at(n).dataRegions.emplace_back("MDL", nPosData, 32);
 
-                node.Mesh.Faces[n].vNormal.fX = ReadNumber<float>(nullptr, 2, sMesh + "Face " + std::to_string(n) + " > Normal > X", &nPosData);
-                node.Mesh.Faces[n].vNormal.fY = ReadNumber<float>(nullptr, 2, sMesh + "Face " + std::to_string(n) + " > Normal > Y", &nPosData);
-                node.Mesh.Faces[n].vNormal.fZ = ReadNumber<float>(nullptr, 2, sMesh + "Face " + std::to_string(n) + " > Normal > Z", &nPosData);
-                node.Mesh.Faces[n].fDistance = ReadNumber<float>(nullptr, 2, sMesh + "Face " + std::to_string(n) + " > Plane Distance", &nPosData);
+                node.Mesh.Faces[n].vNormal.fX = ReadNumber<float>(nullptr, 2, sMeshData + " > Data > Mesh > Faces > Face " + std::to_string(n), &nPosData);
+                node.Mesh.Faces[n].vNormal.fY = ReadNumber<float>(nullptr, 2, sMeshData + " > Data > Mesh > Faces > Face " + std::to_string(n), &nPosData);
+                node.Mesh.Faces[n].vNormal.fZ = ReadNumber<float>(nullptr, 2, sMeshData + " > Data > Mesh > Faces > Face " + std::to_string(n), &nPosData);
+                node.Mesh.Faces[n].fDistance = ReadNumber<float>(nullptr, 2, sMeshData + " > Data > Mesh > Faces > Face " + std::to_string(n), &nPosData);
 
-                ReadNumber(&node.Mesh.Faces[n].nMaterialID, 4, sMesh + "Face " + std::to_string(n) + " > Material ID", &nPosData);
-                //if(!bBinaryPostProcess) node.Mesh.Faces.at(n).nSmoothingGroup = node.Mesh.Faces[n].nMaterialID;
+                ReadNumber(&node.Mesh.Faces[n].nMaterialID, 4, sMeshData + " > Data > Mesh > Faces > Face " + std::to_string(n), &nPosData);
+                //if(!bDetermineSmoothing) node.Mesh.Faces.at(n).nSmoothingGroup = node.Mesh.Faces[n].nMaterialID;
 
-                ReadNumber(node.Mesh.Faces[n].nAdjacentFaces[0].GetPtr(), 5, sMesh + "Face " + std::to_string(n) + " > Adjacent Face 0", &nPosData);
-                ReadNumber(node.Mesh.Faces[n].nAdjacentFaces[1].GetPtr(), 5, sMesh + "Face " + std::to_string(n) + " > Adjacent Face 1", &nPosData);
-                ReadNumber(node.Mesh.Faces[n].nAdjacentFaces[2].GetPtr(), 5, sMesh + "Face " + std::to_string(n) + " > Adjacent Face 2", &nPosData);
-                ReadNumber(node.Mesh.Faces[n].nIndexVertex[0].GetPtr(), 5, sMesh + "Face " + std::to_string(n) + " > Vert Index 0", &nPosData);
-                ReadNumber(node.Mesh.Faces[n].nIndexVertex[1].GetPtr(), 5, sMesh + "Face " + std::to_string(n) + " > Vert Index 1", &nPosData);
-                ReadNumber(node.Mesh.Faces[n].nIndexVertex[2].GetPtr(), 5, sMesh + "Face " + std::to_string(n) + " > Vert Index 2", &nPosData);
+                ReadNumber(node.Mesh.Faces[n].nAdjacentFaces[0].GetPtr(), 5, sMeshData + " > Data > Mesh > Faces > Face " + std::to_string(n), &nPosData);
+                ReadNumber(node.Mesh.Faces[n].nAdjacentFaces[1].GetPtr(), 5, sMeshData + " > Data > Mesh > Faces > Face " + std::to_string(n), &nPosData);
+                ReadNumber(node.Mesh.Faces[n].nAdjacentFaces[2].GetPtr(), 5, sMeshData + " > Data > Mesh > Faces > Face " + std::to_string(n), &nPosData);
+                ReadNumber(node.Mesh.Faces[n].nIndexVertex[0].GetPtr(), 5, sMeshData + " > Data > Mesh > Vert Indices > Face " + std::to_string(n), &nPosData);
+                ReadNumber(node.Mesh.Faces[n].nIndexVertex[1].GetPtr(), 5, sMeshData + " > Data > Mesh > Vert Indices > Face " + std::to_string(n), &nPosData);
+                ReadNumber(node.Mesh.Faces[n].nIndexVertex[2].GetPtr(), 5, sMeshData + " > Data > Mesh > Vert Indices > Face " + std::to_string(n), &nPosData);
                 MarkDataBorder(nPosData - 1);
 
                 if(node.Mesh.IndexLocationArray.nCount > 0){
                     //std::cout << string_format("Reading VertIndices for face %i of %i, at position %i.\n", n, node.Mesh.FaceArray.nCount, nPosData2);
-                    ReadNumber(&node.Mesh.VertIndices[n].at(0), 5, sMesh + "Face " + std::to_string(n) + " > Vert Index 0", &nPosData2);
-                    ReadNumber(&node.Mesh.VertIndices[n].at(1), 5, sMesh + "Face " + std::to_string(n) + " > Vert Index 1", &nPosData2);
-                    ReadNumber(&node.Mesh.VertIndices[n].at(2), 5, sMesh + "Face " + std::to_string(n) + " > Vert Index 2", &nPosData2);
+                    ReadNumber(&node.Mesh.VertIndices[n].at(0), 5, sMeshData + " > Data > Mesh > Vert Indices > Face " + std::to_string(n), &nPosData2);
+                    ReadNumber(&node.Mesh.VertIndices[n].at(1), 5, sMeshData + " > Data > Mesh > Vert Indices > Face " + std::to_string(n), &nPosData2);
+                    ReadNumber(&node.Mesh.VertIndices[n].at(2), 5, sMeshData + " > Data > Mesh > Vert Indices > Face " + std::to_string(n), &nPosData2);
                     MarkDataBorder(nPosData2 - 1);
                 }
             }
             if(bReadSmoothing){
-                for(int n = 0; n < node.Mesh.FaceArray.nCount; n++){
-                    ReadNumber(&node.Mesh.Faces.at(n).nSmoothingGroup, 4, sMesh + "Face " + std::to_string(n) + "Smoothing Groups", &nPosData);
+                for(unsigned int n = 0; n < node.Mesh.FaceArray.nCount; n++){
+                    ReadNumber(&node.Mesh.Faces.at(n).nSmoothingGroup, 4, sMeshData + " > Data > Mesh > Faces > Face " + std::to_string(n), &nPosData);
                     MarkDataBorder(nPosData - 1);
                 }
             }
@@ -849,119 +1056,114 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
     }
 
     if(node.Head.nType & NODE_DANGLY){
-        std::string sDangly = sNode + "Dangly > ";
-        ReadNumber(&node.Dangly.ConstraintArray.nOffset, 6, sDangly + "Constraint Array > Offset");
-        ReadNumber(&node.Dangly.ConstraintArray.nCount, 1, sDangly + "Constraint Array > Count 1");
-        ReadNumber(&node.Dangly.ConstraintArray.nCount2, 1, sDangly + "Constraint Array > Count 2");
+        std::string sDangly = sNode.substr(0, sNode.size() - 3) + " > Header > Danglymesh";
+        std::string sDanglyData = sNode.substr(0, sNode.size() - 3);
+        ReadNumber(&node.Dangly.ConstraintArray.nOffset, 6, sDangly);
+        ReadNumber(&node.Dangly.ConstraintArray.nCount, 1, sDangly);
+        ReadNumber(&node.Dangly.ConstraintArray.nCount2, 1, sDangly);
 
-        node.Dangly.fDisplacement = ReadNumber<float>(nullptr, 2, sDangly + "Displacement");
-        node.Dangly.fTightness = ReadNumber<float>(nullptr, 2, sDangly + "Tightness");
-        node.Dangly.fPeriod = ReadNumber<float>(nullptr, 2, sDangly + "Period");
+        node.Dangly.fDisplacement = ReadNumber<float>(nullptr, 2, sDangly);
+        node.Dangly.fTightness = ReadNumber<float>(nullptr, 2, sDangly);
+        node.Dangly.fPeriod = ReadNumber<float>(nullptr, 2, sDangly);
 
-        ReadNumber(&node.Dangly.nOffsetToData2, 6, sDangly + "Offset To Vert Data");
+        ReadNumber(&node.Dangly.nOffsetToData2, 6, sDangly);
         MarkDataBorder(nPosition - 1);
 
         if(node.Dangly.ConstraintArray.nCount > 0){
-            node.Dangly.v_dataRegions.resize(node.Dangly.ConstraintArray.nCount);
             node.Dangly.Constraints.resize(node.Dangly.ConstraintArray.nCount);
             node.Dangly.Data2.resize(node.Dangly.ConstraintArray.nCount);
-            nPosData = MDL_OFFSET + node.Dangly.ConstraintArray.nOffset;
-            unsigned int nPosData2 = MDL_OFFSET + node.Dangly.nOffsetToData2;
-            for(int n = 0; n < node.Dangly.ConstraintArray.nCount; n++){
-                /// Setting up the pointer to the data
-                node.Dangly.v_dataRegions.at(n).emplace_back("MDL", nPosData, 4);
-                node.Dangly.v_dataRegions.at(n).emplace_back("MDL", nPosData2, 12);
+            nPosData = MdlArrayDataOffset(node.Dangly.ConstraintArray, "dangly constraint array");
+            unsigned int nPosData2 = RequiredMdlDataOffset(node.Dangly.nOffsetToData2, "dangly data2 array");
+            for(unsigned int n = 0; n < node.Dangly.ConstraintArray.nCount; n++){
 
-                node.Dangly.Constraints.at(n) = ReadNumber<float>(nullptr, 2, sDangly + "Constraint " + std::to_string(n), &nPosData);
+                node.Dangly.Constraints.at(n) = ReadNumber<float>(nullptr, 2, sDanglyData + " > Data > Danglymesh > Constraints > Constraint " + std::to_string(n), &nPosData);
                 MarkDataBorder(nPosData - 1);
 
-                node.Dangly.Data2.at(n).fX = ReadNumber<float>(nullptr, 2, sDangly + "Vertex " + std::to_string(n) + " > X", &nPosData2);
-                node.Dangly.Data2.at(n).fY = ReadNumber<float>(nullptr, 2, sDangly + "Vertex " + std::to_string(n) + " > Y", &nPosData2);
-                node.Dangly.Data2.at(n).fZ = ReadNumber<float>(nullptr, 2, sDangly + "Vertex " + std::to_string(n) + " > Z", &nPosData2);
+                node.Dangly.Data2.at(n).fX = ReadNumber<float>(nullptr, 2, sDanglyData + " > Data > Danglymesh > Data2 > Vertex " + std::to_string(n), &nPosData2);
+                node.Dangly.Data2.at(n).fY = ReadNumber<float>(nullptr, 2, sDanglyData + " > Data > Danglymesh > Data2 > Vertex " + std::to_string(n), &nPosData2);
+                node.Dangly.Data2.at(n).fZ = ReadNumber<float>(nullptr, 2, sDanglyData + " > Data > Danglymesh > Data2 > Vertex " + std::to_string(n), &nPosData2);
                 MarkDataBorder(nPosData2 - 1);
             }
         }
     }
 
     if(node.Head.nType & NODE_SKIN){
-        std::string sSkin = sNode + "Skin > ";
-        ReadNumber(&node.Skin.UnknownArray.nOffset, 8, sSkin + "Unknown Array > Offset");
-        ReadNumber(&node.Skin.UnknownArray.nCount, 8, sSkin + "Unknown Array > Count 1");
-        ReadNumber(&node.Skin.UnknownArray.nCount2, 8, sSkin + "Unknown Array > Count 2");
-        ReadNumber(&node.Skin.nOffsetToMdxWeightValues, 6, sSkin + "Offset To MDX Weights");
-        ReadNumber(&node.Skin.nOffsetToMdxBoneIndices, 6, sSkin + "Offset To MDX Indices");
+        std::string sSkin = sNode.substr(0, sNode.size() - 3) + " > Header > Skin";
+        std::string sSkinData = sNode.substr(0, sNode.size() - 3);
+        ReadNumber(&node.Skin.UnknownArray.nOffset, 8, sSkin);
+        ReadNumber(&node.Skin.UnknownArray.nCount, 8, sSkin);
+        ReadNumber(&node.Skin.UnknownArray.nCount2, 8, sSkin);
+        ReadNumber(&node.Skin.nOffsetToMdxWeightValues, 6, sSkin);
+        ReadNumber(&node.Skin.nOffsetToMdxBoneIndices, 6, sSkin);
 
-        ReadNumber(&node.Skin.nOffsetToBonemap, 6, sSkin + "Bonemap Offset");
-        ReadNumber(&node.Skin.nNumberOfBonemap, 1, sSkin + "Bonemap Count");
+        ReadNumber(&node.Skin.nOffsetToBonemap, 6, sSkin);
+        ReadNumber(&node.Skin.nNumberOfBonemap, 1, sSkin);
 
-        ReadNumber(&node.Skin.QBoneArray.nOffset, 6, sSkin + "QBone Array > Offset");
-        ReadNumber(&node.Skin.QBoneArray.nCount, 1, sSkin + "QBone Array > Count 1");
-        ReadNumber(&node.Skin.QBoneArray.nCount2, 1, sSkin + "QBone Array > Count 2");
+        ReadNumber(&node.Skin.QBoneArray.nOffset, 6, sSkin);
+        ReadNumber(&node.Skin.QBoneArray.nCount, 1, sSkin);
+        ReadNumber(&node.Skin.QBoneArray.nCount2, 1, sSkin);
 
-        ReadNumber(&node.Skin.TBoneArray.nOffset, 6, sSkin + "TBone Array > Offset");
-        ReadNumber(&node.Skin.TBoneArray.nCount, 1, sSkin + "TBone Array > Count 1");
-        ReadNumber(&node.Skin.TBoneArray.nCount2, 1, sSkin + "TBone Array > Count 2");
+        ReadNumber(&node.Skin.TBoneArray.nOffset, 6, sSkin);
+        ReadNumber(&node.Skin.TBoneArray.nCount, 1, sSkin);
+        ReadNumber(&node.Skin.TBoneArray.nCount2, 1, sSkin);
 
-        ReadNumber(&node.Skin.Array8Array.nOffset, 6, sSkin + "Garbage Array > Offset");
-        ReadNumber(&node.Skin.Array8Array.nCount, 1, sSkin + "Garbage Array > Count 1");
-        ReadNumber(&node.Skin.Array8Array.nCount2, 1, sSkin + "Garbage Array > Count 2");
+        ReadNumber(&node.Skin.Array8Array.nOffset, 6, sSkin);
+        ReadNumber(&node.Skin.Array8Array.nCount, 1, sSkin);
+        ReadNumber(&node.Skin.Array8Array.nCount2, 1, sSkin);
 
         for(int n = 0; n < 16; n++){
-            ReadNumber(&node.Skin.nBoneIndices[n], 5, sSkin + "Bone Index " + std::to_string(n));
+            ReadNumber(&node.Skin.nBoneIndices[n], 5, sSkin);
         }
-        ReadNumber(&node.Skin.nPadding1, 11, sSkin + "Padding");
-        ReadNumber(&node.Skin.nPadding2, 11, sSkin + "Padding");
+        ReadNumber(&node.Skin.nPadding1, 11, sSkin);
+        ReadNumber(&node.Skin.nPadding2, 11, sSkin);
         MarkDataBorder(nPosition - 1);
 
         if(node.Skin.nNumberOfBonemap != node.Skin.QBoneArray.nCount ||
+           node.Skin.nNumberOfBonemap != node.Skin.QBoneArray.nCount2 ||
            node.Skin.nNumberOfBonemap != node.Skin.TBoneArray.nCount ||
-           node.Skin.nNumberOfBonemap != node.Skin.Array8Array.nCount){
-            Error("Unexpected Error! The bone numbers do not match up for " + GetNodeName(node) + "! Will try to load the data anyway. ");
+           node.Skin.nNumberOfBonemap != node.Skin.TBoneArray.nCount2 ||
+           node.Skin.nNumberOfBonemap != node.Skin.Array8Array.nCount ||
+           node.Skin.nNumberOfBonemap != node.Skin.Array8Array.nCount2){
+            throw mdlexception("Skin bone array counts do not match the bonemap count on node '" + GetNodeName(node) +
+                               "'; refusing to load mismatched bind-pose data into the skin.");
         }
         if(node.Skin.nNumberOfBonemap > 0){
             node.Skin.Bones.resize(node.Skin.nNumberOfBonemap);
-            node.Skin.BoneNameIndices.resize(node.Mesh.nNumberOfVerts);
-            nPosData = MDL_OFFSET + node.Skin.nOffsetToBonemap;
-            unsigned int nPosData2 = MDL_OFFSET + node.Skin.QBoneArray.nOffset;
-            unsigned int nPosData3 = MDL_OFFSET + node.Skin.TBoneArray.nOffset;
-            unsigned int nPosData4 = MDL_OFFSET + node.Skin.Array8Array.nOffset;
-            for(int n = 0; n < node.Skin.nNumberOfBonemap; n++){
+            // BoneNameIndices is compact-slot indexed and is rebuilt after
+            // geometry linearization, once tree-order name indices are known.
+            // Do not size it by vertex count here; that can leave stale or
+            // misleading state if parsing fails before the later rebuild.
+            nPosData = RequiredMdlDataOffset(node.Skin.nOffsetToBonemap, "skin bonemap array");
+            unsigned int nPosData2 = MdlArrayDataOffset(node.Skin.QBoneArray, "skin qbone array");
+            unsigned int nPosData3 = MdlArrayDataOffset(node.Skin.TBoneArray, "skin tbone array");
+            unsigned int nPosData4 = MdlArrayDataOffset(node.Skin.Array8Array, "skin array8");
+            for(unsigned int n = 0; n < node.Skin.nNumberOfBonemap; n++){
                 if(bXbox){
-                    /// Setting up the pointer to the data
-                    node.Skin.Bones[n].dataRegions.emplace_back("MDL", nPosData, 2);
 
-                    ReadNumber(&node.Skin.Bones[n].nBonemap, 5, sSkin + "Bonemap " + std::to_string(n), &nPosData);
+                    ReadNumber(&node.Skin.Bones[n].nBonemap, 5, sSkinData + " > Data > Skin > Bonemap > " + std::to_string(n), &nPosData);
                 }
                 else{
-                    /// Setting up the pointer to the data
-                    node.Skin.Bones[n].dataRegions.emplace_back("MDL", nPosData, 4);
 
-                    node.Skin.Bones[n].nBonemap = (unsigned short) ReadNumber<float>(nullptr, 2, sSkin + "Bonemap " + std::to_string(n), &nPosData);
+                    node.Skin.Bones[n].nBonemap = (unsigned short) ReadNumber<float>(nullptr, 2, sSkinData + " > Data > Skin > Bonemap > " + std::to_string(n), &nPosData);
                 }
                 MarkDataBorder(nPosData - 1);
 
-                /// Setting up the pointer to the data
-                node.Skin.Bones[n].dataRegions.emplace_back("MDL", nPosData2, 16);
 
-                double fQW = ReadNumber<float>(nullptr, 2, sSkin + "QBone " + std::to_string(n) + " > W", &nPosData2);
-                double fQX = ReadNumber<float>(nullptr, 2, sSkin + "QBone " + std::to_string(n) + " > X", &nPosData2);
-                double fQY = ReadNumber<float>(nullptr, 2, sSkin + "QBone " + std::to_string(n) + " > Y", &nPosData2);
-                double fQZ = ReadNumber<float>(nullptr, 2, sSkin + "QBone " + std::to_string(n) + " > Z", &nPosData2);
+                double fQW = ReadNumber<float>(nullptr, 2, sSkinData + " > Data > Skin > Q-Bones > " + std::to_string(n), &nPosData2);
+                double fQX = ReadNumber<float>(nullptr, 2, sSkinData + " > Data > Skin > Q-Bones > " + std::to_string(n), &nPosData2);
+                double fQY = ReadNumber<float>(nullptr, 2, sSkinData + " > Data > Skin > Q-Bones > " + std::to_string(n), &nPosData2);
+                double fQZ = ReadNumber<float>(nullptr, 2, sSkinData + " > Data > Skin > Q-Bones > " + std::to_string(n), &nPosData2);
                 MarkDataBorder(nPosData2 - 1);
                 node.Skin.Bones[n].QBone.SetQuaternion(fQX, fQY, fQZ, fQW);
 
-                /// Setting up the pointer to the data
-                node.Skin.Bones[n].dataRegions.emplace_back("MDL", nPosData3, 12);
 
-                node.Skin.Bones[n].TBone.fX = ReadNumber<float>(nullptr, 2, sSkin + "TBone " + std::to_string(n) + " > X", &nPosData3);
-                node.Skin.Bones[n].TBone.fY = ReadNumber<float>(nullptr, 2, sSkin + "TBone " + std::to_string(n) + " > Y", &nPosData3);
-                node.Skin.Bones[n].TBone.fZ = ReadNumber<float>(nullptr, 2, sSkin + "TBone " + std::to_string(n) + " > Z", &nPosData3);
+                node.Skin.Bones[n].TBone.fX = ReadNumber<float>(nullptr, 2, sSkinData + " > Data > Skin > T-Bones > " + std::to_string(n), &nPosData3);
+                node.Skin.Bones[n].TBone.fY = ReadNumber<float>(nullptr, 2, sSkinData + " > Data > Skin > T-Bones > " + std::to_string(n), &nPosData3);
+                node.Skin.Bones[n].TBone.fZ = ReadNumber<float>(nullptr, 2, sSkinData + " > Data > Skin > T-Bones > " + std::to_string(n), &nPosData3);
                 MarkDataBorder(nPosData3 - 1);
 
-                /// Setting up the pointer to the data
-                node.Skin.Bones[n].dataRegions.emplace_back("MDL", nPosData4, 4);
 
-                ReadNumber(&node.Skin.Bones[n].nPadding, 11, sSkin + "Garbage " + std::to_string(n), &nPosData4);
+                ReadNumber(&node.Skin.Bones[n].nPadding, 11, sSkinData + " > Data > Skin > Array8 (unused)", &nPosData4);
                 if(n + 1 >= node.Skin.nNumberOfBonemap) MarkDataBorder(nPosData4 - 1);
             }
         }
@@ -970,43 +1172,40 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
     ///Need to do this later so that the Skin data is already read
     if(node.Head.nType & NODE_MESH){
         std::string sMdx = GetNodeName(node) + " > ";
-        std::string sMesh = sNode + "Mesh > ";
+        std::string sMeshData = sNode.substr(0, sNode.size() - 3);
         if(node.Mesh.nNumberOfVerts > 0){
             //ReportMdl << "Node " << node.Head.nNameIndex << ": \n";
             node.Mesh.Vertices.resize(node.Mesh.nNumberOfVerts);
-            nPosData = MDL_OFFSET + node.Mesh.nOffsetToVertArray;
+            nPosData = !bXbox ? RequiredMdlDataOffset(node.Mesh.nOffsetToVertArray, "mesh MDL vertex array") : 0u;
             unsigned int nPosData2 = node.Mesh.nOffsetIntoMdx;
             if(nPosData2 > 0 && Mdx) Mdx->MarkDataBorder(nPosData2 - 1);
             unsigned nMaxDataStructs = 0;
             for(int n = 0; n < node.Mesh.nNumberOfVerts; n++){
                 nMaxDataStructs++;
                 if(!bXbox){
-                    /// Setting up the pointer to the data
-                    node.Mesh.Vertices[n].dataRegions.emplace_back("MDL", nPosData, 12);
 
                     node.Mesh.Vertices[n].nOffset = nPosData;
-                    node.Mesh.Vertices[n].fX = ReadNumber<float>(nullptr, 2, sMesh + "Vertex " + std::to_string(n) + " > X", &nPosData);
-                    node.Mesh.Vertices[n].fY = ReadNumber<float>(nullptr, 2, sMesh + "Vertex " + std::to_string(n) + " > Y", &nPosData);
-                    node.Mesh.Vertices[n].fZ = ReadNumber<float>(nullptr, 2, sMesh + "Vertex " + std::to_string(n) + " > Z", &nPosData);
+                    node.Mesh.Vertices[n].fX = ReadNumber<float>(nullptr, 2, sMeshData + " > Data > Mesh > Vert Coordinates > Vert " + std::to_string(n), &nPosData);
+                    node.Mesh.Vertices[n].fY = ReadNumber<float>(nullptr, 2, sMeshData + " > Data > Mesh > Vert Coordinates > Vert " + std::to_string(n), &nPosData);
+                    node.Mesh.Vertices[n].fZ = ReadNumber<float>(nullptr, 2, sMeshData + " > Data > Mesh > Vert Coordinates > Vert " + std::to_string(n), &nPosData);
                     MarkDataBorder(nPosData - 1);
 
                     node.Mesh.Vertices[n].vFromRoot = node.Mesh.Vertices[n];
-                    node.Mesh.Vertices[n].vFromRoot.Rotate(node.Head.qFromRoot);
+                    node.Mesh.Vertices[n].vFromRoot.Rotate(qNode);
                     node.Mesh.Vertices[n].vFromRoot += node.Head.vFromRoot;
                 }
 
                 node.Mesh.Vertices[n].MDXData.nNameIndex = node.Head.nNameIndex;
                 if(node.Mesh.nMdxDataSize > 0 && Mdx){
                 try{
-                    /// Setting up the pointer to the data
-                    node.Mesh.Vertices[n].dataRegions.emplace(node.Mesh.Vertices[n].dataRegions.begin(), "MDX", node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize, node.Mesh.nMdxDataSize);
+                    std::string sMdxVertex = sMdx + "Vertex " + std::to_string(n);
 
                     if(node.Mesh.nMdxDataBitmap & MDX_FLAG_VERTEX){
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxVertex;
 
-                        node.Mesh.Vertices[n].MDXData.vVertex.fX = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Vertex " + std::to_string(n) + " > X", &nPosData2);
-                        node.Mesh.Vertices[n].MDXData.vVertex.fY = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Vertex " + std::to_string(n) + " > Y", &nPosData2);
-                        node.Mesh.Vertices[n].MDXData.vVertex.fZ = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Vertex " + std::to_string(n) + " > Z", &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.vVertex.fX = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.vVertex.fY = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.vVertex.fZ = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
 
                         if(bXbox){
                             node.Mesh.Vertices[n].fX = node.Mesh.Vertices[n].MDXData.vVertex.fX;
@@ -1014,57 +1213,57 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
                             node.Mesh.Vertices[n].fZ = node.Mesh.Vertices[n].MDXData.vVertex.fZ;
 
                             node.Mesh.Vertices[n].vFromRoot = node.Mesh.Vertices[n];
-                            node.Mesh.Vertices[n].vFromRoot.Rotate(node.Head.qFromRoot);
+                            node.Mesh.Vertices[n].vFromRoot.Rotate(qNode);
                             node.Mesh.Vertices[n].vFromRoot += node.Head.vFromRoot;
                         }
                     }
                     if(node.Mesh.nMdxDataBitmap & MDX_FLAG_NORMAL){
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxNormal;
                         if(!bXbox){
-                            node.Mesh.Vertices[n].MDXData.vNormal.fX = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Normal " + std::to_string(n) + " > X", &nPosData2);
-                            node.Mesh.Vertices[n].MDXData.vNormal.fY = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Normal " + std::to_string(n) + " > Y", &nPosData2);
-                            node.Mesh.Vertices[n].MDXData.vNormal.fZ = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Normal " + std::to_string(n) + " > Z", &nPosData2);
+                            node.Mesh.Vertices[n].MDXData.vNormal.fX = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                            node.Mesh.Vertices[n].MDXData.vNormal.fY = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                            node.Mesh.Vertices[n].MDXData.vNormal.fZ = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
                         }
                         else{
-                            node.Mesh.Vertices[n].MDXData.vNormal = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 2, sMdx + "Normal " + std::to_string(n), &nPosData2));
+                            node.Mesh.Vertices[n].MDXData.vNormal = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 2, sMdxVertex, &nPosData2));
                         }
                     }
                     if(node.Mesh.nMdxDataBitmap & MDX_FLAG_COLOR){
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxColor;
-                        node.Mesh.Vertices[n].MDXData.cColor.fR = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Color " + std::to_string(n) + " > R", &nPosData2);
-                        node.Mesh.Vertices[n].MDXData.cColor.fG = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Color " + std::to_string(n) + " > G", &nPosData2);
-                        node.Mesh.Vertices[n].MDXData.cColor.fB = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Color " + std::to_string(n) + " > B", &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.cColor.fR = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.cColor.fG = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.cColor.fB = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
                     }
                     if(node.Mesh.nMdxDataBitmap & MDX_FLAG_UV1){
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxUV1;
-                        node.Mesh.Vertices[n].MDXData.vUV1.fX = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "UVs 1 " + std::to_string(n) + " > U", &nPosData2);
-                        node.Mesh.Vertices[n].MDXData.vUV1.fY = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "UVs 1 " + std::to_string(n) + " > V", &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.vUV1.fX = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.vUV1.fY = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
                     }
                     if(node.Mesh.nMdxDataBitmap & MDX_FLAG_UV2){
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxUV2;
-                        node.Mesh.Vertices[n].MDXData.vUV2.fX = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "UVs 2 " + std::to_string(n) + " > U", &nPosData2);
-                        node.Mesh.Vertices[n].MDXData.vUV2.fY = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "UVs 2 " + std::to_string(n) + " > V", &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.vUV2.fX = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.vUV2.fY = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
                     }
                     if(node.Mesh.nMdxDataBitmap & MDX_FLAG_UV3){
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxUV3;
-                        node.Mesh.Vertices[n].MDXData.vUV3.fX = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "UVs 3 " + std::to_string(n) + " > U", &nPosData2);
-                        node.Mesh.Vertices[n].MDXData.vUV3.fY = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "UVs 3 " + std::to_string(n) + " > V", &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.vUV3.fX = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.vUV3.fY = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
                     }
                     if(node.Mesh.nMdxDataBitmap & MDX_FLAG_UV4){
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxUV4;
-                        node.Mesh.Vertices[n].MDXData.vUV4.fX = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "UVs 4 " + std::to_string(n) + " > U", &nPosData2);
-                        node.Mesh.Vertices[n].MDXData.vUV4.fY = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "UVs 4 " + std::to_string(n) + " > V", &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.vUV4.fX = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.vUV4.fY = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
                     }
                     if(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT1){
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxTangent1;
                         for(int b = 0; b < 3; b++){
                             if(bXbox){
-                                node.Mesh.Vertices[n].MDXData.vTangent1[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 2, sMdx + "Tangent Space 1 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n), &nPosData2));
+                                node.Mesh.Vertices[n].MDXData.vTangent1[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 2, sMdxVertex, &nPosData2));
                             }
                             else{
-                                node.Mesh.Vertices[n].MDXData.vTangent1[b].fX = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Tangent Space 1 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n) + " > X", &nPosData2);
-                                node.Mesh.Vertices[n].MDXData.vTangent1[b].fY = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Tangent Space 1 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n) + " > Y", &nPosData2);
-                                node.Mesh.Vertices[n].MDXData.vTangent1[b].fZ = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Tangent Space 1 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n) + " > Z", &nPosData2);
+                                node.Mesh.Vertices[n].MDXData.vTangent1[b].fX = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                                node.Mesh.Vertices[n].MDXData.vTangent1[b].fY = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                                node.Mesh.Vertices[n].MDXData.vTangent1[b].fZ = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
                             }
                         }
                     }
@@ -1072,12 +1271,12 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxTangent2;
                         for(int b = 0; b < 3; b++){
                             if(bXbox){
-                                node.Mesh.Vertices[n].MDXData.vTangent2[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 2, sMdx + "Tangent Space 2 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n), &nPosData2));
+                                node.Mesh.Vertices[n].MDXData.vTangent2[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 2, sMdxVertex, &nPosData2));
                             }
                             else{
-                                node.Mesh.Vertices[n].MDXData.vTangent2[b].fX = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Tangent Space 2 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n) + " > X", &nPosData2);
-                                node.Mesh.Vertices[n].MDXData.vTangent2[b].fY = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Tangent Space 2 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n) + " > Y", &nPosData2);
-                                node.Mesh.Vertices[n].MDXData.vTangent2[b].fZ = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Tangent Space 2 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n) + " > Z", &nPosData2);
+                                node.Mesh.Vertices[n].MDXData.vTangent2[b].fX = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                                node.Mesh.Vertices[n].MDXData.vTangent2[b].fY = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                                node.Mesh.Vertices[n].MDXData.vTangent2[b].fZ = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
                             }
                         }
                     }
@@ -1085,12 +1284,12 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxTangent3;
                         for(int b = 0; b < 3; b++){
                             if(bXbox){
-                                node.Mesh.Vertices[n].MDXData.vTangent3[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 2, sMdx + "Tangent Space 3 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n), &nPosData2));
+                                node.Mesh.Vertices[n].MDXData.vTangent3[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 2, sMdxVertex, &nPosData2));
                             }
                             else{
-                                node.Mesh.Vertices[n].MDXData.vTangent3[b].fX = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Tangent Space 3 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n) + " > X", &nPosData2);
-                                node.Mesh.Vertices[n].MDXData.vTangent3[b].fY = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Tangent Space 3 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n) + " > Y", &nPosData2);
-                                node.Mesh.Vertices[n].MDXData.vTangent3[b].fZ = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Tangent Space 3 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n) + " > Z", &nPosData2);
+                                node.Mesh.Vertices[n].MDXData.vTangent3[b].fX = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                                node.Mesh.Vertices[n].MDXData.vTangent3[b].fY = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                                node.Mesh.Vertices[n].MDXData.vTangent3[b].fZ = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
                             }
                         }
                     }
@@ -1098,33 +1297,33 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxTangent4;
                         for(int b = 0; b < 3; b++){
                             if(bXbox){
-                                node.Mesh.Vertices[n].MDXData.vTangent4[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 2, sMdx + "Tangent Space 4 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n), &nPosData2));
+                                node.Mesh.Vertices[n].MDXData.vTangent4[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 2, sMdxVertex, &nPosData2));
                             }
                             else{
-                                node.Mesh.Vertices[n].MDXData.vTangent4[b].fX = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Tangent Space 4 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n) + " > X", &nPosData2);
-                                node.Mesh.Vertices[n].MDXData.vTangent4[b].fY = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Tangent Space 4 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n) + " > Y", &nPosData2);
-                                node.Mesh.Vertices[n].MDXData.vTangent4[b].fZ = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Tangent Space 4 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " " + std::to_string(n) + " > Z", &nPosData2);
+                                node.Mesh.Vertices[n].MDXData.vTangent4[b].fX = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                                node.Mesh.Vertices[n].MDXData.vTangent4[b].fY = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                                node.Mesh.Vertices[n].MDXData.vTangent4[b].fZ = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
                             }
                         }
                     }
                     if(node.Head.nType & NODE_SKIN){
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Skin.nOffsetToMdxWeightValues;
-                        node.Mesh.Vertices[n].MDXData.Weights.fWeightValue[0] = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Weight " + std::to_string(n) + " > Value 0", &nPosData2);
-                        node.Mesh.Vertices[n].MDXData.Weights.fWeightValue[1] = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Weight " + std::to_string(n) + " > Value 1", &nPosData2);
-                        node.Mesh.Vertices[n].MDXData.Weights.fWeightValue[2] = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Weight " + std::to_string(n) + " > Value 2", &nPosData2);
-                        node.Mesh.Vertices[n].MDXData.Weights.fWeightValue[3] = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Weight " + std::to_string(n) + " > Value 3", &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.Weights.fWeightValue[0] = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.Weights.fWeightValue[1] = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.Weights.fWeightValue[2] = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                        node.Mesh.Vertices[n].MDXData.Weights.fWeightValue[3] = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
                         nPosData2 = node.Mesh.nOffsetIntoMdx + n * node.Mesh.nMdxDataSize + node.Skin.nOffsetToMdxBoneIndices;
                         if(bXbox){
-                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[0] = Mdx->ReadNumber((unsigned short*) nullptr, 5, sMdx + "Weight " + std::to_string(n) + " > Index 0", &nPosData2);
-                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[1] = Mdx->ReadNumber((unsigned short*) nullptr, 5, sMdx + "Weight " + std::to_string(n) + " > Index 1", &nPosData2);
-                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[2] = Mdx->ReadNumber((unsigned short*) nullptr, 5, sMdx + "Weight " + std::to_string(n) + " > Index 2", &nPosData2);
-                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[3] = Mdx->ReadNumber((unsigned short*) nullptr, 5, sMdx + "Weight " + std::to_string(n) + " > Index 3", &nPosData2);
+                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[0] = Mdx->ReadNumber((unsigned short*) nullptr, 5, sMdxVertex, &nPosData2);
+                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[1] = Mdx->ReadNumber((unsigned short*) nullptr, 5, sMdxVertex, &nPosData2);
+                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[2] = Mdx->ReadNumber((unsigned short*) nullptr, 5, sMdxVertex, &nPosData2);
+                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[3] = Mdx->ReadNumber((unsigned short*) nullptr, 5, sMdxVertex, &nPosData2);
                         }
                         else{
-                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[0] = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Weight " + std::to_string(n) + " > Index 0", &nPosData2);
-                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[1] = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Weight " + std::to_string(n) + " > Index 1", &nPosData2);
-                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[2] = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Weight " + std::to_string(n) + " > Index 2", &nPosData2);
-                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[3] = Mdx->ReadNumber<float>(nullptr, 2, sMdx + "Weight " + std::to_string(n) + " > Index 3", &nPosData2);
+                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[0] = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[1] = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[2] = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
+                            node.Mesh.Vertices[n].MDXData.Weights.nWeightIndex[3] = Mdx->ReadNumber<float>(nullptr, 2, sMdxVertex, &nPosData2);
                         }
                     }
                 }
@@ -1147,63 +1346,64 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
             **/
             //std::cout << "Read data, now let's read the dummy data" << std::endl;
 
-            sMdx = GetNodeName(node) + " > Extra Data > ";
+            sMdx = GetNodeName(node) + " > ";
+            std::string sMdxExtra = sMdx + "Extra Data";
             if(node.Mesh.nMdxDataSize > 0 && Mdx){
                 node.Mesh.MDXData.nNameIndex = node.Head.nNameIndex;
               try{
                 if(node.Mesh.nMdxDataBitmap & MDX_FLAG_VERTEX){
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxVertex;
-                    node.Mesh.MDXData.vVertex.fX = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Vertex > X", &nPosData2);
-                    node.Mesh.MDXData.vVertex.fY = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Vertex > Y", &nPosData2);
-                    node.Mesh.MDXData.vVertex.fZ = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Vertex > Z", &nPosData2);
+                    node.Mesh.MDXData.vVertex.fX = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                    node.Mesh.MDXData.vVertex.fY = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                    node.Mesh.MDXData.vVertex.fZ = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                 }
                 if(node.Mesh.nMdxDataBitmap & MDX_FLAG_NORMAL){
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxNormal;
                     if(!bXbox){
-                        node.Mesh.MDXData.vNormal.fX = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Normal > X", &nPosData2);
-                        node.Mesh.MDXData.vNormal.fY = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Normal > Y", &nPosData2);
-                        node.Mesh.MDXData.vNormal.fZ = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Normal > Z", &nPosData2);
+                        node.Mesh.MDXData.vNormal.fX = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                        node.Mesh.MDXData.vNormal.fY = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                        node.Mesh.MDXData.vNormal.fZ = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                     }
                     else{
-                        node.Mesh.MDXData.vNormal = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 8, sMdx + "Normal", &nPosData2));
+                        node.Mesh.MDXData.vNormal = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 8, sMdxExtra, &nPosData2));
                     }
                 }
                 if(node.Mesh.nMdxDataBitmap & MDX_FLAG_COLOR){
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxColor;
-                    node.Mesh.MDXData.cColor.fR = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Color > R", &nPosData2);
-                    node.Mesh.MDXData.cColor.fG = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Color > G", &nPosData2);
-                    node.Mesh.MDXData.cColor.fB = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Color > B", &nPosData2);
+                    node.Mesh.MDXData.cColor.fR = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                    node.Mesh.MDXData.cColor.fG = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                    node.Mesh.MDXData.cColor.fB = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                 }
                 if(node.Mesh.nMdxDataBitmap & MDX_FLAG_UV1){
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxUV1;
-                    node.Mesh.MDXData.vUV1.fX = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "UVs 1 > U", &nPosData2);
-                    node.Mesh.MDXData.vUV1.fY = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "UVs 1 > V", &nPosData2);
+                    node.Mesh.MDXData.vUV1.fX = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                    node.Mesh.MDXData.vUV1.fY = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                 }
                 if(node.Mesh.nMdxDataBitmap & MDX_FLAG_UV2){
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxUV2;
-                    node.Mesh.MDXData.vUV2.fX = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "UVs 2 > U", &nPosData2);
-                    node.Mesh.MDXData.vUV2.fY = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "UVs 2 > V", &nPosData2);
+                    node.Mesh.MDXData.vUV2.fX = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                    node.Mesh.MDXData.vUV2.fY = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                 }
                 if(node.Mesh.nMdxDataBitmap & MDX_FLAG_UV3){
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxUV3;
-                    node.Mesh.MDXData.vUV3.fX = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "UVs 3 > U", &nPosData2);
-                    node.Mesh.MDXData.vUV3.fY = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "UVs 3 > V", &nPosData2);
+                    node.Mesh.MDXData.vUV3.fX = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                    node.Mesh.MDXData.vUV3.fY = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                 }
                 if(node.Mesh.nMdxDataBitmap & MDX_FLAG_UV4){
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxUV4;
-                    node.Mesh.MDXData.vUV4.fX = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "UVs 4 > U", &nPosData2);
-                    node.Mesh.MDXData.vUV4.fY = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "UVs 4 > V", &nPosData2);
+                    node.Mesh.MDXData.vUV4.fX = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                    node.Mesh.MDXData.vUV4.fY = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                 }
                 if(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT1){
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxTangent1;
                     for(int b = 0; b < 3; b++){
                         if(bXbox){
-                            node.Mesh.MDXData.vTangent1[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 8, sMdx + "Tangent Space 1 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")), &nPosData2));
+                            node.Mesh.MDXData.vTangent1[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 8, sMdxExtra, &nPosData2));
                         }
                         else{
-                            node.Mesh.MDXData.vTangent1[b].fX = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Tangent Space 1 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " > X", &nPosData2);
-                            node.Mesh.MDXData.vTangent1[b].fY = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Tangent Space 1 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " > Y", &nPosData2);
-                            node.Mesh.MDXData.vTangent1[b].fZ = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Tangent Space 1 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " > Z", &nPosData2);
+                            node.Mesh.MDXData.vTangent1[b].fX = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                            node.Mesh.MDXData.vTangent1[b].fY = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                            node.Mesh.MDXData.vTangent1[b].fZ = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                         }
                     }
                 }
@@ -1211,12 +1411,12 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxTangent2;
                     for(int b = 0; b < 3; b++){
                         if(bXbox){
-                            node.Mesh.MDXData.vTangent2[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 8, sMdx + "Tangent Space 2 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")), &nPosData2));
+                            node.Mesh.MDXData.vTangent2[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 8, sMdxExtra, &nPosData2));
                         }
                         else{
-                            node.Mesh.MDXData.vTangent2[b].fX = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Tangent Space 2 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " > X", &nPosData2);
-                            node.Mesh.MDXData.vTangent2[b].fY = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Tangent Space 2 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " > Y", &nPosData2);
-                            node.Mesh.MDXData.vTangent2[b].fZ = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Tangent Space 2 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " > Z", &nPosData2);
+                            node.Mesh.MDXData.vTangent2[b].fX = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                            node.Mesh.MDXData.vTangent2[b].fY = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                            node.Mesh.MDXData.vTangent2[b].fZ = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                         }
                     }
                 }
@@ -1224,12 +1424,12 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxTangent3;
                     for(int b = 0; b < 3; b++){
                         if(bXbox){
-                            node.Mesh.MDXData.vTangent3[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 8, sMdx + "Tangent Space 3 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")), &nPosData2));
+                            node.Mesh.MDXData.vTangent3[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 8, sMdxExtra, &nPosData2));
                         }
                         else{
-                            node.Mesh.MDXData.vTangent3[b].fX = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Tangent Space 3 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " > X", &nPosData2);
-                            node.Mesh.MDXData.vTangent3[b].fY = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Tangent Space 3 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " > Y", &nPosData2);
-                            node.Mesh.MDXData.vTangent3[b].fZ = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Tangent Space 3 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " > Z", &nPosData2);
+                            node.Mesh.MDXData.vTangent3[b].fX = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                            node.Mesh.MDXData.vTangent3[b].fY = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                            node.Mesh.MDXData.vTangent3[b].fZ = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                         }
                     }
                 }
@@ -1237,35 +1437,35 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Mesh.nOffsetToMdxTangent4;
                     for(int b = 0; b < 3; b++){
                         if(bXbox){
-                            node.Mesh.MDXData.vTangent4[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 8, sMdx + "Tangent Space 4 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")), &nPosData2));
+                            node.Mesh.MDXData.vTangent4[b] = DecompressVector(Mdx->ReadNumber<unsigned>(nullptr, 8, sMdxExtra, &nPosData2));
                         }
                         else{
-                            node.Mesh.MDXData.vTangent4[b].fX = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Tangent Space 4 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " > X", &nPosData2);
-                            node.Mesh.MDXData.vTangent4[b].fY = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Tangent Space 4 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " > Y", &nPosData2);
-                            node.Mesh.MDXData.vTangent4[b].fZ = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Tangent Space 4 > " + (b == 0 ? "Bitangent" : (b == 1 ? "Tangent" : "Normal")) + " > Z", &nPosData2);
+                            node.Mesh.MDXData.vTangent4[b].fX = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                            node.Mesh.MDXData.vTangent4[b].fY = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                            node.Mesh.MDXData.vTangent4[b].fZ = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                         }
                     }
                 }
                 if(node.Head.nType & NODE_SKIN){
                     //if(node.Skin.nOffsetToMdxWeightValues != 32) std::cout << string_format("Warning! MDX Skin Data Pointer 1 in %s is not 32! I might be reading wrong!\n", FH->MH.Names[node.Head.nNameIndex].sName.c_str());
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Skin.nOffsetToMdxWeightValues;
-                    node.Mesh.MDXData.Weights.fWeightValue[0] = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Weight > Value 0", &nPosData2);
-                    node.Mesh.MDXData.Weights.fWeightValue[1] = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Weight > Value 1", &nPosData2);
-                    node.Mesh.MDXData.Weights.fWeightValue[2] = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Weight > Value 2", &nPosData2);
-                    node.Mesh.MDXData.Weights.fWeightValue[3] = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Weight > Value 3", &nPosData2);
+                    node.Mesh.MDXData.Weights.fWeightValue[0] = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                    node.Mesh.MDXData.Weights.fWeightValue[1] = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                    node.Mesh.MDXData.Weights.fWeightValue[2] = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                    node.Mesh.MDXData.Weights.fWeightValue[3] = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                     //if(node.Skin.nOffsetToMdxBoneIndices != 48) std::cout << string_format("Warning! MDX Skin Data Pointer 2 in %s is not 48! I might be reading wrong!\n", FH->MH.Names[node.Head.nNameIndex].sName.c_str());
                     nPosData2 = node.Mesh.nOffsetIntoMdx + nMaxDataStructs * node.Mesh.nMdxDataSize + node.Skin.nOffsetToMdxBoneIndices;
                     if(bXbox){
-                        node.Mesh.MDXData.Weights.nWeightIndex[0] = Mdx->ReadNumber((unsigned short*) nullptr, 8, sMdx + "Weight > Index 0", &nPosData2);
-                        node.Mesh.MDXData.Weights.nWeightIndex[1] = Mdx->ReadNumber((unsigned short*) nullptr, 8, sMdx + "Weight > Index 1", &nPosData2);
-                        node.Mesh.MDXData.Weights.nWeightIndex[2] = Mdx->ReadNumber((unsigned short*) nullptr, 8, sMdx + "Weight > Index 2", &nPosData2);
-                        node.Mesh.MDXData.Weights.nWeightIndex[3] = Mdx->ReadNumber((unsigned short*) nullptr, 8, sMdx + "Weight > Index 3", &nPosData2);
+                        node.Mesh.MDXData.Weights.nWeightIndex[0] = Mdx->ReadNumber((unsigned short*) nullptr, 8, sMdxExtra, &nPosData2);
+                        node.Mesh.MDXData.Weights.nWeightIndex[1] = Mdx->ReadNumber((unsigned short*) nullptr, 8, sMdxExtra, &nPosData2);
+                        node.Mesh.MDXData.Weights.nWeightIndex[2] = Mdx->ReadNumber((unsigned short*) nullptr, 8, sMdxExtra, &nPosData2);
+                        node.Mesh.MDXData.Weights.nWeightIndex[3] = Mdx->ReadNumber((unsigned short*) nullptr, 8, sMdxExtra, &nPosData2);
                     }
                     else{
-                        node.Mesh.MDXData.Weights.nWeightIndex[0] = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Weight > Index 0", &nPosData2);
-                        node.Mesh.MDXData.Weights.nWeightIndex[1] = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Weight > Index 1", &nPosData2);
-                        node.Mesh.MDXData.Weights.nWeightIndex[2] = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Weight > Index 2", &nPosData2);
-                        node.Mesh.MDXData.Weights.nWeightIndex[3] = Mdx->ReadNumber<float>(nullptr, 8, sMdx + "Weight > Index 3", &nPosData2);
+                        node.Mesh.MDXData.Weights.nWeightIndex[0] = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                        node.Mesh.MDXData.Weights.nWeightIndex[1] = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                        node.Mesh.MDXData.Weights.nWeightIndex[2] = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
+                        node.Mesh.MDXData.Weights.nWeightIndex[3] = Mdx->ReadNumber<float>(nullptr, 8, sMdxExtra, &nPosData2);
                     }
                 }
                 Mdx->MarkDataBorder(node.Mesh.nOffsetIntoMdx + (nMaxDataStructs + 1) * node.Mesh.nMdxDataSize - 1);
@@ -1281,15 +1481,17 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
 
     if(node.Head.nType & NODE_AABB){
         try{
-            std::string sAabb = sNode + "AABB > ";
-            ReadNumber(&node.Walkmesh.nOffsetToAabb, 6, sAabb + "Offset To Root AABB");
+            std::string sAabb = sNode.substr(0, sNode.size() - 3) + " > Header > Aabb";
+            ReadNumber(&node.Walkmesh.nOffsetToAabb, 6, sAabb);
             MarkDataBorder(nPosition - 1);
 
             nAabbCount = 0;
-            if(node.Walkmesh.nOffsetToAabb > 0){
+            sAabbNodePrefix = sNode;
+            if(node.Walkmesh.nOffsetToAabb.Valid() && node.Walkmesh.nOffsetToAabb > 0){
                 /// Set the offset on the root aabb, then start the recursive aabb reading.
                 node.Walkmesh.RootAabb.nOffset = node.Walkmesh.nOffsetToAabb;
-                ParseAabb(node.Walkmesh.RootAabb, 10, sNode);
+                std::vector<unsigned int> visitedAabbOffsets;
+                ParseAabb(node.Walkmesh.RootAabb, visitedAabbOffsets);
             }
         }
         catch(const std::exception & e){
@@ -1298,44 +1500,48 @@ void MDL::ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFr
     }
 
     if(node.Head.nType & NODE_SABER){
-        std::string sSaber = "Lightsaber > ";
-        ReadNumber(&node.Saber.nOffsetToSaberVerts, 6, sSaber + "Offset To Verts");
-        ReadNumber(&node.Saber.nOffsetToSaberUVs, 6, sSaber + "Offset To UVs");
-        ReadNumber(&node.Saber.nOffsetToSaberNormals, 6, sSaber + "Offset To Normals");
-        ReadNumber(&node.Saber.nInvCount1, 4, sSaber + "Inverted Counter 1");
-        ReadNumber(&node.Saber.nInvCount2, 4, sSaber + "Inverted Counter 2");
+        std::string sSaber = sNode.substr(0, sNode.size() - 3) + " > Header > Lightsaber";
+        std::string sSaberData = sNode.substr(0, sNode.size() - 3);
+        ReadNumber(&node.Saber.nOffsetToSaberVerts, 6, sSaber);
+        ReadNumber(&node.Saber.nOffsetToSaberUVs, 6, sSaber);
+        ReadNumber(&node.Saber.nOffsetToSaberNormals, 6, sSaber);
+        ReadNumber(&node.Saber.nInvCount1, 4, sSaber);
+        ReadNumber(&node.Saber.nInvCount2, 4, sSaber);
         MarkDataBorder(nPosition - 1);
 
         node.Saber.SaberData.resize(176);
-        nPosData = MDL_OFFSET + node.Saber.nOffsetToSaberVerts;
-        unsigned int nPosData2 = MDL_OFFSET + node.Saber.nOffsetToSaberUVs;
-        unsigned int nPosData3 = MDL_OFFSET + node.Saber.nOffsetToSaberNormals;
+        nPosData = RequiredMdlDataOffset(node.Saber.nOffsetToSaberVerts, "saber vertex array");
+        unsigned int nPosData2 = RequiredMdlDataOffset(node.Saber.nOffsetToSaberUVs, "saber uv array");
+        unsigned int nPosData3 = RequiredMdlDataOffset(node.Saber.nOffsetToSaberNormals, "saber normal array");
         for(int n = 0; n < 176; n++){
-            node.Saber.SaberData[n].vVertex.fX = ReadNumber<float>(nullptr, 2, sSaber + "Vertex " + std::to_string(n) + " > X", &nPosData);
-            node.Saber.SaberData[n].vVertex.fY = ReadNumber<float>(nullptr, 2, sSaber + "Vertex " + std::to_string(n) + " > Y", &nPosData);
-            node.Saber.SaberData[n].vVertex.fZ = ReadNumber<float>(nullptr, 2, sSaber + "Vertex " + std::to_string(n) + " > Z", &nPosData);
+            node.Saber.SaberData[n].vVertex.fX = ReadNumber<float>(nullptr, 2, sSaberData + " > Data > Lightsaber > Vertices > Vertex " + std::to_string(n), &nPosData);
+            node.Saber.SaberData[n].vVertex.fY = ReadNumber<float>(nullptr, 2, sSaberData + " > Data > Lightsaber > Vertices > Vertex " + std::to_string(n), &nPosData);
+            node.Saber.SaberData[n].vVertex.fZ = ReadNumber<float>(nullptr, 2, sSaberData + " > Data > Lightsaber > Vertices > Vertex " + std::to_string(n), &nPosData);
             MarkDataBorder(nPosData - 1);
 
-            node.Saber.SaberData[n].vNormal.fX = ReadNumber<float>(nullptr, 2, sSaber + "Normal " + std::to_string(n) + " > X", &nPosData3);
-            node.Saber.SaberData[n].vNormal.fY = ReadNumber<float>(nullptr, 2, sSaber + "Normal " + std::to_string(n) + " > Y", &nPosData3);
-            node.Saber.SaberData[n].vNormal.fZ = ReadNumber<float>(nullptr, 2, sSaber + "Normal " + std::to_string(n) + " > Z", &nPosData3);
+            node.Saber.SaberData[n].vNormal.fX = ReadNumber<float>(nullptr, 2, sSaberData + " > Data > Lightsaber > Normals > Normal " + std::to_string(n), &nPosData3);
+            node.Saber.SaberData[n].vNormal.fY = ReadNumber<float>(nullptr, 2, sSaberData + " > Data > Lightsaber > Normals > Normal " + std::to_string(n), &nPosData3);
+            node.Saber.SaberData[n].vNormal.fZ = ReadNumber<float>(nullptr, 2, sSaberData + " > Data > Lightsaber > Normals > Normal " + std::to_string(n), &nPosData3);
             MarkDataBorder(nPosData3 - 1);
 
-            node.Saber.SaberData[n].vUV1.fX = ReadNumber<float>(nullptr, 2, sSaber + "UV " + std::to_string(n) + " > U", &nPosData2);
-            node.Saber.SaberData[n].vUV1.fY = ReadNumber<float>(nullptr, 2, sSaber + "UV " + std::to_string(n) + " > V", &nPosData2);
+            node.Saber.SaberData[n].vUV1.fX = ReadNumber<float>(nullptr, 2, sSaberData + " > Data > Lightsaber > UVs > UV " + std::to_string(n), &nPosData2);
+            node.Saber.SaberData[n].vUV1.fY = ReadNumber<float>(nullptr, 2, sSaberData + " > Data > Lightsaber > UVs > UV " + std::to_string(n), &nPosData2);
             MarkDataBorder(nPosData2 - 1);
         }
     }
 }
 
-//This is the BWM counterpart to MDL's DecompileModel().
-void BWM::DecompileBWM(ReportObject & ReportMdl){
+// Performs binary BWM/WOK/PWK/DWK parsing.
+void BWM::ProcessBWM(){
     if(sBuffer.empty()) return;
 
-    /// Start timer
-    Timer tDecompile;
-
+    const BufferState oldBufferState = CaptureBufferState();
+    std::unique_ptr<BWMHeader> pOldBwm = std::move(Bwm);
     Bwm.reset(new BWMHeader);
+    auto restoreBwmOnFailure = MakeScopeExit([&](){
+        RestoreBufferState(oldBufferState);
+        Bwm = std::move(pOldBwm);
+    });
 
     std::string sName = GetName() + (GetName() == "DWK" ? " " + std::to_string(((DWK*) this)->GetDwk()) : std::string());
 
@@ -1346,48 +1552,46 @@ void BWM::DecompileBWM(ReportObject & ReportMdl){
     try{
         std::string sHeader ("Header > ");
 
-        /// Setting up the pointer to the data
-        Data.dataRegions.emplace_back(sName, 0, 136);
 
         std::string sFileType, sVersion;
 
         /// Mark version info
-        ReadString(&sFileType, 4, 3, sHeader + "File Type");
+        ReadString(&sFileType, 4, 3, sHeader + "Version");
         ReadString(&sVersion, 4, 3, sHeader + "Version");
 
-        ReadNumber(&Data.nType, 4, sHeader + "Type");
-        Data.vUse1.fX = ReadNumber<float>(nullptr, 2, sHeader + "Relative Use Vector 1 > X");
-        Data.vUse1.fY = ReadNumber<float>(nullptr, 2, sHeader + "Relative Use Vector 1 > Y");
-        Data.vUse1.fZ = ReadNumber<float>(nullptr, 2, sHeader + "Relative Use Vector 1 > Z");
-        Data.vUse2.fX = ReadNumber<float>(nullptr, 2, sHeader + "Relative Use Vector 2 > X");
-        Data.vUse2.fY = ReadNumber<float>(nullptr, 2, sHeader + "Relative Use Vector 2 > Y");
-        Data.vUse2.fZ = ReadNumber<float>(nullptr, 2, sHeader + "Relative Use Vector 2 > Z");
-        Data.vDwk1.fX = ReadNumber<float>(nullptr, 2, sHeader + "Absolute Use Vector 1 > X");
-        Data.vDwk1.fY = ReadNumber<float>(nullptr, 2, sHeader + "Absolute Use Vector 1 > Y");
-        Data.vDwk1.fZ = ReadNumber<float>(nullptr, 2, sHeader + "Absolute Use Vector 1 > Z");
-        Data.vDwk2.fX = ReadNumber<float>(nullptr, 2, sHeader + "Absolute Use Vector 2 > X");
-        Data.vDwk2.fY = ReadNumber<float>(nullptr, 2, sHeader + "Absolute Use Vector 2 > Y");
-        Data.vDwk2.fZ = ReadNumber<float>(nullptr, 2, sHeader + "Absolute Use Vector 2 > Z");
-        Data.vPosition.fX = ReadNumber<float>(nullptr, 2, sHeader + "Position > X");
-        Data.vPosition.fY = ReadNumber<float>(nullptr, 2, sHeader + "Position > Y");
-        Data.vPosition.fZ = ReadNumber<float>(nullptr, 2, sHeader + "Position > Z");
+        ReadNumber(&Data.nType, 4, sHeader + "Walkmesh Type");
+        Data.vUse1.fX = ReadNumber<float>(nullptr, 2, sHeader + "Use Hooks");
+        Data.vUse1.fY = ReadNumber<float>(nullptr, 2, sHeader + "Use Hooks");
+        Data.vUse1.fZ = ReadNumber<float>(nullptr, 2, sHeader + "Use Hooks");
+        Data.vUse2.fX = ReadNumber<float>(nullptr, 2, sHeader + "Use Hooks");
+        Data.vUse2.fY = ReadNumber<float>(nullptr, 2, sHeader + "Use Hooks");
+        Data.vUse2.fZ = ReadNumber<float>(nullptr, 2, sHeader + "Use Hooks");
+        Data.vDwk1.fX = ReadNumber<float>(nullptr, 2, sHeader + "Use Hooks");
+        Data.vDwk1.fY = ReadNumber<float>(nullptr, 2, sHeader + "Use Hooks");
+        Data.vDwk1.fZ = ReadNumber<float>(nullptr, 2, sHeader + "Use Hooks");
+        Data.vDwk2.fX = ReadNumber<float>(nullptr, 2, sHeader + "Use Hooks");
+        Data.vDwk2.fY = ReadNumber<float>(nullptr, 2, sHeader + "Use Hooks");
+        Data.vDwk2.fZ = ReadNumber<float>(nullptr, 2, sHeader + "Use Hooks");
+        Data.vPosition.fX = ReadNumber<float>(nullptr, 2, sHeader + "Position");
+        Data.vPosition.fY = ReadNumber<float>(nullptr, 2, sHeader + "Position");
+        Data.vPosition.fZ = ReadNumber<float>(nullptr, 2, sHeader + "Position");
 
-        ReadNumber(&Data.nNumberOfVerts, 1, sHeader + "Vert Count"); /// This is not equal in the wok and mdl
-        ReadNumber(&Data.nOffsetToVerts, 6, sHeader + "Vert Offset");
-        ReadNumber(&Data.nNumberOfFaces, 1, sHeader + "Face Count"); /// In my test model this equals the number in the mdl
-        ReadNumber(&Data.nOffsetToIndices, 6, sHeader + "Vert Indices Offset");
-        ReadNumber(&Data.nOffsetToMaterials, 6, sHeader + "Material IDs Offset");
-        ReadNumber(&Data.nOffsetToNormals, 6, sHeader + "Normals Offset");
-        ReadNumber(&Data.nOffsetToDistances, 6, sHeader + "Distances Offset");
-        ReadNumber(&Data.nNumberOfAabb, 1, sHeader + "AABB Count"); /// In my test model this equals the number of aabb in the mdl
-        ReadNumber(&Data.nOffsetToAabb, 6, sHeader + "AABB Offset");
+        ReadNumber(&Data.nNumberOfVerts, 1, sHeader + "Number of Vertices"); /// This is not equal in the wok and mdl
+        ReadNumber(&Data.nOffsetToVerts, 6, sHeader + "Offset to Vertex Coordinates");
+        ReadNumber(&Data.nNumberOfFaces, 1, sHeader + "Number of Faces"); /// In my test model this equals the number in the mdl
+        ReadNumber(&Data.nOffsetToIndices, 6, sHeader + "Offset to Vertex Indices");
+        ReadNumber(&Data.nOffsetToMaterials, 6, sHeader + "Offset to Material IDs");
+        ReadNumber(&Data.nOffsetToNormals, 6, sHeader + "Offset to Face Normals");
+        ReadNumber(&Data.nOffsetToDistances, 6, sHeader + "Offset to Plane Distances");
+        ReadNumber(&Data.nNumberOfAabb, 1, sHeader + "Number of Aabb Structs"); /// In my test model this equals the number of aabb in the mdl
+        ReadNumber(&Data.nOffsetToAabb, 6, sHeader + "Offset to Aabb Structs");
         ReadNumber(&Data.nPadding, 11, sHeader + "Unknown");
-        ReadNumber(&Data.nNumberOfAdjacentFaces, 1, sHeader + "Adjacent Edges Count");
-        ReadNumber(&Data.nOffsetToAdjacentFaces, 6, sHeader + "Adjacent Edges Offset");
-        ReadNumber(&Data.nNumberOfEdges, 1, sHeader + "Outer Edges Count");
-        ReadNumber(&Data.nOffsetToEdges, 6, sHeader + "Outer Edges Offset");
-        ReadNumber(&Data.nNumberOfPerimeters, 1, sHeader + "Perimeters Count");
-        ReadNumber(&Data.nOffsetToPerimeters, 6, sHeader + "Perimeters Offset");
+        ReadNumber(&Data.nNumberOfAdjacentFaces, 1, sHeader + "Number of Adjacent Edges");
+        ReadNumber(&Data.nOffsetToAdjacentFaces, 6, sHeader + "Offset to Adjacent Edges");
+        ReadNumber(&Data.nNumberOfEdges, 1, sHeader + "Number of Outer Edges");
+        ReadNumber(&Data.nOffsetToEdges, 6, sHeader + "Offset to Outer Edges");
+        ReadNumber(&Data.nNumberOfPerimeters, 1, sHeader + "Number of Perimeters");
+        ReadNumber(&Data.nOffsetToPerimeters, 6, sHeader + "Offset to Perimeters");
         MarkDataBorder(nPosition - 1);
     }
     catch(const std::exception & e){
@@ -1397,16 +1601,14 @@ void BWM::DecompileBWM(ReportObject & ReportMdl){
     unsigned nPosData = 0;
 
     try{
-        Data.verts.resize(Data.nNumberOfVerts);
-        nPosData = Data.nOffsetToVerts;
-        for(int n = 0; n < Data.nNumberOfVerts; n++){
-            /// Setting up the pointer to the data
-            Data.verts.at(n).dataRegions.emplace_back(sName, nPosData, 12);
+        nPosData = BwmArrayOffset(Data.nNumberOfVerts, Data.nOffsetToVerts, 12u, sBuffer.size(), "BWM vertex array");
+        ResizeBinaryVector(Data.verts, Data.nNumberOfVerts, "BWM vertex array");
+        for(unsigned int n = 0; n < Data.nNumberOfVerts; n++){
 
             //Collect verts
-            Data.verts.at(n).fX = ReadNumber<float>(nullptr, 2, "Vertex " + std::to_string(n) + " > X", &nPosData);
-            Data.verts.at(n).fY = ReadNumber<float>(nullptr, 2, "Vertex " + std::to_string(n) + " > Y", &nPosData);
-            Data.verts.at(n).fZ = ReadNumber<float>(nullptr, 2, "Vertex " + std::to_string(n) + " > Z", &nPosData);
+            Data.verts.at(n).fX = ReadNumber<float>(nullptr, 2, "Vertices > Vertex " + std::to_string(n), &nPosData);
+            Data.verts.at(n).fY = ReadNumber<float>(nullptr, 2, "Vertices > Vertex " + std::to_string(n), &nPosData);
+            Data.verts.at(n).fZ = ReadNumber<float>(nullptr, 2, "Vertices > Vertex " + std::to_string(n), &nPosData);
             MarkDataBorder(nPosData - 1);
         }
     }
@@ -1414,16 +1616,15 @@ void BWM::DecompileBWM(ReportObject & ReportMdl){
         throw mdlexception(std::string("Reading BWM vertex data: ") + e.what());
     }
     try{
-        Data.faces.resize(Data.nNumberOfFaces);
-        nPosData = Data.nOffsetToIndices;
-        for(int n = 0; n < Data.nNumberOfFaces; n++){
-            /// Setting up the pointer to the data
-            Data.faces.at(n).dataRegions.emplace_back(sName, nPosData, 12);
+        nPosData = BwmArrayOffset(Data.nNumberOfFaces, Data.nOffsetToIndices, 12u, sBuffer.size(), "BWM face index array");
+        ResizeBinaryVector(Data.faces, Data.nNumberOfFaces, "BWM face array");
+        for(unsigned int n = 0; n < Data.nNumberOfFaces; n++){
 
             //Collect indices
-            Data.faces.at(n).nIndexVertex[0] = ReadNumber<signed int>(nullptr, 4, "Face " + std::to_string(n) + " > Vert Index 0", &nPosData);
-            Data.faces.at(n).nIndexVertex[1] = ReadNumber<signed int>(nullptr, 4, "Face " + std::to_string(n) + " > Vert Index 1", &nPosData);
-            Data.faces.at(n).nIndexVertex[2] = ReadNumber<signed int>(nullptr, 4, "Face " + std::to_string(n) + " > Vert Index 2", &nPosData);
+            for(int i = 0; i < 3; i++){
+                const std::string sIndexDesc = "Vertex Indices > Face " + std::to_string(n) + " > Index " + std::to_string(i);
+                Data.faces.at(n).nIndexVertex[i] = SignedIntToUShortOrInvalid(ReadNumber<signed int>(nullptr, 4, sIndexDesc, &nPosData), sIndexDesc);
+            }
             MarkDataBorder(nPosData - 1);
         }
     }
@@ -1431,13 +1632,11 @@ void BWM::DecompileBWM(ReportObject & ReportMdl){
         throw mdlexception(std::string("Reading BWM face data: ") + e.what());
     }
     try{
-        nPosData = Data.nOffsetToMaterials;
-        for(int n = 0; n < Data.nNumberOfFaces; n++){
-            /// Setting up the pointer to the data
-            Data.faces.at(n).dataRegions.emplace_back(sName, nPosData, 4);
+        nPosData = BwmArrayOffset(Data.nNumberOfFaces, Data.nOffsetToMaterials, 4u, sBuffer.size(), "BWM material array");
+        for(unsigned int n = 0; n < Data.nNumberOfFaces; n++){
 
             //Collect materials
-            ReadNumber(&Data.faces.at(n).nMaterialID, 4, "Face " + std::to_string(n) + " > Material ID", &nPosData);
+            ReadNumber(&Data.faces.at(n).nMaterialID, 4, "Materials > Material " + std::to_string(n), &nPosData);
             MarkDataBorder(nPosData - 1);
         }
     }
@@ -1445,15 +1644,13 @@ void BWM::DecompileBWM(ReportObject & ReportMdl){
         throw mdlexception(std::string("Reading BWM surface ID data: ") + e.what());
     }
     try{
-        nPosData = Data.nOffsetToNormals;
-        for(int n = 0; n < Data.nNumberOfFaces; n++){
-            /// Setting up the pointer to the data
-            Data.faces.at(n).dataRegions.emplace_back(sName, nPosData, 12);
+        nPosData = BwmArrayOffset(Data.nNumberOfFaces, Data.nOffsetToNormals, 12u, sBuffer.size(), "BWM normal array");
+        for(unsigned int n = 0; n < Data.nNumberOfFaces; n++){
 
             //Collect normals
-            Data.faces.at(n).vNormal.fX = ReadNumber<float>(nullptr, 2, "Face " + std::to_string(n) + " > Normal > X", &nPosData);
-            Data.faces.at(n).vNormal.fY = ReadNumber<float>(nullptr, 2, "Face " + std::to_string(n) + " > Normal > Y", &nPosData);
-            Data.faces.at(n).vNormal.fZ = ReadNumber<float>(nullptr, 2, "Face " + std::to_string(n) + " > Normal > Z", &nPosData);
+            Data.faces.at(n).vNormal.fX = ReadNumber<float>(nullptr, 2, "Face Normals > Normal " + std::to_string(n), &nPosData);
+            Data.faces.at(n).vNormal.fY = ReadNumber<float>(nullptr, 2, "Face Normals > Normal " + std::to_string(n), &nPosData);
+            Data.faces.at(n).vNormal.fZ = ReadNumber<float>(nullptr, 2, "Face Normals > Normal " + std::to_string(n), &nPosData);
             MarkDataBorder(nPosData - 1);
         }
     }
@@ -1461,13 +1658,11 @@ void BWM::DecompileBWM(ReportObject & ReportMdl){
         throw mdlexception(std::string("Reading BWM face normal data: ") + e.what());
     }
     try{
-        nPosData = Data.nOffsetToDistances;
-        for(int n = 0; n < Data.nNumberOfFaces; n++){
-            /// Setting up the pointer to the data
-            Data.faces.at(n).dataRegions.emplace_back(sName, nPosData, 4);
+        nPosData = BwmArrayOffset(Data.nNumberOfFaces, Data.nOffsetToDistances, 4u, sBuffer.size(), "BWM plane-distance array");
+        for(unsigned int n = 0; n < Data.nNumberOfFaces; n++){
 
             //Collect distances
-            Data.faces.at(n).fDistance = ReadNumber<float>(nullptr, 2, "Face " + std::to_string(n) + " > Plane Distance", &nPosData);
+            Data.faces.at(n).fDistance = ReadNumber<float>(nullptr, 2, "Plane Distances > Distance " + std::to_string(n), &nPosData);
             MarkDataBorder(nPosData - 1);
         }
     }
@@ -1475,24 +1670,23 @@ void BWM::DecompileBWM(ReportObject & ReportMdl){
         throw mdlexception(std::string("Reading BWM plane distance data: ") + e.what());
     }
     try{
-        Data.aabb.resize(Data.nNumberOfAabb);
-        nPosData = Data.nOffsetToAabb;
-        for(int n = 0; n < Data.nNumberOfAabb; n++){
-            /// Setting up the pointer to the data
-            Data.aabb.at(n).dataRegions.emplace_back(sName, nPosData, 44);
+        nPosData = BwmArrayOffset(Data.nNumberOfAabb, Data.nOffsetToAabb, 44u, sBuffer.size(), "BWM AABB array");
+        ResizeBinaryVector(Data.aabb, Data.nNumberOfAabb, "BWM AABB array");
+        for(unsigned int n = 0; n < Data.nNumberOfAabb; n++){
 
             //Collect aabb
-            Data.aabb.at(n).vBBmin.fX = ReadNumber<float>(nullptr, 2, "AABB " + std::to_string(n) + " > Bounding Box Min > X", &nPosData);
-            Data.aabb.at(n).vBBmin.fY = ReadNumber<float>(nullptr, 2, "AABB " + std::to_string(n) + " > Bounding Box Min > Y", &nPosData);
-            Data.aabb.at(n).vBBmin.fZ = ReadNumber<float>(nullptr, 2, "AABB " + std::to_string(n) + " > Bounding Box Min > Z", &nPosData);
-            Data.aabb.at(n).vBBmax.fX = ReadNumber<float>(nullptr, 2, "AABB " + std::to_string(n) + " > Bounding Box Max > X", &nPosData);
-            Data.aabb.at(n).vBBmax.fY = ReadNumber<float>(nullptr, 2, "AABB " + std::to_string(n) + " > Bounding Box Max > Y", &nPosData);
-            Data.aabb.at(n).vBBmax.fZ = ReadNumber<float>(nullptr, 2, "AABB " + std::to_string(n) + " > Bounding Box Max > Z", &nPosData);
-            Data.aabb.at(n).nID = ReadNumber<signed int>(nullptr, 4, "AABB " + std::to_string(n) + " > Face Index", &nPosData);
-            ReadNumber(&Data.aabb.at(n).nExtra, 4, "AABB " + std::to_string(n) + " > Unknown", &nPosData);
-            ReadNumber(&Data.aabb.at(n).nProperty, 4, "AABB " + std::to_string(n) + " > Second Child Property", &nPosData);
-            ReadNumber(&Data.aabb.at(n).nChild1, 4, "AABB " + std::to_string(n) + " > Child 1 Index", &nPosData);
-            ReadNumber(&Data.aabb.at(n).nChild2, 4, "AABB " + std::to_string(n) + " > Child 2 Index", &nPosData);
+            Data.aabb.at(n).vBBmin.fX = ReadNumber<float>(nullptr, 2, "Aabb Tree > Aabb Struct " + std::to_string(n), &nPosData);
+            Data.aabb.at(n).vBBmin.fY = ReadNumber<float>(nullptr, 2, "Aabb Tree > Aabb Struct " + std::to_string(n), &nPosData);
+            Data.aabb.at(n).vBBmin.fZ = ReadNumber<float>(nullptr, 2, "Aabb Tree > Aabb Struct " + std::to_string(n), &nPosData);
+            Data.aabb.at(n).vBBmax.fX = ReadNumber<float>(nullptr, 2, "Aabb Tree > Aabb Struct " + std::to_string(n), &nPosData);
+            Data.aabb.at(n).vBBmax.fY = ReadNumber<float>(nullptr, 2, "Aabb Tree > Aabb Struct " + std::to_string(n), &nPosData);
+            Data.aabb.at(n).vBBmax.fZ = ReadNumber<float>(nullptr, 2, "Aabb Tree > Aabb Struct " + std::to_string(n), &nPosData);
+            const std::string sAabbDesc = "Aabb Tree > Aabb Struct " + std::to_string(n);
+            Data.aabb.at(n).nID = SignedIntToUShortOrInvalid(ReadNumber<signed int>(nullptr, 4, sAabbDesc, &nPosData), sAabbDesc + " face id");
+            ReadNumber(&Data.aabb.at(n).nExtra, 4, "Aabb Tree > Aabb Struct " + std::to_string(n), &nPosData);
+            ReadNumber(&Data.aabb.at(n).nProperty, 4, "Aabb Tree > Aabb Struct " + std::to_string(n), &nPosData);
+            ReadNumber(&Data.aabb.at(n).nChild1, 4, "Aabb Tree > Aabb Struct " + std::to_string(n), &nPosData);
+            ReadNumber(&Data.aabb.at(n).nChild2, 4, "Aabb Tree > Aabb Struct " + std::to_string(n), &nPosData);
             MarkDataBorder(nPosData - 1);
         }
     }
@@ -1500,32 +1694,29 @@ void BWM::DecompileBWM(ReportObject & ReportMdl){
         throw mdlexception(std::string("Reading BWM aabb data: ") + e.what());
     }
     try{
-        nPosData = Data.nOffsetToAdjacentFaces;
-        for(int n = 0; n < Data.nNumberOfAdjacentFaces; n++){
-            if(n < Data.faces.size()){
-                /// Setting up the pointer to the data
-                Data.faces.at(n).dataRegions.emplace_back(sName, nPosData, 12);
+        nPosData = BwmArrayOffset(Data.nNumberOfAdjacentFaces, Data.nOffsetToAdjacentFaces, 12u, sBuffer.size(), "BWM adjacent-face array");
+        for(unsigned int n = 0; n < Data.nNumberOfAdjacentFaces; n++){
+            if(static_cast<std::size_t>(n) < Data.faces.size()){
 
-                Data.faces.at(n).nAdjacentFaces[0] = ReadNumber<signed int>(nullptr, 4, "Walkable Face " + std::to_string(n) + " > Adjacent Edge 0", &nPosData);
-                Data.faces.at(n).nAdjacentFaces[1] = ReadNumber<signed int>(nullptr, 4, "Walkable Face " + std::to_string(n) + " > Adjacent Edge 1", &nPosData);
-                Data.faces.at(n).nAdjacentFaces[2] = ReadNumber<signed int>(nullptr, 4, "Walkable Face " + std::to_string(n) + " > Adjacent Edge 2", &nPosData);
+                for(int i = 0; i < 3; i++){
+                    const std::string sAdjacentDesc = "Adjacent Faces > Face " + std::to_string(n) + " > Edge " + std::to_string(i);
+                    Data.faces.at(n).nAdjacentFaces[i] = SignedIntToUShortOrInvalid(ReadNumber<signed int>(nullptr, 4, sAdjacentDesc, &nPosData), sAdjacentDesc);
+                }
                 MarkDataBorder(nPosData - 1);
             }
-            else Error("More adjacent faces than faces!");
+            else throw mdlexception("BWM adjacent-face count exceeds the face count; refusing to ignore extra adjacency rows.");
         }
     }
     catch(const std::exception & e){
         throw mdlexception(std::string("Reading BWM adjacent edge data: ") + e.what());
     }
     try{
-        Data.edges.resize(Data.nNumberOfEdges);
-        nPosData = Data.nOffsetToEdges;
-        for(int n = 0; n < Data.nNumberOfEdges; n++){
-            /// Setting up the pointer to the data
-            Data.edges.at(n).dataRegions.emplace_back(sName, nPosData, 8);
+        nPosData = BwmArrayOffset(Data.nNumberOfEdges, Data.nOffsetToEdges, 8u, sBuffer.size(), "BWM edge array");
+        ResizeBinaryVector(Data.edges, Data.nNumberOfEdges, "BWM edge array");
+        for(unsigned int n = 0; n < Data.nNumberOfEdges; n++){
 
-            ReadNumber(&Data.edges.at(n).nIndex, 4, "Outer Edge " + std::to_string(n) + " > Index", &nPosData);
-            ReadNumber(&Data.edges.at(n).nTransition, 4, "Outer Edge " + std::to_string(n) + " > Transition", &nPosData);
+            ReadNumber(&Data.edges.at(n).nIndex, 4, "Edges > Edge " + std::to_string(n), &nPosData);
+            ReadNumber(&Data.edges.at(n).nTransition, 4, "Edges > Edge " + std::to_string(n), &nPosData);
             MarkDataBorder(nPosData - 1);
         }
     }
@@ -1533,13 +1724,11 @@ void BWM::DecompileBWM(ReportObject & ReportMdl){
         throw mdlexception(std::string("Reading BWM edge data: ") + e.what());
     }
     try{
-        Data.perimeters.resize(Data.nNumberOfPerimeters);
-        nPosData = Data.nOffsetToPerimeters;
-        for(int n = 0; n < Data.nNumberOfPerimeters; n++){
-            /// Setting up the pointer to the data
-            Data.perimeters.at(n).dataRegions.emplace_back(sName, nPosData, 4);
+        nPosData = BwmArrayOffset(Data.nNumberOfPerimeters, Data.nOffsetToPerimeters, 4u, sBuffer.size(), "BWM perimeter array");
+        ResizeBinaryVector(Data.perimeters, Data.nNumberOfPerimeters, "BWM perimeter array");
+        for(unsigned int n = 0; n < Data.nNumberOfPerimeters; n++){
 
-            ReadNumber(&Data.perimeters.at(n).nPerimeter, 4, "Perimeter " + std::to_string(n), &nPosData);
+            ReadNumber(&Data.perimeters.at(n).nPerimeter, 4, "Perimeters > Perimeter " + std::to_string(n), &nPosData);
             MarkDataBorder(nPosData - 1);
         }
     }
@@ -1547,7 +1736,6 @@ void BWM::DecompileBWM(ReportObject & ReportMdl){
         throw mdlexception(std::string("Reading BWM perimeter data: ") + e.what());
     }
 
-    positions.shrink_to_fit();
-
-    ReportMdl << "Decompiled BWM in " << tDecompile.GetTime() << ".\n";
+    restoreBwmOnFailure.Dismiss();
 }
+

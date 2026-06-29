@@ -1,6 +1,8 @@
 #include "MDL.h"
 #include <algorithm>
+#include <cmath>
 #include <iomanip>
+#include <limits>
 
 /**
     Functions:
@@ -10,20 +12,24 @@
     MDL::ExportWokAscii()
     RecursiveAabb() //Helper
     MDL::ConvertToAscii()
-/**/
+*/
 
 void MDL::ExportAscii(std::string &sExport){
+    sExport.clear();
     if(!FH) return;
     std::stringstream ss;
     try{
         ConvertToAscii(CONVERT_MODEL, ss, (void*) &(FH->MH));
     }
     catch(const std::exception & e){
-        Error("An exception occurred while creating model ascii:\n\n" + std::string(e.what()) + "\n\nThe exported ascii will be broken.");
+        sExport.clear();
+        Error("An exception occurred while creating model ascii:\n\n" + std::string(e.what()) + "\n\nExport aborted so no partial/broken ASCII is returned.");
+        return;
     }
     sExport = ss.str();
 }
 void MDL::ExportPwkAscii(std::string &sExport){
+    sExport.clear();
     if(!Pwk) return;
     if(!Pwk->GetData()) return;
     std::stringstream ss;
@@ -31,21 +37,27 @@ void MDL::ExportPwkAscii(std::string &sExport){
         ConvertToAscii(CONVERT_PWK, ss, (void*) Pwk.get());
     }
     catch(const std::exception & e){
-        Error("An exception occurred while creating pwk ascii:\n\n" + std::string(e.what()) + "\n\nThe exported ascii will be broken.");
+        sExport.clear();
+        Error("An exception occurred while creating pwk ascii:\n\n" + std::string(e.what()) + "\n\nExport aborted so no partial/broken ASCII is returned.");
+        return;
     }
     sExport = ss.str();
 }
 void MDL::ExportDwkAscii(std::string &sExport){
+    sExport.clear();
     std::stringstream ss;
     try{
         ConvertToAscii(CONVERT_DWK, ss, (void*) this);
     }
     catch(const std::exception & e){
-        Error("An exception occurred while creating dwk ascii:\n\n" + std::string(e.what()) + "\n\nThe exported ascii will be broken.");
+        sExport.clear();
+        Error("An exception occurred while creating dwk ascii:\n\n" + std::string(e.what()) + "\n\nExport aborted so no partial/broken ASCII is returned.");
+        return;
     }
     sExport = ss.str();
 }
 void MDL::ExportWokAscii(std::string &sExport){
+    sExport.clear();
     if(!Wok) return;
     if(!Wok->GetData()) return;
     std::stringstream ss;
@@ -53,24 +65,77 @@ void MDL::ExportWokAscii(std::string &sExport){
         ConvertToAscii(CONVERT_WOK, ss, (void*) Wok.get());
     }
     catch(const std::exception & e){
-        Error("An exception occurred while creating wok ascii:\n\n" + std::string(e.what()) + "\n\nThe exported ascii will be broken.");
+        sExport.clear();
+        Error("An exception occurred while creating wok ascii:\n\n" + std::string(e.what()) + "\n\nExport aborted so no partial/broken ASCII is returned.");
+        return;
     }
     sExport = ss.str();
 }
 
 std::string nl = "\r\n";
+
+static unsigned short CheckedAsciiRenderIndex(std::size_t index, const std::string & sContext){
+    const std::size_t nInvalid = static_cast<std::size_t>(std::numeric_limits<unsigned short>::max());
+    if(index >= nInvalid){
+        throw mdlexception(sContext + " would require a render vertex index outside the 16-bit MDL range.");
+    }
+    return static_cast<unsigned short>(index);
+}
+
+static void WriteRawControllerBlocks(std::stringstream &sReturn, const std::string &nl, const std::string &indent, Node &node){
+    if(!node.Head.Controllers.empty()){
+        sReturn << nl << indent << "controllerraw " << node.Head.Controllers.size();
+        for(Controller &ctrl : node.Head.Controllers){
+            sReturn << nl << indent << "  " << static_cast<unsigned int>(ctrl.nControllerType);
+            sReturn << " " << static_cast<unsigned int>(ctrl.nUnknown2);
+            sReturn << " " << static_cast<unsigned int>(ctrl.nValueCount);
+            sReturn << " " << static_cast<unsigned int>(ctrl.nTimekeyStart);
+            sReturn << " " << static_cast<unsigned int>(ctrl.nDataStart);
+            sReturn << " " << static_cast<unsigned int>(ctrl.nColumnCount);
+            sReturn << " " << static_cast<unsigned int>(static_cast<unsigned char>(ctrl.nPadding.at(0)));
+            sReturn << " " << static_cast<unsigned int>(static_cast<unsigned char>(ctrl.nPadding.at(1)));
+            sReturn << " " << static_cast<unsigned int>(static_cast<unsigned char>(ctrl.nPadding.at(2)));
+        }
+    }
+    if(!node.Head.ControllerData.empty()){
+        sReturn << nl << indent << "controllerdataraw " << node.Head.ControllerData.size();
+        for(double value : node.Head.ControllerData){
+            sReturn << nl << indent << "  " << FloatBits(static_cast<float>(value));
+        }
+    }
+}
+
 void RecursiveAabb(Aabb * AABB, std::stringstream &str){
+    if(AABB == nullptr) throw mdlexception("Cannot export AABB tree: null AABB node.");
+    if(AABB->Child1.size() > 1 || AABB->Child2.size() > 1){
+        throw mdlexception("Cannot export AABB tree: a node has more than one child in a binary child slot; refusing to drop extra child data.");
+    }
+    // Extended ASCII fields.
+    //   minx miny minz maxx maxy maxz faceid property hasChild1 hasChild2
+    // The writer still emits the old first seven values, but the added property/child
+    // flags allow ASCII -> binary to preserve the original tree shape instead of
+    // rebuilding it from faces. Child offsets themselves are intentionally not written;
+    // they are placement-dependent and are regenerated by WriteAabb().
+    // Child flags describe the recursive ASCII payload we are about to emit.
+    // Do not infer a child from a raw child offset alone: if the child vector is
+    // absent, there is no recursive child line to read back, and exporting
+    // hasChild=1 would make ASCII re-import consume the next sibling as a child.
+    const bool bHasChild1 = !AABB->Child1.empty();
+    const bool bHasChild2 = !AABB->Child2.empty();
     str << nl << "    " << PrepareFloat(AABB->vBBmin.fX) <<
                 " " << PrepareFloat(AABB->vBBmin.fY) <<
                 " " << PrepareFloat(AABB->vBBmin.fZ) <<
                 " " << PrepareFloat(AABB->vBBmax.fX) <<
                 " " << PrepareFloat(AABB->vBBmax.fY) <<
                 " " << PrepareFloat(AABB->vBBmax.fZ) <<
-                " " << AABB->nID.Print();
-    if(AABB->nChild1 > 0){
+                " " << AABB->nID.Print() <<
+                " " << AABB->nProperty.Print() <<
+                " " << (bHasChild1 ? 1 : 0) <<
+                " " << (bHasChild2 ? 1 : 0);
+    if(!AABB->Child1.empty()){
         RecursiveAabb(&AABB->Child1[0], str);
     }
-    if(AABB->nChild2 > 0){
+    if(!AABB->Child2.empty()){
         RecursiveAabb(&AABB->Child2[0], str);
     }
 }
@@ -78,6 +143,36 @@ void RecursiveAabb(Aabb * AABB, std::stringstream &str){
 
 
 /// Here we need another pass at the meshes to weld the vertices if the option is turned on
+
+void ClearWeldedArrays(Node & node){
+    if(!(node.Head.nType & NODE_MESH)) return;
+
+    node.Mesh.TempVertices.clear();
+    if(node.Head.nType & NODE_DANGLY) node.Dangly.TempConstraints.clear();
+
+    for(Face & face : node.Mesh.Faces){
+        face.bProcessed = {false, false, false};
+        face.nTempIndexVertex = {INVALID_SHORT, INVALID_SHORT, INVALID_SHORT};
+    }
+}
+
+class WeldedArrayCleanupGuard{
+    Node * pNode = nullptr;
+  public:
+    void Arm(Node & node){
+        pNode = &node;
+    }
+    void Clear(){
+        if(pNode != nullptr){
+            ClearWeldedArrays(*pNode);
+            pNode = nullptr;
+        }
+    }
+    ~WeldedArrayCleanupGuard(){
+        Clear();
+    }
+};
+
 void BuildWeldedArrays(Node & node){
     if(!(node.Head.nType & NODE_MESH) || (node.Head.nType & NODE_SABER) || (node.Head.nType & NODE_AABB)) return;
 
@@ -90,12 +185,24 @@ void BuildWeldedArrays(Node & node){
     vertices.clear();
     if(p_constraints) p_constraints->clear();
 
+    if(node.Mesh.Faces.size() > vertices.max_size() / 3u){
+        throw mdlexception("Mesh has too many faces to build welded ASCII vertex arrays safely.");
+    }
+    const std::size_t nMaxRenderVerts = node.Mesh.Faces.size() * 3u;
+    vertices.reserve(nMaxRenderVerts);
+    if(p_constraints){
+        if(nMaxRenderVerts > p_constraints->max_size()){
+            throw mdlexception("Mesh has too many faces to build welded ASCII constraint arrays safely.");
+        }
+        p_constraints->reserve(nMaxRenderVerts);
+    }
+
     /// Reset all the processed flags to false
     for(Face & face : node.Mesh.Faces){
             face.bProcessed = {false, false, false};
     }
 
-    for(int f = 0; f < node.Mesh.Faces.size(); f++){
+    for(int f = 0; f < static_cast<int>(node.Mesh.Faces.size()); f++){
         Face & face = node.Mesh.Faces.at(f);
         for(int i = 0; i < 3; i++){
             if(face.bProcessed.at(i)) continue;
@@ -103,25 +210,27 @@ void BuildWeldedArrays(Node & node){
             /// Copy the vertex struct
             Vertex vert = node.Mesh.Vertices.at(face.nIndexVertex.at(i));
 
-            for(int f2 = f; f2 < node.Mesh.Faces.size(); f2++){
+            for(int f2 = f; f2 < static_cast<int>(node.Mesh.Faces.size()); f2++){
                 Face & face2 = node.Mesh.Faces.at(f2);
                 for(int i2 = 0; i2 < 3; i2++){
                     //Make sure that we're only changing what's past our current position if we are in the same face.
                     if(f2 == f && i2 <= i) continue;
+                    if(face2.bProcessed.at(i2)) continue;
 
                     Vertex & vert2 = node.Mesh.Vertices.at(face2.nIndexVertex.at(i2));
-                    if(vert.fX == vert2.fX &&
-                       vert.fY == vert2.fY &&
-                       vert.fZ == vert2.fZ &&
-                       (!(node.Head.nType & NODE_SKIN) || vert.MDXData.Weights == vert2.MDXData.Weights) &&
+                    // Render vertices are
+                    // only interchangeable when the full MDX payload is identical.
+                    // Position-only welding can detach UVs, normals, colors, tangents or
+                    // skin weights from the original render vertex.
+                    if(vert == vert2 &&
                        (!p_constraints || (node.Dangly.Constraints.at(face.nIndexVertex.at(i)) == node.Dangly.Constraints.at(face2.nIndexVertex.at(i2))))
                        ){
-                        face2.nTempIndexVertex.at(i2) = node.Mesh.TempVertices.size();
+                        face2.nTempIndexVertex.at(i2) = CheckedAsciiRenderIndex(node.Mesh.TempVertices.size(), "Welded ASCII export");
                         face2.bProcessed.at(i2) = true;
                     }
                 }
             }
-            face.nTempIndexVertex.at(i) = node.Mesh.TempVertices.size();
+            face.nTempIndexVertex.at(i) = CheckedAsciiRenderIndex(node.Mesh.TempVertices.size(), "Welded ASCII export");
             face.bProcessed.at(i) = true;
             if(p_constraints) node.Dangly.TempConstraints.push_back(node.Dangly.Constraints.at(face.nIndexVertex.at(i)));
             node.Mesh.TempVertices.push_back(std::move(vert));
@@ -134,7 +243,6 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
     //ReportMdl << "Converting to ascii, data type: " << nDataType << "\n";
     std::string nl = "\r\n";
     std::stringstream sTimestamp;
-    static unsigned nExportedNodes = 0;
     SYSTEMTIME st;
     GetLocalTime(&st);
     sTimestamp << (st.wDay<10? "0" : "") << st.wDay << "/" << (st.wMonth<10? "0" : "") << st.wMonth << "/" << st.wYear;
@@ -144,7 +252,6 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
     if(nDataType == 0) return;
     else if(nDataType == CONVERT_MODEL){
         ModelHeader * mh = (ModelHeader*) Data;
-        nExportedNodes = 0;
         sReturn << "# Exported with MDLedit " << version.Print() << " ";
         if(src == AsciiSource) sReturn << "from ascii source ";
         else if(src == BinarySource) sReturn << "from binary source ";
@@ -152,6 +259,13 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         sReturn << "at " << sTimestamp.str();
         sReturn << nl << "# MODEL ASCII";
         sReturn << nl << "newmodel " << mh->GH.sName.c_str();
+        // Preserve the binary target game/platform in ASCII. Several binary
+        // node layouts differ between K1 and TSL/K2, and TSL has one more
+        // compact skin-palette slot than K1. An unedited decompiled ASCII
+        // should therefore carry the target it came from instead of relying
+        // on the current UI/default setting.
+        sReturn << nl << "game " << (bK2 ? "kotor2" : "kotor1");
+        sReturn << nl << "platform " << (bXbox ? "xbox" : "pc");
         sReturn << nl << "setsupermodel " << mh->GH.sName.c_str() << " " << mh->cSupermodelName.c_str();
         sReturn << nl << "classification " << ReturnClassificationName(mh->nClassification).c_str();
         sReturn << nl << "classification_unk1 " << (int) mh->nSubclassification;
@@ -159,6 +273,13 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         sReturn << nl << "setanimationscale " << PrepareFloat(mh->fScale);
         sReturn << nl << "compress_quaternions " << (mh->bCompressQuaternions ? 1 : 0);
         sReturn << nl << "headlink " << (HeadLinked() ? 1 : 0);
+        // Preserve binary header fields that are runtime/padding-like but can
+        // contain nonzero vanilla values, especially on K1 body/head models.
+        sReturn << nl << "totalnodes " << mh->GH.nTotalNumberOfNodes;
+        sReturn << nl << "geometryheaderpadding " << (int) mh->GH.nPadding[0]
+                << " " << (int) mh->GH.nPadding[1]
+                << " " << (int) mh->GH.nPadding[2];
+        sReturn << nl << "supermodelreference " << mh->nSupermodelReference;
         sReturn << nl;
         sReturn << nl << "# GEOM ASCII";
         sReturn << nl << "beginmodelgeom " << mh->GH.sName.c_str();
@@ -167,20 +288,19 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         sReturn     << nl << "  bmin " << PrepareFloat(mh->vBBmin.fX) << " " << PrepareFloat(mh->vBBmin.fY) << " " << PrepareFloat(mh->vBBmin.fZ);
         sReturn     << nl << "  bmax " << PrepareFloat(mh->vBBmax.fX) << " " << PrepareFloat(mh->vBBmax.fY) << " " << PrepareFloat(mh->vBBmax.fZ);
         sReturn     << nl << "  radius " << PrepareFloat(mh->fRadius);
-        for(int n = 0; n < mh->Names.size(); n++){
+        for(int n = 0; n < static_cast<int>(mh->Names.size()); n++){
             ConvertToAscii(CONVERT_NODE, sReturn, (void*) &n);
         }
         sReturn << nl << "endmodelgeom " << mh->GH.sName.c_str() << nl;
 
         if(bWriteAnimations){
-            for(int n = 0; n < mh->Animations.size(); n++){
+            for(int n = 0; n < static_cast<int>(mh->Animations.size()); n++){
                 ConvertToAscii(CONVERT_ANIMATION, sReturn, (void*) &mh->Animations.at(n));
             }
         }
 
         sReturn << nl << nl << "donemodel " << mh->GH.sName.c_str() << nl;
 
-        ReportMdl << "Exported nodes: " << nExportedNodes << "\n";
     }
     else if(nDataType == CONVERT_ANIMATION){
         Animation * anim = (Animation*) Data;
@@ -188,12 +308,21 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         sReturn << nl << "  length " << PrepareFloat(anim->fLength);
         sReturn << nl << "  transtime " << PrepareFloat(anim->fTransition);
         sReturn << nl << "  animroot " << anim->sAnimRoot.c_str();
+        sReturn << nl << "  animheader " << anim->nFunctionPointer0;
+        sReturn << " " << anim->nFunctionPointer1;
+        sReturn << " " << anim->nNumberOfNames;
+        sReturn << " " << anim->nRefCount;
+        sReturn << " " << static_cast<unsigned int>(anim->nModelType);
+        sReturn << " " << static_cast<unsigned int>(anim->nPadding.at(0));
+        sReturn << " " << static_cast<unsigned int>(anim->nPadding.at(1));
+        sReturn << " " << static_cast<unsigned int>(anim->nPadding.at(2));
+        sReturn << " " << anim->nPadding2;
         if(anim->Events.size() > 0){
-            for(int s = 0; s < anim->Events.size(); s++){
+            for(int s = 0; s < static_cast<int>(anim->Events.size()); s++){
                 sReturn << nl << "  event " << anim->Events.at(s).fTime << " " << anim->Events.at(s).sName.c_str();
             }
         }
-        for(int n = 0; n < anim->ArrayOfNodes.size(); n++){
+        for(int n = 0; n < static_cast<int>(anim->ArrayOfNodes.size()); n++){
             Node & node = anim->ArrayOfNodes.at(n);
             ConvertToAscii(CONVERT_ANIMATION_NODE, sReturn, (void*) &node);
         }
@@ -206,30 +335,37 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         //ReportMdl << "Animation node: " << MakeUniqueName(node->Head.nNameIndex) << nl;
         sReturn << nl << "      parent " << (node->Head.nParentIndex.Valid() ? MakeUniqueName(node->Head.nParentIndex) : "NULL");
         if(node->Head.Controllers.size() > 0){
-            for(int n = 0; n < node->Head.Controllers.size(); n++){
+            for(int n = 0; n < static_cast<int>(node->Head.Controllers.size()); n++){
                 ConvertToAscii(CONVERT_CONTROLLER_KEYED, sReturn, (void*) &(node->Head.Controllers.at(n)));
             }
         }
         else if(node->Head.ControllerData.size() > 0){
+            // Preserve controllerless animation data exactly. Some TSL models
+            // contain nonzero and even NaN payloads here; the old exporter wrote
+            // only the count, causing ASCII -> binary to replace the payload with
+            // zeroes.
             sReturn << nl << "      extra_data " << node->Head.ControllerData.size();
-            //ConvertToAscii(CONVERT_CONTROLLERLESS_DATA, sReturn, (void*) node);
+            for(double fData : node->Head.ControllerData){
+                sReturn << nl << "        " << PrepareFloat(fData, false);
+            }
         }
+        WriteRawControllerBlocks(sReturn, nl, "      ", *node);
         sReturn << nl << "    endnode";
     }
     else if(nDataType == CONVERT_NODE){
         if(!FH) return;
         ModelHeader * mh = &FH->MH;
         int n = *((int*) Data);
-        MdlInteger<unsigned short> nNodeIndex = GetNodeIndexByNameIndex(n);
+        int nNodeIndex = GetNodeIndexByNameIndex(n);
 
-        if(!nNodeIndex.Valid()){
+        if(nNodeIndex == -1){
             sReturn << nl << "name " << mh->Names.at(n).sName;
         }
         else{
             Node & node = mh->ArrayOfNodes.at(nNodeIndex);
+            WeldedArrayCleanupGuard WeldedCleanup;
 
             //std::cout << "Exporting node " << nExportedNodes << " (" << GetNodeName(node) << ")\n";
-            nExportedNodes++;
 
             if(node.Head.nType & NODE_HEADER){
                 ConvertToAscii(CONVERT_HEADER, sReturn, (void*) &node);
@@ -241,20 +377,21 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
                 ConvertToAscii(CONVERT_AABB, sReturn, (void*) &node);
             }
             else if(node.Head.nType & NODE_SABER){
+                ConvertToAscii(CONVERT_MESH, sReturn, (void*) &node);
                 ConvertToAscii(CONVERT_SABER, sReturn, (void*) &node);
             }
             else if(node.Head.nType & NODE_DANGLY){
-                if(bMinimizeVerts2) BuildWeldedArrays(node);
+                if(bMinimizeVerts2){ WeldedCleanup.Arm(node); BuildWeldedArrays(node); }
                 ConvertToAscii(CONVERT_MESH, sReturn, (void*) &node);
                 ConvertToAscii(CONVERT_DANGLY, sReturn, (void*) &node);
             }
             else if(node.Head.nType & NODE_SKIN && !bSkinToTrimesh){
-                if(bMinimizeVerts2) BuildWeldedArrays(node);
+                if(bMinimizeVerts2){ WeldedCleanup.Arm(node); BuildWeldedArrays(node); }
                 ConvertToAscii(CONVERT_MESH, sReturn, (void*) &node);
                 ConvertToAscii(CONVERT_SKIN, sReturn, (void*) &node);
             }
             else if(node.Head.nType & NODE_MESH){
-                if(bMinimizeVerts2) BuildWeldedArrays(node);
+                if(bMinimizeVerts2){ WeldedCleanup.Arm(node); BuildWeldedArrays(node); }
                 ConvertToAscii(CONVERT_MESH, sReturn, (void*) &node);
             }
             else if(node.Head.nType & NODE_REFERENCE){
@@ -266,6 +403,7 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
             else if(node.Head.nType & NODE_LIGHT){
                 ConvertToAscii(CONVERT_LIGHT, sReturn, (void*) &node);
             }
+            WeldedCleanup.Clear();
             if(node.Head.nType != 0) sReturn << nl << "endnode";
         }
     }
@@ -285,11 +423,13 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         sReturn << " ";
         sReturn << MakeUniqueName(node->Head.nNameIndex);
         sReturn << nl << "  parent " << (node->Head.nParentIndex.Valid() ? MakeUniqueName(node->Head.nParentIndex) : "NULL");
+        sReturn << nl << "  nodepadding " << node->Head.nPadding1;
         if(node->Head.Controllers.size() > 0){
-            for(int n = 0; n < node->Head.Controllers.size(); n++){
+            for(int n = 0; n < static_cast<int>(node->Head.Controllers.size()); n++){
                 ConvertToAscii(CONVERT_CONTROLLER_SINGLE, sReturn, (void*) &(node->Head.Controllers.at(n)));
             }
         }
+        WriteRawControllerBlocks(sReturn, nl, "  ", *node);
     }
     else if(nDataType == CONVERT_LIGHT){
         Node * node = (Node*) Data;
@@ -302,19 +442,19 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         sReturn << nl << "  fadinglight " << node->Light.nFadingLight;
         sReturn << nl << "  flareradius " << PrepareFloat(node->Light.fFlareRadius);
         sReturn << nl << "  texturenames " << node->Light.FlareTextureNames.size();
-        for(int n = 0; n < node->Light.FlareTextureNames.size(); n++){
+        for(int n = 0; n < static_cast<int>(node->Light.FlareTextureNames.size()); n++){
             sReturn << nl << "    " << node->Light.FlareTextureNames.at(n).sName;
         }
         sReturn << nl << "  flaresizes " << node->Light.FlareSizes.size();
-        for(int n = 0; n < node->Light.FlareSizes.size(); n++){
+        for(int n = 0; n < static_cast<int>(node->Light.FlareSizes.size()); n++){
             sReturn << nl << "    " << node->Light.FlareSizes.at(n);
         }
         sReturn << nl << "  flarepositions " << node->Light.FlarePositions.size();
-        for(int n = 0; n < node->Light.FlarePositions.size(); n++){
+        for(int n = 0; n < static_cast<int>(node->Light.FlarePositions.size()); n++){
             sReturn << nl << "    " << node->Light.FlarePositions.at(n);
         }
         sReturn << nl << "  flarecolorshifts " << node->Light.FlareColorShifts.size();
-        for(int n = 0; n < node->Light.FlareColorShifts.size(); n++){
+        for(int n = 0; n < static_cast<int>(node->Light.FlareColorShifts.size()); n++){
             sReturn << nl << "    " << node->Light.FlareColorShifts.at(n).fR << " " << node->Light.FlareColorShifts.at(n).fG << " " << node->Light.FlareColorShifts.at(n).fB;
         }
     }
@@ -332,12 +472,15 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         sReturn << nl << "  render " << node->Emitter.cRender.c_str();
         sReturn << nl << "  blend " << node->Emitter.cBlend.c_str();
         sReturn << nl << "  texture " << node->Emitter.cTexture.c_str();
-        sReturn << nl << "  chunkname " << node->Emitter.cChunkName.c_str();
+        std::string sChunkNameOut = node->Emitter.cChunkName.c_str();
+        sReturn << nl << "  chunkname " << (sChunkNameOut.empty() ? "NULL" : sChunkNameOut);
         sReturn << nl << "  twosidedtex " << node->Emitter.nTwosidedTex;
         sReturn << nl << "  loop " << node->Emitter.nLoop;
         sReturn << nl << "  renderorder " << node->Emitter.nRenderOrder;
         sReturn << nl << "  m_bFrameBlending " << (int) node->Emitter.nFrameBlending;
         sReturn << nl << "  m_sDepthTextureName " << node->Emitter.cDepthTextureName.c_str();
+        sReturn << nl << "  emitterpadding1 " << (int) node->Emitter.nPadding1;
+        sReturn << nl << "  emitterflagsraw " << node->Emitter.nFlags;
 
         sReturn << nl << "  p2p " << (node->Emitter.nFlags & EMITTER_FLAG_P2P ? 1 : 0);
         sReturn << nl << "  p2p_sel " << (node->Emitter.nFlags & EMITTER_FLAG_P2P_SEL ? 1 : 0);
@@ -386,18 +529,30 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         sReturn << nl << "  dirt_texture " << node->Mesh.nDirtTexture;
         sReturn << nl << "  dirt_worldspace " << node->Mesh.nDirtCoordSpace;
         sReturn << nl << "  hologram_donotdraw " << (int) node->Mesh.nHideInHolograms;
+        // Preserve raw mesh header padding. K1 and K2 vanilla models frequently
+        // contain nonzero values in these fields.
+        if(bK2){
+            sReturn << nl << "  meshpadding1 " << static_cast<unsigned int>(static_cast<unsigned char>(node->Mesh.nPadding1));
+            sReturn << nl << "  meshpadding2 " << static_cast<unsigned int>(static_cast<unsigned char>(node->Mesh.nPadding2));
+        }
+        sReturn << nl << "  meshpadding3 " << node->Mesh.nPadding3;
+        sReturn << nl << "  meshpadding " << node->Mesh.nPadding;
         sReturn << nl << "  tangentspace " << (node->Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT1 ? 1 : 0);
-        sReturn << nl << "  inv_count " << node->Mesh.nMeshInvertedCounter;
-        if(node->Mesh.cTexture1.c_str() != std::string()) sReturn << nl << "  bitmap " << node->Mesh.GetTexture(1);
-        if(node->Mesh.cTexture2.c_str() != std::string()) sReturn << nl << "  bitmap2 " << node->Mesh.GetTexture(2);
-        if(node->Mesh.cTexture3.c_str() != std::string()) sReturn << nl << "  texture0 " << node->Mesh.GetTexture(3);
-        if(node->Mesh.cTexture4.c_str() != std::string()) sReturn << nl << "  texture1 " << node->Mesh.GetTexture(4);
+        if(node->Head.nType & NODE_SABER) sReturn << nl << "  inv_count " << node->Saber.nInvCount1 << " " << node->Saber.nInvCount2;
+        else sReturn << nl << "  inv_count " << node->Mesh.nMeshInvertedCounter;
+        if(node->Mesh.cTexture1.c_str() != std::string()) sReturn << nl << "  bitmap " << node->Mesh.cTexture1.c_str();
+        if(node->Mesh.cTexture2.c_str() != std::string()) sReturn << nl << "  bitmap2 " << node->Mesh.cTexture2.c_str();
+        if(node->Mesh.cTexture3.c_str() != std::string()) sReturn << nl << "  texture0 " << node->Mesh.cTexture3.c_str();
+        if(node->Mesh.cTexture4.c_str() != std::string()) sReturn << nl << "  texture1 " << node->Mesh.cTexture4.c_str();
 
         /// If the Wok is present, we may want to put out the wok verts instead.
         std::vector<Vertex> * ptr_verts = &node->Mesh.Vertices;
         std::vector<Vertex> WokVerts;
         if(bUseWokData && (node->Head.nType & NODE_AABB) && Wok && Wok->GetData()){
             WokVerts = GetWokVertData(*node);
+            if(WokVerts.size() != node->Mesh.Vertices.size()){
+                throw mdlexception("Cannot export WOK-derived vertices for node '" + GetNodeName(*node) + "': WOK/MDL face or vertex mapping is inconsistent.");
+            }
             ptr_verts = &WokVerts;
         }
         else if(bMinimizeVerts2 && !(node->Head.nType & NODE_AABB) && !(node->Head.nType & NODE_SABER)){
@@ -405,13 +560,13 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         }
 
         sReturn << nl << "  verts " << ptr_verts->size();
-        for(int n = 0; n < ptr_verts->size(); n++){
+        for(int n = 0; n < static_cast<int>(ptr_verts->size()); n++){
             //Two possibilities - I put MDX if MDX is present, otherwise MDL
-            if(!Mdx) sReturn << nl << "    " << PrepareFloat(ptr_verts->at(n).fX) << " " << PrepareFloat(ptr_verts->at(n).fY) << " " << PrepareFloat(ptr_verts->at(n).fZ);
+            if(!Mdx || !(node->Mesh.nMdxDataBitmap & MDX_FLAG_VERTEX)) sReturn << nl << "    " << PrepareFloat(ptr_verts->at(n).fX) << " " << PrepareFloat(ptr_verts->at(n).fY) << " " << PrepareFloat(ptr_verts->at(n).fZ);
             else if(!bXbox) sReturn << nl << "    " << PrepareFloat(ptr_verts->at(n).MDXData.vVertex.fX) << " " << PrepareFloat(ptr_verts->at(n).MDXData.vVertex.fY) << " " << PrepareFloat(ptr_verts->at(n).MDXData.vVertex.fZ);
         }
         sReturn << nl << "  faces " << node->Mesh.Faces.size();
-        for(int n = 0; n < node->Mesh.Faces.size(); n++){
+        for(int n = 0; n < static_cast<int>(node->Mesh.Faces.size()); n++){
             sReturn << nl << "    ";
             if(bMinimizeVerts2 && !(node->Head.nType & NODE_AABB) && !(node->Head.nType & NODE_SABER)){
                 sReturn << node->Mesh.Faces.at(n).nTempIndexVertex.at(0);
@@ -432,51 +587,123 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
             else sReturn << "  0 0 0";
             sReturn << "  " << node->Mesh.Faces.at(n).nMaterialID;
         }
+        // Expose binary face runtime data instead of forcing
+        // decompile->compile to regenerate normals, plane distances, and adjacency.
+        sReturn << nl << "  faceextra " << node->Mesh.Faces.size();
+        for(int n = 0; n < static_cast<int>(node->Mesh.Faces.size()); n++){
+            Face & face = node->Mesh.Faces.at(n);
+            sReturn << nl << "    " << PrepareFloat(face.vNormal.fX);
+            sReturn << " " << PrepareFloat(face.vNormal.fY);
+            sReturn << " " << PrepareFloat(face.vNormal.fZ);
+            sReturn << " " << PrepareFloat(face.fDistance);
+            sReturn << " " << face.nAdjacentFaces.at(0);
+            sReturn << " " << face.nAdjacentFaces.at(1);
+            sReturn << " " << face.nAdjacentFaces.at(2);
+        }
+        if(Mdx && !Mdx->sBuffer.empty() && node->Mesh.nMdxDataBitmap & MDX_FLAG_NORMAL){
+            sReturn << nl << "  normalindices " << node->Mesh.Faces.size();
+            for(int n = 0; n < static_cast<int>(node->Mesh.Faces.size()); n++){
+                sReturn << nl << "    ";
+                if(bMinimizeVerts2 && !(node->Head.nType & NODE_AABB) && !(node->Head.nType & NODE_SABER)){
+                    sReturn << node->Mesh.Faces.at(n).nTempIndexVertex.at(0);
+                    sReturn << " " << node->Mesh.Faces.at(n).nTempIndexVertex.at(1);
+                    sReturn << " " << node->Mesh.Faces.at(n).nTempIndexVertex.at(2);
+                }
+                else{
+                    sReturn << node->Mesh.Faces.at(n).nIndexVertex.at(0);
+                    sReturn << " " << node->Mesh.Faces.at(n).nIndexVertex.at(1);
+                    sReturn << " " << node->Mesh.Faces.at(n).nIndexVertex.at(2);
+                }
+            }
+            sReturn << nl << "  normals " << ptr_verts->size();
+            for(int n = 0; n < static_cast<int>(ptr_verts->size()); n++){
+                sReturn << nl << "    " << PrepareFloat(ptr_verts->at(n).MDXData.vNormal.fX);
+                sReturn << " " << PrepareFloat(ptr_verts->at(n).MDXData.vNormal.fY);
+                sReturn << " " << PrepareFloat(ptr_verts->at(n).MDXData.vNormal.fZ);
+            }
+        }
+        if(Mdx && !Mdx->sBuffer.empty() && node->Mesh.nMdxDataBitmap & MDX_FLAG_COLOR){
+            sReturn << nl << "  colorindices " << node->Mesh.Faces.size();
+            for(int n = 0; n < static_cast<int>(node->Mesh.Faces.size()); n++){
+                sReturn << nl << "    ";
+                if(bMinimizeVerts2 && !(node->Head.nType & NODE_AABB) && !(node->Head.nType & NODE_SABER)){
+                    sReturn << node->Mesh.Faces.at(n).nTempIndexVertex.at(0);
+                    sReturn << " " << node->Mesh.Faces.at(n).nTempIndexVertex.at(1);
+                    sReturn << " " << node->Mesh.Faces.at(n).nTempIndexVertex.at(2);
+                }
+                else{
+                    sReturn << node->Mesh.Faces.at(n).nIndexVertex.at(0);
+                    sReturn << " " << node->Mesh.Faces.at(n).nIndexVertex.at(1);
+                    sReturn << " " << node->Mesh.Faces.at(n).nIndexVertex.at(2);
+                }
+            }
+            sReturn << nl << "  colors " << ptr_verts->size();
+            for(int n = 0; n < static_cast<int>(ptr_verts->size()); n++){
+                sReturn << nl << "    " << PrepareFloat(ptr_verts->at(n).MDXData.cColor.fR);
+                sReturn << " " << PrepareFloat(ptr_verts->at(n).MDXData.cColor.fG);
+                sReturn << " " << PrepareFloat(ptr_verts->at(n).MDXData.cColor.fB);
+            }
+        }
+        if(Mdx && !Mdx->sBuffer.empty() && node->Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT1){
+            sReturn << nl << "  tangentbasis " << ptr_verts->size();
+            for(int n = 0; n < static_cast<int>(ptr_verts->size()); n++){
+                const VertexData & mdx = ptr_verts->at(n).MDXData;
+                sReturn << nl << "    " << PrepareFloat(mdx.vTangent1.at(0).fX);
+                sReturn << " " << PrepareFloat(mdx.vTangent1.at(0).fY);
+                sReturn << " " << PrepareFloat(mdx.vTangent1.at(0).fZ);
+                sReturn << " " << PrepareFloat(mdx.vTangent1.at(1).fX);
+                sReturn << " " << PrepareFloat(mdx.vTangent1.at(1).fY);
+                sReturn << " " << PrepareFloat(mdx.vTangent1.at(1).fZ);
+                sReturn << " " << PrepareFloat(mdx.vTangent1.at(2).fX);
+                sReturn << " " << PrepareFloat(mdx.vTangent1.at(2).fY);
+                sReturn << " " << PrepareFloat(mdx.vTangent1.at(2).fZ);
+            }
+        }
         if(Mdx && !Mdx->sBuffer.empty() && node->Mesh.nMdxDataBitmap & MDX_FLAG_UV1){
             sReturn << nl << "  tverts " << node->Mesh.Vertices.size();
-            for(int n = 0; n < node->Mesh.Vertices.size(); n++){
+            for(int n = 0; n < static_cast<int>(node->Mesh.Vertices.size()); n++){
                 sReturn << nl << "    " << PrepareFloat(node->Mesh.Vertices.at(n).MDXData.vUV1.fX);
                 sReturn << " " << PrepareFloat(node->Mesh.Vertices.at(n).MDXData.vUV1.fY);
             }
         }
         if(Mdx && !Mdx->sBuffer.empty() && node->Mesh.nMdxDataBitmap & MDX_FLAG_UV2){
             sReturn << nl << "  texindices1 " << node->Mesh.Faces.size();
-            for(int n = 0; n < node->Mesh.Faces.size(); n++){
+            for(int n = 0; n < static_cast<int>(node->Mesh.Faces.size()); n++){
                 sReturn << nl << "    ";
                 sReturn << node->Mesh.Faces.at(n).nIndexVertex.at(0);
                 sReturn << " " << node->Mesh.Faces.at(n).nIndexVertex.at(1);
                 sReturn << " " << node->Mesh.Faces.at(n).nIndexVertex.at(2);
             }
             sReturn << nl << "  tverts1 " << node->Mesh.Vertices.size();
-            for(int n = 0; n < node->Mesh.Vertices.size(); n++){
+            for(int n = 0; n < static_cast<int>(node->Mesh.Vertices.size()); n++){
                 sReturn << nl << "    " << PrepareFloat(node->Mesh.Vertices.at(n).MDXData.vUV2.fX);
                 sReturn << " " << PrepareFloat(node->Mesh.Vertices.at(n).MDXData.vUV2.fY);
             }
         }
         if(Mdx && !Mdx->sBuffer.empty() && node->Mesh.nMdxDataBitmap & MDX_FLAG_UV3){
             sReturn << nl << "  texindices2 " << node->Mesh.Faces.size();
-            for(int n = 0; n < node->Mesh.Faces.size(); n++){
+            for(int n = 0; n < static_cast<int>(node->Mesh.Faces.size()); n++){
                 sReturn << nl << "    ";
                 sReturn << node->Mesh.Faces.at(n).nIndexVertex.at(0);
                 sReturn << " " << node->Mesh.Faces.at(n).nIndexVertex.at(1);
                 sReturn << " " << node->Mesh.Faces.at(n).nIndexVertex.at(2);
             }
             sReturn << nl << "  tverts2 " << node->Mesh.Vertices.size();
-            for(int n = 0; n < node->Mesh.Vertices.size(); n++){
+            for(int n = 0; n < static_cast<int>(node->Mesh.Vertices.size()); n++){
                 sReturn << nl << "    " << PrepareFloat(node->Mesh.Vertices.at(n).MDXData.vUV3.fX);
                 sReturn << " " << PrepareFloat(node->Mesh.Vertices.at(n).MDXData.vUV3.fY);
             }
         }
         if(Mdx && !Mdx->sBuffer.empty() && node->Mesh.nMdxDataBitmap & MDX_FLAG_UV4){
             sReturn << nl << "  texindices3 " << node->Mesh.Faces.size();
-            for(int n = 0; n < node->Mesh.Faces.size(); n++){
+            for(int n = 0; n < static_cast<int>(node->Mesh.Faces.size()); n++){
                 sReturn << nl << "    ";
                 sReturn << node->Mesh.Faces.at(n).nIndexVertex.at(0);
                 sReturn << " " << node->Mesh.Faces.at(n).nIndexVertex.at(1);
                 sReturn << " " << node->Mesh.Faces.at(n).nIndexVertex.at(2);
             }
             sReturn << nl << "  tverts3 " << node->Mesh.Vertices.size();
-            for(int n = 0; n < node->Mesh.Vertices.size(); n++){
+            for(int n = 0; n < static_cast<int>(node->Mesh.Vertices.size()); n++){
                 sReturn << nl << "    " << PrepareFloat(node->Mesh.Vertices.at(n).MDXData.vUV4.fX);
                 sReturn << " " << PrepareFloat(node->Mesh.Vertices.at(n).MDXData.vUV4.fY);
             }
@@ -491,32 +718,97 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
                 ptr_verts = &node->Mesh.TempVertices;
             }
             sReturn << nl << "  weights " << ptr_verts->size();
-            for(int n = 0; n < ptr_verts->size(); n++){
+            for(int n = 0; n < static_cast<int>(ptr_verts->size()); n++){
                 sReturn << nl << "    ";
-                int i = 0;
-                MdlInteger<unsigned short> nBoneNumber; // = (int) round(ptr_verts->at(n).MDXData.Weights.fWeightIndex.at(i));
-                //ReportMdl << "Bone name index array size: " << node->Skin.BoneNameIndices.size() << nl;
                 bool bDependentVert = false;
-                while(i < 4){
-                    nBoneNumber = ptr_verts->at(n).MDXData.Weights.nWeightIndex.at(i);
-                    //ReportMdl << "Reading bone number " << nBoneNumber << nl;
-                    if(nBoneNumber.Valid() && nBoneNumber < node->Skin.BoneNameIndices.size()){
-                        MdlInteger<unsigned short> nNameIndex = node->Skin.BoneNameIndices.at(nBoneNumber);
-                        //if (nNameIndex > -1) nNameIndex = data.NameIndicesInOffsetOrder.at(nNameIndex);
-                        //ReportMdl << "Reading bone number " << nBoneNumber;
-                        //ReportMdl << ", representing bone " << FH->MH.Names.at(node->Skin.BoneNameIndices.at(nBoneNumber)).sName.c_str() << ".\n";
-                        //sReturn << " " << FH->MH.Names.at(nNameIndex).sName.c_str() << " " << PrepareFloat(ptr_verts->at(n).MDXData.Weights.fWeightValue.at(i));
-                        if(nNameIndex.Valid() && nNameIndex < FH->MH.Names.size()){
-                            if(!bDependentVert) bDependentVert = true;
-                            sReturn << " " << MakeUniqueName(nNameIndex) << " " << PrepareFloat(ptr_verts->at(n).MDXData.Weights.fWeightValue.at(i));
-                        }
+                for(int i = 0; i < 4; i++){
+                    const double fWeight = ptr_verts->at(n).MDXData.Weights.fWeightValue.at(i);
+                    if(!std::isfinite(fWeight)){
+                        throw mdlexception("Cannot export skin weights for node '" + GetNodeName(*node) +
+                                           "': vertex " + std::to_string(n) +
+                                           " has a non-finite skin weight.");
                     }
-                    i++;
-                    //if(i < 4) nBoneNumber = (int) round(ptr_verts->at(n).MDXData.Weights.fWeightIndex.at(i));
+                    if(std::abs(fWeight) < 0.0000001) continue;
+
+                    MdlInteger<unsigned short> nBoneNumber = ptr_verts->at(n).MDXData.Weights.nWeightIndex.at(i);
+                    if(!nBoneNumber.Valid() || static_cast<unsigned short>(nBoneNumber) >= node->Skin.BoneNameIndices.size()){
+                        throw mdlexception("Cannot export skin weights for node '" + GetNodeName(*node) +
+                                           "': vertex " + std::to_string(n) +
+                                           " has an active influence with no valid compact bone name mapping.");
+                    }
+
+                    MdlInteger<unsigned short> nNameIndex = node->Skin.BoneNameIndices.at(nBoneNumber);
+                    if(!nNameIndex.Valid() || static_cast<unsigned short>(nNameIndex) >= FH->MH.Names.size()){
+                        throw mdlexception("Cannot export skin weights for node '" + GetNodeName(*node) +
+                                           "': vertex " + std::to_string(n) +
+                                           " has an active influence mapped to an invalid name index.");
+                    }
+
+                    bDependentVert = true;
+                    sReturn << " " << MakeUniqueName(nNameIndex) << " " << PrepareFloat(fWeight);
                 }
                 if(!bDependentVert){
-                    sReturn << " root 1.0";
+                    throw mdlexception("Cannot export skin weights for node '" + GetNodeName(*node) +
+                                       "': vertex " + std::to_string(n) +
+                                       " has no active skin influence; refusing to replace it with root 1.0.");
                 }
+            }
+
+            // Keep the compact shader-palette order.
+            // K2/TSL exposes a 17th compact reverse-map slot in nPadding1; K1 uses 16.
+            const int nCompactSlotCount = bK2 ? 17 : 16;
+            sReturn << nl << "  compactbonemap " << nCompactSlotCount;
+            for(int nSlot = 0; nSlot < nCompactSlotCount; nSlot++){
+                unsigned short nFullBone = (nSlot < 16) ? node->Skin.nBoneIndices.at(nSlot) : node->Skin.nPadding1;
+                MdlInteger<unsigned short> nNameIndex;
+                if(nFullBone < data.NameIndicesInTreeOrder.size() &&
+                   nFullBone < node->Skin.Bones.size() &&
+                   node->Skin.Bones.at(nFullBone).nBonemap.Valid() &&
+                   static_cast<unsigned short>(node->Skin.Bones.at(nFullBone).nBonemap) == nSlot){
+                    nNameIndex = data.NameIndicesInTreeOrder.at(nFullBone);
+                }
+
+                sReturn << nl << "    ";
+                if(nNameIndex.Valid() && nNameIndex < data.Names.size()) sReturn << MakeUniqueName(nNameIndex);
+                else sReturn << "null"; // inactive/non-semantic compact slot; raw value is preserved by compactbonemapraw
+            }
+
+            // Preserve the raw 18-short compact reverse-map header. K1 uses
+            // 16 semantic compact slots followed by two raw padding shorts; K2
+            // uses 17 semantic slots followed by one raw padding short. Vanilla
+            // often leaves inactive entries as arbitrary uint16 values.
+            const int nRawCompactHeaderShorts = 18;
+            sReturn << nl << "  compactbonemapraw " << nRawCompactHeaderShorts;
+            for(int nSlot = 0; nSlot < nRawCompactHeaderShorts; nSlot++){
+                unsigned short nFullBone = 0;
+                if(nSlot < 16) nFullBone = node->Skin.nBoneIndices.at(nSlot);
+                else if(nSlot == 16) nFullBone = node->Skin.nPadding1;
+                else nFullBone = node->Skin.nPadding2;
+                sReturn << nl << "    " << nFullBone;
+            }
+
+            // K1 still has two uint16 skin padding fields after the 16-slot
+            // reverse map. Vanilla frequently leaves arbitrary non-zero values
+            // there, so expose them instead of normalizing them to zero. In K2,
+            // nPadding1 is the 17th compact slot and is already emitted through
+            // compactbonemapraw; nPadding2 remains padding and still needs to be
+            // preserved.
+            if(!bK2) sReturn << nl << "  skinpadding1 " << node->Skin.nPadding1;
+            sReturn << nl << "  skinpadding2 " << node->Skin.nPadding2;
+
+            // Keep the binary skin Array8 / boneconstantindices block.
+            if(node->Skin.Bones.size() > std::numeric_limits<unsigned int>::max()){
+                throw mdlexception("Cannot export boneconstantindices for node '" + GetNodeName(*node) + "': skin bone count exceeds 32-bit list size.");
+            }
+            const unsigned int nBoneconstantCount = static_cast<unsigned int>(node->Skin.Bones.size());
+            if((node->Skin.Array8Array.nOffset != 0 || node->Skin.Array8Array.nCount != 0 || node->Skin.Array8Array.nCount2 != 0) &&
+               (node->Skin.Array8Array.nCount != nBoneconstantCount || node->Skin.Array8Array.nCount2 != nBoneconstantCount)){
+                throw mdlexception("Cannot export boneconstantindices for node '" + GetNodeName(*node) +
+                                   "': preserved Array8 counts do not match the skin bone count; refusing to normalize and erase mismatched header data.");
+            }
+            sReturn << nl << "  boneconstantindices " << node->Skin.Bones.size();
+            for(int n = 0; n < static_cast<int>(node->Skin.Bones.size()); n++){
+                sReturn << nl << "    " << node->Skin.Bones.at(n).nPadding;
             }
         }
     }
@@ -532,7 +824,7 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         }
 
         sReturn << nl << "  constraints " << ptr_constraints->size();
-        for(int n = 0; n < ptr_constraints->size(); n++){
+        for(int n = 0; n < static_cast<int>(ptr_constraints->size()); n++){
             sReturn << nl << "    " << PrepareFloat(ptr_constraints->at(n));
         }
     }
@@ -550,20 +842,38 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
                 sReturn << nl << "  roomlinks";
                 Vector vLyt;
                 if(FH) vLyt = FH->MH.vLytPosition;
-                for(int l = 0; l < data.edges.size(); l++){
+                for(int l = 0; l < static_cast<int>(data.edges.size()); l++){
                     if(data.edges.at(l).nTransition.Valid()){
-                        int nIndex = data.edges.at(l).nIndex;
-                        Face & wokface = data.faces.at(nIndex/3);
+                        const unsigned int nIndex = data.edges.at(l).nIndex;
+                        const unsigned int nWokFaceIndex = nIndex / 3u;
+                        if(nWokFaceIndex >= data.faces.size()) continue;
+                        Face & wokface = data.faces.at(nWokFaceIndex);
+
+                        bool bWokFaceValid = true;
+                        for(int i = 0; i < 3; i++){
+                            if(!wokface.nIndexVertex.at(i).Valid() || static_cast<unsigned short>(wokface.nIndexVertex.at(i)) >= data.verts.size()){
+                                bWokFaceValid = false;
+                            }
+                        }
+                        if(!bWokFaceValid) continue;
+
                         Vector & v1 = data.verts.at(wokface.nIndexVertex.at(0));
                         Vector & v2 = data.verts.at(wokface.nIndexVertex.at(1));
                         Vector & v3 = data.verts.at(wokface.nIndexVertex.at(2));
-                        for(int f = 0; f < node->Mesh.Faces.size(); f++){
+                        for(int f = 0; f < static_cast<int>(node->Mesh.Faces.size()); f++){
                             Face & mdlface = node->Mesh.Faces.at(f);
+                            bool bMdlFaceValid = true;
+                            for(int i = 0; i < 3; i++){
+                                if(!mdlface.nIndexVertex.at(i).Valid() || static_cast<unsigned short>(mdlface.nIndexVertex.at(i)) >= node->Mesh.Vertices.size()){
+                                    bMdlFaceValid = false;
+                                }
+                            }
+                            if(!bMdlFaceValid) continue;
+
                             Vector v4 (node->Mesh.Vertices.at(mdlface.nIndexVertex.at(0)).vFromRoot + vLyt);
                             Vector v5 (node->Mesh.Vertices.at(mdlface.nIndexVertex.at(1)).vFromRoot + vLyt);
                             Vector v6 (node->Mesh.Vertices.at(mdlface.nIndexVertex.at(2)).vFromRoot + vLyt);
                             if(v1.Compare(v4, 0.1) && v2.Compare(v5, 0.1) && v3.Compare(v6, 0.1)){
-                                mdlface.nEdgeTransitions.at(nIndex%3) = data.edges.at(l).nTransition;
                                 sReturn << nl << "    " << (3*f + nIndex%3) << " " << data.edges.at(l).nTransition;
                                 break;
                             }
@@ -576,110 +886,29 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
     }
     else if(nDataType == CONVERT_SABER){
         Node * node = (Node*) Data;
-        sReturn << nl << "  inv_count " << node->Saber.nInvCount1 << " " << node->Saber.nInvCount2;
-        if(node->Mesh.cTexture1.c_str() != std::string()) sReturn << nl << "  bitmap " << node->Mesh.GetTexture(1);
-
-        if(node->Saber.SaberData.size() == 176){
-            Vector vDiff;
-            Vector vOut;
-            vDiff = node->Saber.SaberData.at(4).vVertex - node->Saber.SaberData.at(0).vVertex;
-
-            sReturn << nl << "  verts 16";
-            vOut = node->Saber.SaberData.at(0).vVertex;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-            vOut = node->Saber.SaberData.at(1).vVertex;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-            vOut = node->Saber.SaberData.at(2).vVertex;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-            vOut = node->Saber.SaberData.at(3).vVertex;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-
-            vOut = node->Saber.SaberData.at(0).vVertex + vDiff;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-            vOut = node->Saber.SaberData.at(1).vVertex + vDiff;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-            vOut = node->Saber.SaberData.at(2).vVertex + vDiff;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-            vOut = node->Saber.SaberData.at(3).vVertex + vDiff;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-
-            vOut = node->Saber.SaberData.at(88).vVertex;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-            vOut = node->Saber.SaberData.at(89).vVertex;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-            vOut = node->Saber.SaberData.at(90).vVertex;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-            vOut = node->Saber.SaberData.at(91).vVertex;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-
-            vOut = node->Saber.SaberData.at(88).vVertex - vDiff;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-            vOut = node->Saber.SaberData.at(89).vVertex - vDiff;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-            vOut = node->Saber.SaberData.at(90).vVertex - vDiff;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-            vOut = node->Saber.SaberData.at(91).vVertex - vDiff;
-            sReturn << nl << "    " << PrepareFloat(vOut.fX) << " " << PrepareFloat(vOut.fY) << " " << PrepareFloat(vOut.fZ);
-
-            sReturn << nl << "  faces 12";
-            /// SIDE 1
-            sReturn << nl << "    5 4 0  1  5 4 0  0";
-            sReturn << nl << "    0 1 5  1  0 1 5  0";
-            sReturn << nl << "    13 8 12  1  13 8 12  0";
-            sReturn << nl << "    8 13 9  1  8 13 9  0";
-            sReturn << nl << "    6 5 1  1  6 5 1  0";
-            //sReturn << nl << "    2 6 5  1  2 6 5  0"; //Correct faces, but not what they are in the game
-            sReturn << nl << "    1 2 6  1  1 2 6  0";
-            //sReturn << nl << "    1 2 5  1  1 2 5  0"; //Correct faces, but not what they are in the game
-            sReturn << nl << "    10 9 13  1  10 9 13  0";
-            sReturn << nl << "    13 14 10  1  13 14 10  0";
-            sReturn << nl << "    3 6 2  1  3 6 2  0";
-            sReturn << nl << "    6 3 7  1  6 3 7  0";
-            sReturn << nl << "    15 11 14  1  15 11 14  0";
-            sReturn << nl << "    10 14 11  1  10 14 11  0";
-            /// SIDE 2
-            /*
-            sReturn << nl << "    4 5 0  1  4 5 0  0";
-            sReturn << nl << "    1 0 5  1  1 0 5  0";
-            sReturn << nl << "    8 13 12  1  8 13 12  0";
-            sReturn << nl << "    13 8 9  1  13 8 9  0";
-            sReturn << nl << "    5 6 1  1  5 6 1  0";
-            //sReturn << nl << "    6 2 5  1  6 2 5  0"; //Correct faces, but not what they are in the game
-            sReturn << nl << "    2 1 6  1  2 1 6  0";
-            //sReturn << nl << "    2 1 5  1  2 1 5  0"; //Correct faces, but not what they are in the game
-            sReturn << nl << "    9 10 13  1  9 10 13  0";
-            sReturn << nl << "    14 13 10  1  14 13 10  0";
-            sReturn << nl << "    6 3 2  1  6 3 2  0";
-            sReturn << nl << "    3 6 7  1  3 6 7  0";
-            sReturn << nl << "    11 15 14  1  11 15 14  0";
-            sReturn << nl << "    14 10 11  1  14 10 11  0";
-            */
-
-            sReturn << nl << "  tverts 16";
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(0).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(0).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(1).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(1).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(2).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(2).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(3).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(3).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(4).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(4).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(5).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(5).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(6).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(6).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(7).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(7).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(88).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(88).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(89).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(89).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(90).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(90).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(91).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(91).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(92).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(92).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(93).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(93).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(94).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(94).vUV1.fY);
-            sReturn << nl << "    " << PrepareFloat(node->Saber.SaberData.at(95).vUV1.fX) << " " << PrepareFloat(node->Saber.SaberData.at(95).vUV1.fY);
+        // Write the exact binary lightsaber payload. Vanilla saber
+        // nodes keep their render data in the MDL saber block, not the MDX stream.
+        // The older 16-vert recipe is lossy because it regenerates the 176-entry
+        // runtime blade data and normals.
+        sReturn << nl << "  saberdata " << node->Saber.SaberData.size();
+        for(int n = 0; n < static_cast<int>(node->Saber.SaberData.size()); n++){
+            const VertexData & sd = node->Saber.SaberData.at(n);
+            sReturn << nl << "    " << PrepareFloat(sd.vVertex.fX);
+            sReturn << " " << PrepareFloat(sd.vVertex.fY);
+            sReturn << " " << PrepareFloat(sd.vVertex.fZ);
+            sReturn << " " << PrepareFloat(sd.vUV1.fX);
+            sReturn << " " << PrepareFloat(sd.vUV1.fY);
+            sReturn << " " << PrepareFloat(sd.vNormal.fX);
+            sReturn << " " << PrepareFloat(sd.vNormal.fY);
+            sReturn << " " << PrepareFloat(sd.vNormal.fZ);
         }
     }
     /// TODO: cases where num(controllers) == 0 but num(controller data) > 0
     else if(nDataType == CONVERT_CONTROLLERLESS_DATA){
         Node & node = * (Node*) Data;
         ModelHeader & data = FH->MH;
-        MdlInteger<unsigned short> nNodeIndex = GetNodeIndexByNameIndex(node.Head.nNameIndex);
-        if(!nNodeIndex.Valid()) throw mdlexception("converting controllerless data to ascii error: dealing with a name index that does not have a node in geometry.");
+        int nNodeIndex = GetNodeIndexByNameIndex(node.Head.nNameIndex);
+        if(nNodeIndex == -1) throw mdlexception("converting controllerless data to ascii error: dealing with a name index that does not have a node in geometry.");
         Node & geonode = data.ArrayOfNodes.at(nNodeIndex);
         Location loc = geonode.GetLocation();
 
@@ -692,7 +921,7 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
             for(int n = 0; n < 2; n++){
                 sReturn << nl << "        " << PrepareFloat(node.Head.ControllerData.at(n)) << " ";
                 float fCompressed = node.Head.ControllerData.at(2 + n);
-                qCurrent = DecompressQuaternion(*(unsigned*)&fCompressed);
+                qCurrent = DecompressQuaternion(FloatBits(fCompressed));
                 aaCurrent = AxisAngle(qCurrent);
                 sReturn << PrepareFloat(aaCurrent.vAxis.fX) << " " << PrepareFloat(aaCurrent.vAxis.fY) << " " << PrepareFloat(aaCurrent.vAxis.fZ) << " " << PrepareFloat(aaCurrent.fAngle);
             }
@@ -731,7 +960,7 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
             for(int n = 0; n < 2; n++){
                 sReturn << nl << "        " << PrepareFloat(node.Head.ControllerData.at(8 + n)) << " ";
                 float fCompressed = node.Head.ControllerData.at(8 + 2 + n);
-                qCurrent = DecompressQuaternion(*(unsigned*)&fCompressed);
+                qCurrent = DecompressQuaternion(FloatBits(fCompressed));
                 aaCurrent = AxisAngle(qCurrent);
                 sReturn << PrepareFloat(aaCurrent.vAxis.fX) << " " << PrepareFloat(aaCurrent.vAxis.fY) << " " << PrepareFloat(aaCurrent.vAxis.fZ) << " " << PrepareFloat(aaCurrent.fAngle);
             }
@@ -742,8 +971,8 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
     else if(nDataType == CONVERT_CONTROLLER_KEYED){
         Controller * ctrl = (Controller*) Data;
         ModelHeader & data = FH->MH;
-        MdlInteger<unsigned short> nNodeIndex = GetNodeIndexByNameIndex(ctrl->nNameIndex);
-        if(!nNodeIndex.Valid()) throw mdlexception("converting keyed controller to ascii error: dealing with a name index that does not have a node in geometry.");
+        int nNodeIndex = GetNodeIndexByNameIndex(ctrl->nNameIndex);
+        if(nNodeIndex == -1) throw mdlexception("converting keyed controller to ascii error: dealing with a name index that does not have a node in geometry.");
         Node & geonode = data.ArrayOfNodes.at(nNodeIndex);
         Location loc = geonode.GetLocation();
         Node * p_node = nullptr;
@@ -778,7 +1007,7 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
                 for(int n = 0; n < ctrl->nValueCount; n++){
                     sReturn << nl << "        " << PrepareFloat(node.Head.ControllerData.at(ctrl->nTimekeyStart + n)) << " ";
                     float fCompressed = node.Head.ControllerData.at(ctrl->nDataStart + n);
-                    qCurrent = DecompressQuaternion(*(unsigned*)&fCompressed);
+                    qCurrent = DecompressQuaternion(FloatBits(fCompressed));
                     aaCurrent = AxisAngle(qCurrent);
 
                     sReturn << PrepareFloat(aaCurrent.vAxis.fX) << " " << PrepareFloat(aaCurrent.vAxis.fY) << " " << PrepareFloat(aaCurrent.vAxis.fZ) << " " << PrepareFloat(aaCurrent.fAngle);
@@ -876,18 +1105,14 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
     }
     else if(nDataType == CONVERT_CONTROLLER_SINGLE){
         Controller * ctrl = (Controller*) Data;
-        if(ctrl->nValueCount > 1){
-            Error("Error! Single controller has more than one value. Skipping.");
-            return;
-        }
-        MdlInteger<unsigned short> nNodeIndex = GetNodeIndexByNameIndex(ctrl->nNameIndex);
-        if(!nNodeIndex.Valid()) throw mdlexception("converting single controller to ascii error: dealing with a name index that does not have a node in geometry.");
+        int nNodeIndex = GetNodeIndexByNameIndex(ctrl->nNameIndex);
+        if(nNodeIndex == -1) throw mdlexception("converting single controller to ascii error: dealing with a name index that does not have a node in geometry.");
         Node & node = FH->MH.ArrayOfNodes.at(nNodeIndex);
         sReturn << nl << "  " << ReturnControllerName(ctrl->nControllerType, node.Head.nType) << " ";
         if(ctrl->nColumnCount == 2 && ctrl->nControllerType == CONTROLLER_HEADER_ORIENTATION){
             //Compressed orientation
             float fCompressed = node.Head.ControllerData.at(ctrl->nDataStart);
-            Orientation CtrlOrient(DecompressQuaternion(*(unsigned*)&fCompressed));
+            Orientation CtrlOrient(DecompressQuaternion(FloatBits(fCompressed)));
             //sReturn << PrepareFloat(CtrlOrient.GetQuaternion().vAxis.fX) << " " << PrepareFloat(CtrlOrient.GetQuaternion().vAxis.fY) << " " << PrepareFloat(CtrlOrient.GetQuaternion().vAxis.fZ) << " " << PrepareFloat(CtrlOrient.GetQuaternion().fW);
             sReturn << PrepareFloat(CtrlOrient.GetAxisAngle().vAxis.fX) << " " << PrepareFloat(CtrlOrient.GetAxisAngle().vAxis.fY) << " " << PrepareFloat(CtrlOrient.GetAxisAngle().vAxis.fZ) << " " << PrepareFloat(CtrlOrient.GetAxisAngle().fAngle);
         }
@@ -938,12 +1163,12 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         sReturn << nl << "  orientation 1.0 0.0 0.0 0.0";
 
         sReturn << nl << "  verts " << data.verts.size();
-        for(int n = 0; n < data.verts.size(); n++){
+        for(int n = 0; n < static_cast<int>(data.verts.size()); n++){
             sReturn << nl << "    " << PrepareFloat(data.verts.at(n).fX) << " " << PrepareFloat(data.verts.at(n).fY) << " " << PrepareFloat(data.verts.at(n).fZ);
         }
 
         sReturn << nl << "  faces " << data.faces.size();
-        for(int n = 0; n < data.faces.size(); n++){
+        for(int n = 0; n < static_cast<int>(data.faces.size()); n++){
             sReturn << nl << "    ";
             sReturn << data.faces.at(n).nIndexVertex.at(0);
             sReturn << " " << data.faces.at(n).nIndexVertex.at(1);
@@ -955,13 +1180,13 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
 
         int nRoomLinkSize = 0;
         std::stringstream ssRoomlinks;
-        for(int n = 0; n < data.edges.size(); n++){
+        for(int n = 0; n < static_cast<int>(data.edges.size()); n++){
             if(data.edges.at(n).nTransition.Valid()){
                 ssRoomlinks << nl << "    " << data.edges.at(n).nIndex << " " << data.edges.at(n).nTransition;
                 nRoomLinkSize++;
             }
         }
-        sReturn << nl << "  roomlinks " << data.edges.size() << ssRoomlinks.str();
+        sReturn << nl << "  roomlinks " << nRoomLinkSize << ssRoomlinks.str();
 
         sReturn << nl << "endnode";
     }
@@ -975,7 +1200,7 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
             FileHeader & Data = *FH;
 
             sModel = Data.MH.GH.sName.c_str();
-            for(int n = 0; n < Data.MH.Names.size(); n++){
+            for(int n = 0; n < static_cast<int>(Data.MH.Names.size()); n++){
                 std::string & sName = Data.MH.Names.at(n).sName;
                 if(sName.find("pwk_use01")!=std::string::npos || sName.find("pwk_dp_use_01")!=std::string::npos) sUse1 = sName;
                 else if(sName.find("pwk_use02")!=std::string::npos || sName.find("pwk_dp_use_02")!=std::string::npos) sUse2 = sName;
@@ -983,7 +1208,7 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
                 else if(safesubstr(sName, strlen(sName.c_str()) - 4, 4) == "_pwk") sRoot = sName;
             }
             std::string sPrefix = safesubstr(Data.MH.GH.sName, 0, 4);
-            std::transform(sPrefix.begin(), sPrefix.end(), sPrefix.begin(), ::tolower);
+            ToLowerInPlace(sPrefix);
             if(sPrefix == "plc_") sPrefix = safesubstr(Data.MH.GH.sName, 4, 3);
             else sPrefix = safesubstr(Data.MH.GH.sName, 0, 3);
             if(sUse1.empty()) sUse1 = sPrefix + "_pwk_use01";
@@ -1011,12 +1236,12 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
         sReturn << nl << "  position " << PrepareFloat(data.vPosition.fX) << " " << PrepareFloat(data.vPosition.fY) << " " << PrepareFloat(data.vPosition.fZ);
         sReturn << nl << "  orientation 1.0 0.0 0.0 0.0";
         sReturn << nl << "  verts " << data.verts.size();
-        for(int v = 0; v < data.verts.size(); v++){
+        for(int v = 0; v < static_cast<int>(data.verts.size()); v++){
             Vector & vert = data.verts.at(v);
             sReturn << nl << "    " << PrepareFloat(vert.fX) << " " << PrepareFloat(vert.fY) << " " << PrepareFloat(vert.fZ);
         }
         sReturn << nl << "  faces " << data.faces.size();
-        for(int v = 0; v < data.faces.size(); v++){
+        for(int v = 0; v < static_cast<int>(data.faces.size()); v++){
             Face & face = data.faces.at(v);
             sReturn << nl << "    " << face.nIndexVertex.at(0) << " " << face.nIndexVertex.at(1) << " " << face.nIndexVertex.at(2) << "  1  0 0 0  " << face.nMaterialID;
         }
@@ -1038,13 +1263,12 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
 
         /// DETERMINE NAMES
         std::string sClosedUse1, sClosedUse2, sOpen1Use1, sOpen1Use2, sOpen2Use1, sOpen2Use2, sClosedMesh, sOpen1Mesh, sOpen2Mesh, sRoot, sModel;
-        bool bClosedUse1 = true, bClosedUse2 = true, bOpen1Use1 = true, bOpen1Use2 = true, bOpen2Use1 = true, bOpen2Use2 = true;
-        bool bClosedMesh = true, bOpen1Mesh = true, bOpen2Mesh = true, bRoot = true;
+        bool bOpen1Use2 = true, bOpen2Use2 = true;
         if(FH){
             FileHeader & Data = *FH;
 
             sModel = Data.MH.GH.sName.c_str();
-            for(int n = 0; n < Data.MH.Names.size(); n++){
+            for(int n = 0; n < static_cast<int>(Data.MH.Names.size()); n++){
                 std::string & sName = Data.MH.Names.at(n).sName;
                 if(sName.find("DWK_dp_closed_01")!=std::string::npos) sClosedUse1 = sName;
                 else if(sName.find("DWK_dp_closed_02")!=std::string::npos) sClosedUse2 = sName;
@@ -1057,16 +1281,8 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
                 else if(sName.find("DWK_wg_open2")!=std::string::npos) sOpen2Mesh = sName;
                 else if(safesubstr(sName, strlen(sName.c_str()) - 4, 4) == "_DWK") sRoot = sName;
             }
-            if(sClosedUse1.empty()) bClosedUse1 = false;
-            if(sClosedUse2.empty()) bClosedUse2 = false;
-            if(sOpen1Use1.empty()) bOpen1Use1 = false;
             if(sOpen1Use2.empty()) bOpen1Use2 = false;
-            if(sOpen2Use1.empty()) bOpen2Use1 = false;
             if(sOpen2Use2.empty()) bOpen2Use2 = false;
-            if(sClosedMesh.empty()) bClosedMesh = false;
-            if(sOpen1Mesh.empty()) bOpen1Mesh = false;
-            if(sOpen2Mesh.empty()) bOpen2Mesh = false;
-            if(sRoot.empty()) bRoot = false;
             if(sRoot.empty()) sRoot = std::string(Data.MH.GH.sName.c_str()) + "_DWK";
         }
         if(sClosedUse1.empty()) sClosedUse1 = "md_DWK_dp_closed_01";
@@ -1097,12 +1313,12 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
             sReturn << nl << "  position " << PrepareFloat(data.vPosition.fX) << " " << PrepareFloat(data.vPosition.fY) << " " << PrepareFloat(data.vPosition.fZ);
             sReturn << nl << "  orientation 1.0 0.0 0.0 0.0";
             sReturn << nl << "  verts " << data.verts.size();
-            for(int v = 0; v < data.verts.size(); v++){
+            for(int v = 0; v < static_cast<int>(data.verts.size()); v++){
                 Vector & vert = data.verts.at(v);
                 sReturn << nl << "    " << PrepareFloat(vert.fX) << " " << PrepareFloat(vert.fY) << " " << PrepareFloat(vert.fZ);
             }
             sReturn << nl << "  faces " << data.faces.size();
-            for(int v = 0; v < data.faces.size(); v++){
+            for(int v = 0; v < static_cast<int>(data.faces.size()); v++){
                 Face & face = data.faces.at(v);
                 sReturn << nl << "    " << face.nIndexVertex.at(0) << " " << face.nIndexVertex.at(1) << " " << face.nIndexVertex.at(2) << "  1  0 0 0  " << face.nMaterialID;
             }
@@ -1123,12 +1339,12 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
             sReturn << nl << "  position " << PrepareFloat(data.vPosition.fX) << " " << PrepareFloat(data.vPosition.fY) << " " << PrepareFloat(data.vPosition.fZ);
             sReturn << nl << "  orientation 1.0 0.0 0.0 0.0";
             sReturn << nl << "  verts " << data.verts.size();
-            for(int v = 0; v < data.verts.size(); v++){
+            for(int v = 0; v < static_cast<int>(data.verts.size()); v++){
                 Vector & vert = data.verts.at(v);
                 sReturn << nl << "    " << PrepareFloat(vert.fX) << " " << PrepareFloat(vert.fY) << " " << PrepareFloat(vert.fZ);
             }
             sReturn << nl << "  faces " << data.faces.size();
-            for(int v = 0; v < data.faces.size(); v++){
+            for(int v = 0; v < static_cast<int>(data.faces.size()); v++){
                 Face & face = data.faces.at(v);
                 sReturn << nl << "    " << face.nIndexVertex.at(0) << " " << face.nIndexVertex.at(1) << " " << face.nIndexVertex.at(2) << "  1  0 0 0  " << face.nMaterialID;
             }
@@ -1151,12 +1367,12 @@ void MDL::ConvertToAscii(int nDataType, std::stringstream & sReturn, void * Data
             sReturn << nl << "  position " << PrepareFloat(data.vPosition.fX) << " " << PrepareFloat(data.vPosition.fY) << " " << PrepareFloat(data.vPosition.fZ);
             sReturn << nl << "  orientation 1.0 0.0 0.0 0.0";
             sReturn << nl << "  verts " << data.verts.size();
-            for(int v = 0; v < data.verts.size(); v++){
+            for(int v = 0; v < static_cast<int>(data.verts.size()); v++){
                 Vector & vert = data.verts.at(v);
                 sReturn << nl << "    " << PrepareFloat(vert.fX) << " " << PrepareFloat(vert.fY) << " " << PrepareFloat(vert.fZ);
             }
             sReturn << nl << "  faces " << data.faces.size();
-            for(int v = 0; v < data.faces.size(); v++){
+            for(int v = 0; v < static_cast<int>(data.faces.size()); v++){
                 Face & face = data.faces.at(v);
                 sReturn << nl << "    " << face.nIndexVertex.at(0) << " " << face.nIndexVertex.at(1) << " " << face.nIndexVertex.at(2) << "  1  0 0 0  " << face.nMaterialID;
             }

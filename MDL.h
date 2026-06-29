@@ -266,8 +266,8 @@ bool IsMaterialWalkable(int nMat);
 #define TS_NORMAL       0x04
 #define TS_ALL          0x07
 
-extern const unsigned short INVALID_SHORT;
-extern const unsigned int INVALID_INT;
+constexpr unsigned short INVALID_SHORT = 0xFFFF;
+constexpr unsigned int INVALID_INT = 0xFFFFFFFF;
 
 //Data structures
 struct Edge;
@@ -307,7 +307,7 @@ class PWK;
 class DWK;
 class Ascii;
 
-bool LoadSupermodel(MDL & curmdl, std::unique_ptr<MDL> & Supermodel);
+bool LoadSupermodel(MDL & curmdl, std::unique_ptr<MDL> & Supermodel, bool bWarnIfUnavailable = true);
 
 /**** DATA STRUCTS ****/
 template <class IntegerType>
@@ -319,9 +319,8 @@ class MdlInteger{
         nData = (~nData);
     }
     MdlInteger(IntegerType nInit) : nData(nInit) {}
-    MdlInteger(const MdlInteger<IntegerType> & second){
-        nData = second.nData;
-    }
+    MdlInteger(const MdlInteger<IntegerType> & second) = default;
+    MdlInteger<IntegerType> & operator=(const MdlInteger<IntegerType> & second) = default;
     void Set(IntegerType nSet) { nData = nSet; }
     bool Valid() const{
         IntegerType nMax = 0;
@@ -362,6 +361,7 @@ class MdlInteger{
     //friend MdlInteger & operator==(const T & integer, const MdlInteger<IntegerType> & mdlinteger);
     MdlInteger & operator=(const IntegerType & integer){
         nData = integer;
+        return *this;
     }
     //MdlInteger & operator=(const MdlInteger & integer){ nData = integer.nData; }
     //MdlInteger & operator=(IntegerType & integer){ nData = integer; }
@@ -371,7 +371,6 @@ class MdlInteger{
 
     /// This function should allow implicit conversion, dispensing with the get function.
     operator IntegerType() const {
-        if(!Valid()) throw mdlexception("MdlInteger::ImplicitConversion: Getting an invalid value!");
         return nData;
     }
 };
@@ -379,14 +378,12 @@ class MdlInteger{
 template <class IntegerType>
 MdlInteger<IntegerType> & MdlInteger<IntegerType>::operator++(){
     nData++;
-    if(!Valid()) throw mdlexception("MdlInteger::operator++: Reached invalid value by using ++. The limit of the number storage size has been reached!");
     return *this;
 }
 
 template <class IntegerType>
 MdlInteger<IntegerType> & MdlInteger<IntegerType>::operator++(int){
     nData++;
-    if(!Valid()) throw mdlexception("MdlInteger::operator++: Reached invalid value by using ++. The limit of the number storage size has been reached!");
     return *this;
 }
 
@@ -425,15 +422,6 @@ bool operator!=(const MdlInteger<IntegerType> & mdlinteger, const MdlInteger<Int
     return !(mdlinteger == mdlinteger2);
 }
 
-struct DataRegion{
-    unsigned nOffset = 0;
-    unsigned nSize = 0;
-    std::string sFile;
-    HTREEITEM hItem = NULL;
-
-    DataRegion(const std::string & sFile, unsigned nOffset, unsigned nSize): nOffset(nOffset), nSize(nSize), sFile(sFile) {}
-    DataRegion(const DataRegion & reg): nOffset(reg.nOffset), nSize(reg.nSize), sFile(reg.sFile), hItem(reg.hItem) {}
-};
 
 struct Location{
     Vector vPosition;
@@ -453,11 +441,6 @@ struct Color{
         fR = f1;
         fG = f2;
         fB = f3;
-    }
-    void ConvertToByte(){
-        nR = (int) round(255.0 * fR);
-        nG = (int) round(255.0 * fG);
-        nB = (int) round(255.0 * fB);
     }
     void Set(double f1, double f2, double f3){
         fR = f1;
@@ -483,7 +466,6 @@ struct Weight{
 };
 
 struct VertexData{
-    std::vector<DataRegion> dataRegions;
 
     //Binary members
     Vector vVertex;
@@ -502,10 +484,14 @@ struct VertexData{
     //Added members
     MdlInteger<unsigned short> nNameIndex;
 
-    VertexData(){}
-    VertexData(const Vector & v1, MdlInteger<unsigned short> nName = -1): vVertex(v1), nNameIndex(nName) {}
-    VertexData(const Vector & v1, const Vector & v2, MdlInteger<unsigned short> nName = -1): vVertex(v1), vUV1(v2), nNameIndex(nName) {}
-    VertexData(const Vector & v1, const Vector & v2, const Vector & v3, MdlInteger<unsigned short> nName = -1): vVertex(v1), vUV1(v2), vNormal(v3), nNameIndex(nName) {}
+    VertexData();
+    VertexData(const VertexData &) = default;
+    VertexData(VertexData &&);
+    VertexData & operator=(const VertexData &) = default;
+    VertexData & operator=(VertexData &&) = default;
+    VertexData(const Vector & v1, int nName = -1): vVertex(v1), nNameIndex(static_cast<unsigned short>(nName)) {}
+    VertexData(const Vector & v1, const Vector & v2, int nName = -1);
+    VertexData(const Vector & v1, const Vector & v2, const Vector & v3, int nName = -1): vVertex(v1), vNormal(v3), vUV1(v2), nNameIndex(static_cast<unsigned short>(nName)) {}
     bool operator==(const VertexData & vd){
         if(vVertex == vd.vVertex &&
            vNormal == vd.vNormal &&
@@ -533,13 +519,13 @@ struct VertexData{
 };
 
 struct Vertex: public Vector{
-    std::vector<DataRegion> dataRegions;
 
     unsigned nOffset = 0;
     VertexData MDXData;
     MdlInteger<unsigned int> nLinkedFacesIndex;
 
     Vertex assign(const Vector & v, bool bMdx = false){
+        (void)bMdx;
         fX = v.fX;
         fY = v.fY;
         fZ = v.fZ;
@@ -555,7 +541,6 @@ struct Vertex: public Vector{
 };
 
 struct Edge{
-    std::vector<DataRegion> dataRegions;
 
     MdlInteger<unsigned int> nIndex;
     MdlInteger<unsigned int> nTransition;
@@ -564,14 +549,14 @@ struct Edge{
 };
 
 struct Perimeter{
-    std::vector<DataRegion> dataRegions;
 
     unsigned nPerimeter = 0;
 
     Perimeter(unsigned nPerimeter = 0): nPerimeter(nPerimeter) {}
 
-    unsigned & operator=(const unsigned & integer){
+    Perimeter & operator=(const unsigned & integer){
         nPerimeter = integer;
+        return *this;
     }
 
     /// This function should allow implicit conversion.
@@ -582,7 +567,6 @@ struct Perimeter{
 };
 
 struct Face{
-    std::vector<DataRegion> dataRegions;
 
     //Binary members
     Vector vNormal;
@@ -598,6 +582,11 @@ struct Face{
     std::array<MdlInteger<unsigned short>, 3> nIndexTvert2;
     std::array<MdlInteger<unsigned short>, 3> nIndexTvert3;
     std::array<MdlInteger<unsigned short>, 3> nIndexColor;
+    std::array<MdlInteger<unsigned short>, 3> nIndexNormal; // optional explicit MDX normal indices
+    bool bPreserveRuntimeFaceData = false; // keep binary face normal/distance/adjacency when supplied
+    Vector vPreservedNormal;
+    double fPreservedDistance = 0.0;
+    std::array<MdlInteger<unsigned short>, 3> nPreservedAdjacentFaces;
     std::array<bool, 3> bProcessed = {false, false, false};
     bool bProcessedSG = false;
     std::array<MdlInteger<unsigned int>, 3> nEdgeTransitions;
@@ -612,11 +601,16 @@ struct Face{
     Vector vCentroid;
     MdlInteger<unsigned short> nID;
     MdlInteger<unsigned short> nNameIndex;
+
+    Face() = default;
+    Face(const Face &) = default;
+    Face(Face &&);
+    Face & operator=(const Face &) = default;
+    Face & operator=(Face &&) = default;
 };
 
 
 struct Aabb{
-    std::vector<DataRegion> dataRegions;
 
     //binary members
     Vector vBBmin;
@@ -631,10 +625,16 @@ struct Aabb{
     std::vector<Aabb> Child1;
     std::vector<Aabb> Child2;
     MdlInteger<unsigned> nExtra = 0;
+
+    Aabb() = default;
+    Aabb(const Aabb &) = default;
+    Aabb(Aabb &&) = default;
+    Aabb & operator=(const Aabb &) = default;
+    Aabb & operator=(Aabb &&) = default;
+    ~Aabb();
 };
 
 struct Controller{
-    std::vector<DataRegion> dataRegions;
 
     //Binary members
     MdlInteger<unsigned int> nControllerType = 0;
@@ -682,8 +682,6 @@ struct ArrayHead{
 };
 
 struct Patch{
-    static MDL * ptr_mdl;                                       /// A pointer to the current model's file header
-    static double fDiff;                                        /// The diff used for comparing vectors
     MdlInteger<unsigned int> nPatchGroup;                       /// The number of the patch group this patch belongs to.
     MdlInteger<unsigned int> nNodeArrayIndex;                   /// This is the index of the mesh with our vert
     MdlInteger<unsigned int> nVertex;                           /// This is the index of the vert
@@ -701,18 +699,16 @@ struct Patch{
     Vector vVertexN;
     bool bBadGeo = false, bGroupBadGeo = false;
     bool bBadUV = false, bGroupBadUV = false;
-    std::vector<Patch> & GetPatchGroup();
-    Node & GetNode();
-    bool CompareNormal();
-    bool CompareTangentSpace(char cVec);
-    void CalculateWorld(bool bNormal = false, bool bTangent = false);
-    void Calculate(bool bNormal = false, bool bTangent = false, std::vector<MdlInteger<unsigned int>> * patches = nullptr);
-    bool FindNormal(unsigned int nCheckFrom, std::vector<MdlInteger<unsigned int>> & OurSmoothedPatches, std::stringstream & file);
-    char FindTangentSpace(unsigned int nCheckFrom, std::vector<MdlInteger<unsigned int>> & OurSmoothedPatches, std::stringstream & file);
+
+    Patch() = default;
+    Patch(const Patch &) = default;
+    Patch(Patch &&) = default;
+    Patch & operator=(const Patch &) = default;
+    Patch & operator=(Patch &&) = default;
+    ~Patch();
 };
 
 struct Bone{
-    std::vector<DataRegion> dataRegions;
 
     MdlInteger<unsigned short> nBonemap;
     Orientation QBone;
@@ -745,12 +741,10 @@ struct Header{
     std::vector<MdlInteger<unsigned short>> ChildIndices;
     MdlInteger<unsigned short> nParentIndex;
     Vector vFromRoot;
-    Quaternion qFromRoot;
 };
 
 /// NODE_LIGHT
 struct LightHeader{
-    std::vector<std::vector<DataRegion>> v_dataRegions;
 
     //Binary members
     double fFlareRadius = 0.0;                      /// 0   4B float
@@ -896,7 +890,7 @@ struct MeshHeader{
     81 Padding 328 4 uint32 K1@320
     82 MDX data location 332 4 uint32 K1@324
     83 Vertex data location 336 4 uint32 K1@328
-    /***/
+    */
 
     //Added members
     std::vector<Face> Faces;
@@ -908,19 +902,22 @@ struct MeshHeader{
     std::vector<Vector> TempTverts1;
     std::vector<Vector> TempTverts2;
     std::vector<Vector> TempTverts3;
+    std::vector<Vector> TempNormals; // explicit MDX normals supplied by ASCII
+    bool bPreserveMdxNormals = false; // true when ASCII supplied explicit normals; do not overwrite them after TempNormals is cleared
+    std::vector<std::array<Vector, 3>> TempTangent1; // explicit MDX tangent basis 1, stored as B/T/N triples
+    bool bPreserveMdxTangent1 = false;
     std::vector<Color> TempColors;
     std::array<bool, 4> TangentSpace = {false, false, false, false};
     VertexData MDXData;
     unsigned int nVertIndicesCount = 0;
     unsigned int nVertIndicesLocation = 0;
     MdlInteger<unsigned int> nMeshInvertedCounter;
-    char * GetTexture(int nTex){
-        if(nTex == 1) return (char*) cTexture1.c_str();
-        if(nTex == 2) return (char*) cTexture2.c_str();
-        if(nTex == 3) return (char*) cTexture3.c_str();
-        if(nTex == 4) return (char*) cTexture4.c_str();
-        return "Invalid texture!";
-    }
+    MeshHeader() = default;
+    MeshHeader(const MeshHeader &) = default;
+    MeshHeader(MeshHeader &&) = default;
+    MeshHeader & operator=(const MeshHeader &) = default;
+    MeshHeader & operator=(MeshHeader &&) = default;
+    ~MeshHeader();
 };
 
 /// NODE_SKIN
@@ -932,19 +929,20 @@ struct SkinHeader{
     unsigned int nNumberOfBonemap = 0;
     ArrayHead QBoneArray;
     ArrayHead TBoneArray;
-    ArrayHead Array8Array; //empty, data irrelevant
+    ArrayHead Array8Array; // boneconstantindices / skin Array8, preserved through ASCII
     std::array<unsigned short, 16> nBoneIndices = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    unsigned short nPadding1 = 0;
+    unsigned short nPadding1 = 0; // K2/TSL uses this adjacent short as compact skin slot 16
     unsigned short nPadding2 = 0;
 
     std::vector<Bone> Bones;
     std::vector<MdlInteger<unsigned short>> BoneNameIndices;
     std::vector<Weight> TempWeights;
+    std::vector<MdlInteger<unsigned short>> TempCompactBoneNameIndices; // optional compact slot -> name index from decompiled ASCII
+    std::vector<MdlInteger<unsigned short>> TempCompactBoneRawIndices; // exact compact reverse-map header values, including unused/garbage slots
 };
 
 /// NODE_DANGLY
 struct DanglymeshHeader{
-    std::vector<std::vector<DataRegion>> v_dataRegions;
 
     //Binary members
     ArrayHead ConstraintArray;
@@ -962,10 +960,12 @@ struct DanglymeshHeader{
 /// NODE_AABB
 struct WalkmeshHeader{
     //Binary members
-    unsigned int nOffsetToAabb = 0;
+    MdlInteger<unsigned int> nOffsetToAabb = 0;
 
     //Added members
     Aabb RootAabb;
+    std::vector<Aabb> TempAabbNodes; // pre-order AABB tree nodes with child flags
+    bool bPreserveAabbTree = false;  // true when ASCII supplied extended AABB nodes
 };
 
 /// NODE_SABER
@@ -979,10 +979,10 @@ struct SaberHeader{
 
     //Added members
     std::vector<VertexData> SaberData;
+    bool bPreserveSaberData = false; // exact binary saber verts/uvs/normals were supplied
 };
 
 struct Node{
-    std::vector<DataRegion> dataRegions;
 
     unsigned int nOffset = 0;
     MdlInteger<unsigned int> nAnimation;
@@ -997,14 +997,18 @@ struct Node{
     WalkmeshHeader Walkmesh;
     SaberHeader Saber;
 
+    Node();
+    Node(const Node &);
+    Node(Node &&);
+    Node & operator=(Node &&);
+    ~Node();
+
     Location GetLocation();
-    unsigned GetSize();
 };
 
 /**** HIGHER ELEMENTS ****/
 
 struct Animation{
-    std::vector<DataRegion> dataRegions;
 
     //Binary members
 
@@ -1032,6 +1036,13 @@ struct Animation{
     Node RootAnimationNode;
     std::vector<Event> Events;
     std::vector<Node> ArrayOfNodes;
+
+    Animation();
+    Animation(const Animation &) = default;
+    Animation(Animation &&) = default;
+    Animation & operator=(const Animation &) = delete;
+    Animation & operator=(Animation &&) = default;
+    ~Animation();
 };
 
 struct GeometryHeader{
@@ -1049,7 +1060,6 @@ struct GeometryHeader{
 };
 
 struct ModelHeader{
-    std::vector<DataRegion> dataRegions;
 
     //Binary members
     unsigned char nClassification = 0;
@@ -1087,6 +1097,7 @@ struct ModelHeader{
     Vector vLytPosition;
     bool bCompressQuaternions = false;
     bool bHeadLink = false;
+    bool bPreserveTotalNumberOfNodes = false; // ASCII supplied totalnodes; do not recompute away supermodel-inclusive binary value
     GeometryHeader GH;
     Node RootNode;
     std::vector<Animation> Animations;
@@ -1110,7 +1121,6 @@ struct FileHeader{
 };
 
 struct BWMHeader{
-    std::vector<DataRegion> dataRegions;
 
     //Data
     int nType = 0;
@@ -1140,6 +1150,8 @@ struct BWMHeader{
     std::vector<Vertex> verts;
     std::vector<Edge> edges;
     std::vector<Perimeter> perimeters;
+
+    BWMHeader();
 };
 
 /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// /// ///
@@ -1150,7 +1162,7 @@ class MDX: public BinaryFile{
     static const std::string sClassName;
   public:
      //Getters
-     const std::string GetName(){ return sClassName; }
+     const std::string GetName();
 
     //Friends
     friend class MDL;
@@ -1174,30 +1186,32 @@ class MDL: public BinaryFile{
     std::stringstream ssReport;
 
     /// Recursive reading functions
-    void ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFromRoot, Quaternion qFromRoot, const std::string & sPrefix, bool bMinimal = false);
-    void ParseAabb(Aabb & aabb, unsigned int nHighestOffset, const std::string & sPrefix);
+    void ParseNode(Node & node, std::vector<unsigned int> & offsets, Vector vFromRoot, bool bMinimal = false);
+    void ParseAabb(Aabb & aabb, std::vector<unsigned int> & visitedOffsets);
     void LinearizeGeometry(Node & node, std::vector<Node> & ArrayOfNodes);
-    void LinearizeAnimation(Node & node, std::vector<Node> & ArrayOfNodes);
+    void LinearizeAnimation(Node & node, std::vector<Node> & ArrayOfNodes, int nChildIndex = -1);
 
-    bool CheckNodes(std::vector<Node> & nodes, std::stringstream & ssReturn, MdlInteger<unsigned int> nAnimation);
+    bool CheckNodes(std::vector<Node> & nodes, std::stringstream & ssReturn, int nAnimation);
 
     //Writing
-    void WriteNodes(Node & node, std::vector<unsigned int> indices, const std::string & sPrefix);
-    void WriteMDX(Node & node, const std::string & sPrefix);
-    void WriteAabb(Aabb & aabb, const std::string & sPrefix);
-    void GatherChildren(Node & node, std::vector<Node> & ArrayOfNodes, Vector vFromRoot, Quaternion qFromRoot, std::vector<MdlInteger<short unsigned>> indices, unsigned long * nNumVertsFaces = nullptr);
+    void WriteNodes(Node & node);
+    void WriteMDX(Node & node);
+    void WriteAabb(const Aabb & aabb);
+    void GatherChildren(Node & node, std::vector<Node> & ArrayOfNodes, Vector vFromRoot);
 
     //Calculating
     void CreatePatches();
     void AsciiPostProcess(std::vector<std::string> & sBumpmapped);
-    void BinaryPostProcess();
+    void DetermineSmoothing();
+    bool FindNormal(int nCheckFrom, const int & nPatchCount, const int & nPatch, const int & nPatchGroup, const Vector & vBaseNormal, const Vector & vTargetNormal, std::vector<int> & SmoothedPatches, std::stringstream & file);
+    char FindTangentSpace(int nCheckFrom, const int & nPatchCount, const int & nPatch, const int & nPatchGroup, const Vector & vBaseBitangent, const Vector & vBaseTangent, const Vector & vBaseNormal, const Vector & vTargetBitangent, const Vector & vTargetTangent, const Vector & vTargetNormal, std::vector<int> & SmoothedPatches, std::stringstream & file);
     void GenerateSmoothingNumber(std::vector<int> & SmoothingGroup, const std::vector<unsigned long int> & nSmoothinGroupNumbers, const int & nSmoothinGroupCounter, const int & pg, std::stringstream & file);
     void ConsolidateSmoothingGroups(int pg, std::vector<std::vector<unsigned long int>> & Numbers, std::vector<bool> & DoneGroups);
-    std::string MakeUniqueName(MdlInteger<unsigned short> nNameIndex);
+    std::string MakeUniqueName(int nNameIndex);
     std::vector<Vertex> GetWokVertData(Node & node);
 
     //Getters
-    const std::string GetName(){ return sClassName; }
+    const std::string GetName();
     unsigned int FunctionPointer1(unsigned int FN_PTR);
     unsigned int FunctionPointer2(unsigned int FN_PTR);
 
@@ -1205,11 +1219,11 @@ class MDL: public BinaryFile{
     void Report(std::string);
     void ProgressSize(int, int);
     void ProgressPos(int);
-    void ProgressSetStep(int);
-    void ProgressStepIt();
 
 
   public:
+    ~MDL();
+
     std::unique_ptr<ASCII> Ascii;
     std::unique_ptr<ASCII> PwkAscii;
     std::unique_ptr<ASCII> DwkAscii;
@@ -1224,8 +1238,6 @@ class MDL: public BinaryFile{
     void (*PtrReport)(std::string) = nullptr;
     void (*PtrProgressSize)(int, int) = nullptr;
     void (*PtrProgressPos)(int) = nullptr;
-    void (*PtrProgressSetStep)(int) = nullptr;
-    void (*PtrProgressStepIt)() = nullptr;
 
     //Friends
     friend ASCII;
@@ -1237,7 +1249,7 @@ class MDL: public BinaryFile{
     bool bXbox = false;
     bool bDebug = false;
     bool bWriteSmoothing = false;
-    bool bBinaryPostProcess = true;
+    bool bDetermineSmoothing = true;
     bool bSmoothAreaWeighting = true;
     bool bSmoothAngleWeighting = false;
     bool bMinimizeVerts = false;
@@ -1254,8 +1266,8 @@ class MDL: public BinaryFile{
     //Getters
     std::unique_ptr<FileHeader> & GetFileData();
     std::vector<char> & GetAsciiBuffer();
-    MdlInteger<unsigned short> GetNameIndex(const std::string & sName);
-    MdlInteger<unsigned short> GetNodeIndexByNameIndex(MdlInteger<unsigned short> nIndex, MdlInteger<unsigned int> nAnimation = -1);
+    int GetNameIndex(const std::string & sName);
+    int GetNodeIndexByNameIndex(int nIndex, int nAnimation = -1);
     bool HeadLinked();
     bool NodeExists(const std::string & sNodeName);
     std::string & GetNodeName(Node & node);
@@ -1277,8 +1289,8 @@ class MDL: public BinaryFile{
 
     //Setters/general
     bool LinkHead(bool bLink);
-    void WriteUintToPlaceholder(unsigned int nUint, unsigned int nOffset);
-    void WriteByteToPlaceholder(unsigned char nByte, unsigned int nOffset);
+    void WriteUintToPlaceholder(unsigned int nUint, int nOffset);
+    void WriteByteToPlaceholder(unsigned char nByte, int nOffset);
 
     //ascii
     void ExportAscii(std::string &sExport);
@@ -1292,18 +1304,14 @@ class MDL: public BinaryFile{
 
 class ReportObject{
     MDL * ptr_mdl = nullptr;
-    bool bOpen = true;
 
   public:
-    ReportObject(const MDL & mdl, bool bOpen = true): ptr_mdl(const_cast<MDL*>(&mdl)), bOpen(bOpen) {}
+    ReportObject(const MDL & mdl): ptr_mdl(const_cast<MDL*>(&mdl)) {}
     template<class T>
     ReportObject & operator<<(const T & os){
-        if(bOpen) std::cout << os;
+        std::cout << os;
         if(ptr_mdl != nullptr) ptr_mdl->GetReport() << os;
         return *this;
-    }
-    void Open(bool bSet = true){
-        bOpen = bSet;
     }
 };
 
@@ -1315,7 +1323,7 @@ class BWM: public BinaryFile{
     std::unique_ptr<BWMHeader> & GetData() { return Bwm; }
 
     //Loaders
-    void DecompileBWM(ReportObject &);
+    void ProcessBWM();
     void Compile();
 };
 
@@ -1324,7 +1332,7 @@ class PWK: public BWM{
 
   public:
     //Getters
-    const std::string GetName(){ return sClassName; }
+    const std::string GetName();
 };
 
 class DWK: public BWM{
@@ -1333,7 +1341,7 @@ class DWK: public BWM{
 
   public:
     //Getters
-    const std::string GetName(){ return sClassName; }
+    const std::string GetName();
     void SetDwk(unsigned char n){ nDWK = n; }
     unsigned char GetDwk(){ return nDWK; }
 };
@@ -1343,16 +1351,16 @@ class WOK: public BWM{
 
   public:
     //Getters
-    const std::string GetName(){ return sClassName; }
-    void CalculateWokData(Node & node, Vector vLytPos, std::stringstream * ptrssFile);
+    const std::string GetName();
+    void WriteWok(Node & node, Vector vLytPos, std::stringstream * ptrssFile);
 };
 
 int ReturnController(std::string sController, int nType);
 std::string ReturnClassificationName(int nClassification);
 std::string ReturnControllerName(int, int nType);
 
-void BuildAabbTree(Aabb & aabb, const std::vector<Face*> & faces, std::stringstream * file = nullptr);
-void LinearizeAabbTree(Aabb & aabbroot, std::vector<Aabb> & aabbarray);
+void BuildAabb(Aabb & aabb, const std::vector<Face*> & faces, std::stringstream * file = nullptr);
+void LinearizeAabb(const Aabb & aabbroot, std::vector<Aabb> & aabbarray);
 
 
 #endif // MDL_H_INCLUDED

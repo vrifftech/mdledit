@@ -7,6 +7,13 @@
 #define IDI_DLG_ICON        3
 #define ID_CUR_DRAG         4
 
+#define MDLEDIT_VERSION_MAJOR 1
+#define MDLEDIT_VERSION_MINOR 0
+#define MDLEDIT_VERSION_PATCH 5
+#define MDLEDIT_VERSION_BUILD 2
+#define MDLEDIT_VERSION_STRING "1.0.5b BETA"
+
+
 //The menu
 #define IDM_MAIN            100
 #define IDM_FILE_NEW        101
@@ -50,7 +57,6 @@
 #define IDM_SHOW_GROUP      138
 #define IDM_SHOW_DATASTRUCT 139
 #define IDM_SHOW_REPORT     140
-#define IDM_AUTO_SCROLL     141
 
 //GUI controls
 #define IDC_MAIN_EDIT    201

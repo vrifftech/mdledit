@@ -1,16 +1,279 @@
 #include "MDL.h"
+#include "embedded_supermodels.h"
 #include <algorithm>
+#include <cmath>
 #include "shlwapi.h"
 
-/**
+namespace {
+    bool BuildPreservedAabbRecursive(const std::vector<Aabb> & linear, unsigned int & cursor, Aabb & out){
+        if(cursor >= linear.size()) return false;
+
+        out = linear.at(cursor++);
+        const bool bHasChild1 = out.nChild1.Valid() && out.nChild1 > 0;
+        const bool bHasChild2 = out.nChild2.Valid() && out.nChild2 > 0;
+
+        // nChild1/nChild2 are temporary child-presence flags when read from ASCII.
+        // WriteAabb() regenerates real offsets from the Child vectors.
+        out.nChild1 = 0;
+        out.nChild2 = 0;
+        out.Child1.clear();
+        out.Child2.clear();
+
+        if(bHasChild1){
+            out.Child1.resize(1);
+            if(!BuildPreservedAabbRecursive(linear, cursor, out.Child1.front())) return false;
+        }
+        if(bHasChild2){
+            out.Child2.resize(1);
+            if(!BuildPreservedAabbRecursive(linear, cursor, out.Child2.front())) return false;
+        }
+        return true;
+    }
+
+    Node * FindAsciiRootNode(std::vector<Node> & nodes, const std::string & sContext){
+        Node * pRoot = nullptr;
+        for(Node & node : nodes){
+            if(node.Head.nType == 0 || !node.Head.nNameIndex.Valid()) continue;
+            if(!node.Head.nParentIndex.Valid()){
+                if(pRoot != nullptr){
+                    throw mdlexception("ASCII post-processing found multiple root nodes in " + sContext + "; refusing to choose one and orphan the rest.");
+                }
+                pRoot = &node;
+            }
+        }
+        return pRoot;
+    }
+
+    bool ContainsNameIndex(const std::vector<unsigned short> & values, unsigned short value){
+        return std::find(values.begin(), values.end(), value) != values.end();
+    }
+
+
+    unsigned short CheckedAsciiVertexIndex(std::size_t index, const std::string & sContext){
+        const std::size_t nInvalid = static_cast<std::size_t>(std::numeric_limits<unsigned short>::max());
+        if(index >= nInvalid){
+            throw mdlexception(sContext + " would require a vertex index outside the 16-bit MDL range.");
+        }
+        return static_cast<unsigned short>(index);
+    }
+
+    int FindAsciiNodeIndexByNameIndex(ModelHeader & header, unsigned short nNameIndex){
+        for(std::size_t i = 0; i < header.ArrayOfNodes.size(); ++i){
+            Node & node = header.ArrayOfNodes.at(i);
+            if(node.Head.nNameIndex.Valid() && static_cast<unsigned short>(node.Head.nNameIndex) == nNameIndex){
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
+    Node & GetAsciiNodeByNameIndex(ModelHeader & header, unsigned short nNameIndex, const std::string & sContext){
+        const int nIndex = FindAsciiNodeIndexByNameIndex(header, nNameIndex);
+        if(nIndex < 0){
+            throw mdlexception(sContext + " references node name index " + std::to_string(nNameIndex) + ", but no geometry node with that name index exists.");
+        }
+        return header.ArrayOfNodes.at(static_cast<unsigned int>(nIndex));
+    }
+
+    unsigned short CheckedAsciiNameIndex(ModelHeader & header, MdlInteger<unsigned short> nNameIndex, const std::string & sContext){
+        if(!nNameIndex.Valid()){
+            throw mdlexception(sContext + " has an invalid node name index.");
+        }
+        const unsigned short nIndex = static_cast<unsigned short>(nNameIndex);
+        if(nIndex >= header.Names.size()){
+            throw mdlexception(sContext + " references node name index " + std::to_string(nIndex) + ", which is outside the name table.");
+        }
+        return nIndex;
+    }
+
+    void GatherChildrenRecursive(Node & node,
+                                 std::vector<Node> & arrayOfNodes,
+                                 Vector vFromRoot,
+                                 std::vector<unsigned short> & active,
+                                 std::vector<unsigned short> & visited){
+        if(!node.Head.nNameIndex.Valid()){
+            throw mdlexception("GatherChildren() error: node has an invalid name index.");
+        }
+
+        const unsigned short nNameIndex = static_cast<unsigned short>(node.Head.nNameIndex);
+        if(ContainsNameIndex(active, nNameIndex)){
+            throw mdlexception("GatherChildren() error: cyclic node hierarchy detected while collecting children.");
+        }
+        if(ContainsNameIndex(visited, nNameIndex)){
+            throw mdlexception("GatherChildren() error: hierarchy reaches the same node more than once.");
+        }
+
+        active.push_back(nNameIndex);
+
+        /// Propagate only the Vector from the root through recursion. The node's
+        /// own static orientation rotates the incoming offset before the node
+        /// position is added.
+        if(node.Head.nType & NODE_MESH){
+            Location location = node.GetLocation();
+            Quaternion qNode = location.oOrientation.GetQuaternion();
+            vFromRoot.Rotate(qNode);
+            vFromRoot += location.vPosition;
+            node.Head.vFromRoot = vFromRoot;
+        }
+
+        std::vector<MdlInteger<unsigned short>> childIndices;
+        childIndices.reserve(arrayOfNodes.size());
+        for(Node & child : arrayOfNodes){
+            if(child.Head.nNameIndex.Valid() && child.Head.nParentIndex == node.Head.nNameIndex){
+                childIndices.push_back(child.Head.nNameIndex);
+                GatherChildrenRecursive(child, arrayOfNodes, vFromRoot, active, visited);
+            }
+        }
+
+        childIndices.shrink_to_fit();
+        node.Head.ChildIndices = std::move(childIndices);
+        active.pop_back();
+        visited.push_back(nNameIndex);
+    }
+}
+
+/*
     Functions:
     GetNormal()
     FindThirdIndex()
     MDL::GatherChildren()
     MDL::GetSupernodes()
     MDL::AsciiPostProcess()
-/**/
+*/
 
+
+
+namespace {
+inline void CalculateWorld(MDL& mdl, FileHeader& data, Patch& patch, bool bNormal, bool bTangent){
+    if(!bNormal && !bTangent) return;
+    Node& patch_node = data.MH.ArrayOfNodes.at(static_cast<unsigned int>(patch.nNodeArrayIndex));
+
+    for(unsigned int face_ind : patch.FaceIndices){
+        Face& face = patch_node.Mesh.Faces.at(face_ind);
+        Vertex& v1 = patch_node.Mesh.Vertices.at(face.nIndexVertex[0]);
+        Vertex& v2 = patch_node.Mesh.Vertices.at(face.nIndexVertex[1]);
+        Vertex& v3 = patch_node.Mesh.Vertices.at(face.nIndexVertex[2]);
+
+        Vector Edge1 = v2.vFromRoot - v1.vFromRoot;
+        Vector Edge2 = v3.vFromRoot - v1.vFromRoot;
+        Vector Edge3 = v3.vFromRoot - v2.vFromRoot;
+
+        if(face.fAreaUV == 0.0) patch.bBadUV = true;
+        if(face.fArea <= 0.0) patch.bBadGeo = true;
+
+        Vector vAdd = cross(Edge1, Edge2);
+        vAdd.Normalize();
+
+        if(mdl.bSmoothAreaWeighting) vAdd *= (face.fArea > 0.000001 ? face.fArea : 0.0);
+
+        if(mdl.bSmoothAngleWeighting){
+            if(patch.nVertex == face.nIndexVertex[0]) vAdd *= Angle(Edge1, Edge2);
+            else if(patch.nVertex == face.nIndexVertex[1]) vAdd *= Angle(Edge1, Edge3);
+            else if(patch.nVertex == face.nIndexVertex[2]) vAdd *= Angle(Edge2, Edge3);
+        }
+
+        if(mdl.bCreaseAngle && Angle(patch.vWorldNormal, vAdd) > static_cast<double>(mdl.nCreaseAngle)) continue;
+
+        if(bNormal) patch.vWorldNormal += vAdd;
+
+        vAdd.Normalize();
+
+        if(bTangent){
+            Vector& UVvert1 = v1.MDXData.vUV1;
+            Vector& UVvert2 = v2.MDXData.vUV1;
+            Vector& UVvert3 = v3.MDXData.vUV1;
+            Vector UVedge1 = UVvert2 - UVvert1;
+            Vector UVedge2 = UVvert3 - UVvert1;
+
+            double r = (UVedge1.fX * UVedge2.fY - UVedge1.fY * UVedge2.fX);
+            if(r != 0.0) r = 1.0 / r;
+            else r = 2406.6388;
+
+            Vector vAddT = r * (Edge1 * UVedge2.fY - Edge2 * UVedge1.fY);
+            Vector vAddB = r * (Edge2 * UVedge1.fX - Edge1 * UVedge2.fX);
+
+            vAddT.Normalize();
+            vAddB.Normalize();
+            if(vAddT.Null()) vAddT = Vector(1.0, 0.0, 0.0);
+            if(vAddB.Null()) vAddB = Vector(1.0, 0.0, 0.0);
+
+            Vector vCross = cross(vAdd, vAddT);
+            double fDot = dot(vCross, vAddB);
+            if(fDot > 0.0000000001) vAddT *= -1.0;
+
+            Vector vNormalUV = cross(UVedge1, UVedge2);
+            if(vNormalUV.fZ < 0.0){
+                vAddT *= -1.0;
+                vAddB *= -1.0;
+            }
+
+            patch.vWorldT += vAddT;
+            patch.vWorldB += vAddB;
+            patch.vWorldN += cross(vAddB, vAddT);
+        }
+    }
+}
+
+inline void CalculateVertex(MDL& mdl, FileHeader& data, Patch& patch, bool bNormal, bool bTangent, std::vector<MdlInteger<unsigned int>>* patches = nullptr){
+    (void)mdl;
+    if(!bNormal && !bTangent) return;
+    if(!patches) patches = &patch.SmoothedPatches;
+
+    std::vector<Patch>& patch_group = data.MH.PatchArrayPointers.at(static_cast<unsigned int>(patch.nPatchGroup));
+    std::vector<MdlInteger<unsigned int>>& smoothed_patches = *patches;
+
+    Vector vWorking, vWorkingTST, vWorkingTSB, vWorkingTSN;
+    patch.bGroupBadGeo = false;
+    patch.bGroupBadUV = false;
+
+    std::vector<int> CheckedPatches;
+    CheckedPatches.reserve(smoothed_patches.size());
+    for(int n = 0; n < static_cast<int>(smoothed_patches.size()); n++){
+        Patch& curpatch = patch_group.at(static_cast<unsigned int>(smoothed_patches.at(n)));
+        if(std::find(CheckedPatches.begin(), CheckedPatches.end(), curpatch.nNodeArrayIndex) != CheckedPatches.end()) continue;
+
+        CheckedPatches.push_back(curpatch.nNodeArrayIndex);
+
+        int nNormals = 0;
+        Vector vMeshNormal, vMeshTST, vMeshTSB, vMeshTSN;
+
+        for(int n2 = n; n2 < static_cast<int>(smoothed_patches.size()); n2++){
+            Patch& curpatch2 = patch_group.at(static_cast<unsigned int>(smoothed_patches.at(n2)));
+            if(curpatch.nNodeArrayIndex != curpatch2.nNodeArrayIndex) continue;
+
+            if(!patch.bGroupBadGeo && curpatch2.bBadGeo) patch.bGroupBadGeo = true;
+            if(!patch.bGroupBadUV && curpatch2.bBadUV) patch.bGroupBadUV = true;
+
+            nNormals++;
+            if(bNormal) vMeshNormal += curpatch2.vWorldNormal;
+            if(bTangent) vMeshTSB += curpatch2.vWorldB;
+            if(bTangent) vMeshTST += curpatch2.vWorldT;
+            if(bTangent) vMeshTSN += curpatch2.vWorldN;
+        }
+
+        double fMeshNormalLength = vMeshNormal.GetLength();
+        double fMeshTSBLength = vMeshTSB.GetLength();
+        double fMeshTSTLength = vMeshTST.GetLength();
+        double fMeshTSNLength = vMeshTSN.GetLength();
+        if(bNormal && fMeshNormalLength > 0.000000000001 && std::isfinite(fMeshNormalLength)) vWorking += (nNormals * vMeshNormal / fMeshNormalLength);
+        if(bTangent && fMeshTSBLength > 0.000000000001 && std::isfinite(fMeshTSBLength)) vWorkingTSB += (vMeshTSB / fMeshTSBLength);
+        if(bTangent && fMeshTSTLength > 0.000000000001 && std::isfinite(fMeshTSTLength)) vWorkingTST += (vMeshTST / fMeshTSTLength);
+        if(bTangent && fMeshTSNLength > 0.000000000001 && std::isfinite(fMeshTSNLength)) vWorkingTSN += (vMeshTSN / fMeshTSNLength);
+    }
+
+    if(bNormal) vWorking.Normalize();
+    if(bTangent) vWorkingTSB.Normalize();
+    if(bTangent) vWorkingTST.Normalize();
+    if(bTangent) vWorkingTSN.Normalize();
+
+    if(bNormal) patch.vVertexNormal = vWorking;
+    if(bTangent) patch.vVertexB = vWorkingTSB;
+    if(bTangent) patch.vVertexT = vWorkingTST;
+    if(bTangent) patch.vVertexN = vWorkingTSN;
+}
+
+
+}
 
 /// Utility function, gets triangular face normalized normal from vert vectors
 Vector GetNormal(Vector v1, Vector v2, Vector v3){
@@ -22,7 +285,7 @@ Vector GetNormal(Vector v1, Vector v2, Vector v3){
 /// Utility function for mesh->saber conversion
 /// Loops through the faces, until it finds one where both of the vert indices exits, then it returns the third index (unless it's being ignored), otherwise -1
 int FindThirdIndex(const std::vector<Face> & faces, int ind1, int ind2, int ignore = -1){
-    for(int f = 0; f < faces.size(); f++){
+    for(int f = 0; f < static_cast<int>(faces.size()); f++){
         const Face & face = faces.at(f);
         int nFound = 0;
         for(int i = 0; i < 3; i++){
@@ -37,73 +300,66 @@ int FindThirdIndex(const std::vector<Face> & faces, int ind1, int ind2, int igno
     return -1;
 }
 
-void MDL::GatherChildren(Node & node, std::vector<Node> & ArrayOfNodes, Vector vFromRoot, Quaternion qFromRoot, std::vector<MdlInteger<unsigned short>> indices, unsigned long * p_nNumFacesTotal){
-    node.Head.ChildIndices.resize(0); //Reset child array
-    node.Head.ChildIndices.reserve(ArrayOfNodes.size());
-
-    indices.push_back(node.Head.nNameIndex);
-
-    /// Let's do the transformations/translations here. First orientation, then translation.
-    //Location loc = node.GetLocation();
-    Vector vAdd = node.Head.vPos;
-    vAdd.Rotate(qFromRoot);
-    vFromRoot += vAdd;
-    qFromRoot *= node.Head.oOrient.GetQuaternion();
-
-    node.Head.vFromRoot = vFromRoot;
-    node.Head.qFromRoot = qFromRoot;
-
-    if(p_nNumFacesTotal && node.Head.nType & NODE_MESH && !(node.Head.nType & NODE_SABER)){
-        *p_nNumFacesTotal += node.Mesh.Faces.size();
-    }
-
-    for(Node & child : ArrayOfNodes){
-        if(child.Head.nParentIndex == node.Head.nNameIndex){
-            //The nodes with this index is a child, adopt it
-            //node.Head.Children.push_back(ArrayOfNodes[n]);
-            node.Head.ChildIndices.push_back(child.Head.nNameIndex);
-            if(std::find(indices.begin(), indices.end(), child.Head.nNameIndex) == indices.end())
-                GatherChildren(child, ArrayOfNodes, vFromRoot, qFromRoot, indices, p_nNumFacesTotal);
-        }
-    }
-    node.Head.ChildIndices.shrink_to_fit();
+void MDL::GatherChildren(Node & node, std::vector<Node> & ArrayOfNodes, Vector vFromRoot){
+    std::vector<unsigned short> active;
+    std::vector<unsigned short> visited;
+    active.reserve(ArrayOfNodes.size());
+    visited.reserve(ArrayOfNodes.size());
+    GatherChildrenRecursive(node, ArrayOfNodes, vFromRoot, active, visited);
 }
+void GetSupernodes(ModelHeader & MH, ModelHeader & superMH, int & nHighest, int & nTotalSupermodelNodes, int nNodeCurrentNameIndex, int nSupernodeCurrentNameIndex){
+    if(nNodeCurrentNameIndex < 0) return;
 
-void GetSupernodes(ModelHeader & MH, ModelHeader & superMH, unsigned & nHighest, unsigned & nTotalSupermodelNodes, MdlInteger<unsigned short> nNodeCurrent, MdlInteger<unsigned short> nSupernodeCurrent){
-    if(!nNodeCurrent.Valid()) return;
-    Node & node = MH.ArrayOfNodes.at(nNodeCurrent);
+    Node & node = GetAsciiNodeByNameIndex(MH,
+        static_cast<unsigned short>(nNodeCurrentNameIndex),
+        "GetSupernodes()");
 
-    if(!nSupernodeCurrent.Valid()){
-        node.Head.nSupernodeNumber = nHighest;
+    if(nSupernodeCurrentNameIndex == -1){
+        if(nHighest < 0 || nHighest > std::numeric_limits<unsigned short>::max()){
+            throw mdlexception("GetSupernodes() generated a supernode number outside the 16-bit node field range.");
+        }
+        node.Head.nSupernodeNumber = static_cast<unsigned short>(nHighest);
         nHighest++;
-        for(int n = 0; n < node.Head.ChildIndices.size(); n++){
-            GetSupernodes(MH, superMH, nHighest, nTotalSupermodelNodes, node.Head.ChildIndices.at(n), -2);
+        for(auto childNameIndex : node.Head.ChildIndices){
+            const unsigned short nChildNameIndex = CheckedAsciiNameIndex(MH, childNameIndex, "GetSupernodes() child");
+            GetSupernodes(MH, superMH, nHighest, nTotalSupermodelNodes, nChildNameIndex, -2);
         }
     }
-    else if(nSupernodeCurrent == static_cast<unsigned short>(-2)){
+    else if(nSupernodeCurrentNameIndex == -2){
         /// Question: I am adding this to an already existing value in this variable.
         /// It is probably the name index, but is it possible that it actually has to be the node index?
-        node.Head.nSupernodeNumber = static_cast<unsigned short>(node.Head.nSupernodeNumber) + nTotalSupermodelNodes + 1;
-        for(int n = 0; n < node.Head.ChildIndices.size(); n++){
-            GetSupernodes(MH, superMH, nHighest, nTotalSupermodelNodes, node.Head.ChildIndices.at(n), -2);
+        const unsigned int nBaseSupernode = static_cast<unsigned short>(node.Head.nSupernodeNumber);
+        const unsigned int nAdjustedSupernode = nBaseSupernode + static_cast<unsigned int>(nTotalSupermodelNodes) + 1u;
+        if(nTotalSupermodelNodes < 0 || nAdjustedSupernode > std::numeric_limits<unsigned short>::max()){
+            throw mdlexception("GetSupernodes() adjusted a supernode number outside the 16-bit node field range.");
+        }
+        node.Head.nSupernodeNumber = static_cast<unsigned short>(nAdjustedSupernode);
+        for(auto childNameIndex : node.Head.ChildIndices){
+            const unsigned short nChildNameIndex = CheckedAsciiNameIndex(MH, childNameIndex, "GetSupernodes() child");
+            GetSupernodes(MH, superMH, nHighest, nTotalSupermodelNodes, nChildNameIndex, -2);
         }
     }
     else{
-        Node & supernode = superMH.ArrayOfNodes.at(nSupernodeCurrent);
+        Node & supernode = GetAsciiNodeByNameIndex(superMH,
+            static_cast<unsigned short>(nSupernodeCurrentNameIndex),
+            "GetSupernodes() supermodel");
         node.Head.nSupernodeNumber = supernode.Head.nSupernodeNumber;
-        for(int n = 0; n < node.Head.ChildIndices.size(); n++){
+        for(auto childNameIndex : node.Head.ChildIndices){
+            const unsigned short nChildNameIndex = CheckedAsciiNameIndex(MH, childNameIndex, "GetSupernodes() child");
             bool bFound = false;
-            std::string sNodeName = MH.Names.at(node.Head.ChildIndices.at(n)).sName.c_str();
-            std::transform(sNodeName.begin(), sNodeName.end(), sNodeName.begin(), ::tolower);
-            for(int n2 = 0; n2 < supernode.Head.ChildIndices.size() && !bFound; n2++){
-                std::string sSupernodeName = superMH.Names.at(supernode.Head.ChildIndices.at(n2)).sName.c_str();
-                std::transform(sSupernodeName.begin(), sSupernodeName.end(), sSupernodeName.begin(), ::tolower);
+            std::string sNodeName = MH.Names.at(nChildNameIndex).sName.c_str();
+            ToLowerInPlace(sNodeName);
+            for(auto superChildNameIndexValue : supernode.Head.ChildIndices){
+                if(bFound) break;
+                const unsigned short nSuperChildNameIndex = CheckedAsciiNameIndex(superMH, superChildNameIndexValue, "GetSupernodes() supermodel child");
+                std::string sSupernodeName = superMH.Names.at(nSuperChildNameIndex).sName.c_str();
+                ToLowerInPlace(sSupernodeName);
                 if(sNodeName == sSupernodeName){
                     bFound = true;
-                    GetSupernodes(MH, superMH, nHighest, nTotalSupermodelNodes, node.Head.ChildIndices.at(n), supernode.Head.ChildIndices.at(n2));
+                    GetSupernodes(MH, superMH, nHighest, nTotalSupermodelNodes, nChildNameIndex, nSuperChildNameIndex);
                 }
             }
-            if(!bFound) GetSupernodes(MH, superMH, nHighest, nTotalSupermodelNodes, node.Head.ChildIndices.at(n), -1);
+            if(!bFound) GetSupernodes(MH, superMH, nHighest, nTotalSupermodelNodes, nChildNameIndex, -1);
         }
     }
 }
@@ -116,35 +372,35 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
 
     /// PART 0 ///
     /// Get rid of the duplication marks
-    for(int n = 0; n < Data.MH.Names.size(); n++){
+    for(int n = 0; n < static_cast<int>(Data.MH.Names.size()); n++){
         std::string & sNode = Data.MH.Names.at(n).sName;
         if(sNode.find("__dpl") != std::string::npos){
             sNode.resize(sNode.find("__dpl"));
         }
     }
     /// Implementation of 'bumpmapped_texture': applies bumpmaps
-    for(int s = 0; s < sBumpmapped.size(); s++){
-        for(int n = 0; n < Data.MH.ArrayOfNodes.size(); n++){
+    for(int s = 0; s < static_cast<int>(sBumpmapped.size()); s++){
+        for(int n = 0; n < static_cast<int>(Data.MH.ArrayOfNodes.size()); n++){
             //ReportMdl << "Checking node\n";
             Node & node = Data.MH.ArrayOfNodes.at(n);
             if(node.Head.nType & NODE_MESH && !(node.Head.nType & NODE_AABB) && !(node.Head.nType & NODE_SABER)){
                 if(std::string(node.Mesh.cTexture1.c_str()) != "" && std::string(node.Mesh.cTexture1.c_str()) != "NULL"){
-                    if(StringEqual(sBumpmapped.at(s).c_str(), node.Mesh.cTexture1.c_str())){
+                    if(StringEqual(sBumpmapped.at(s).c_str(), node.Mesh.cTexture1.c_str(), true)){
                         node.Mesh.nMdxDataBitmap = node.Mesh.nMdxDataBitmap | MDX_FLAG_TANGENT1;
                     }
                 }
                 if(node.Mesh.cTexture2.c_str() != std::string("") && node.Mesh.cTexture2.c_str() != std::string("NULL")){
-                    if(StringEqual(sBumpmapped.at(s).c_str(), node.Mesh.cTexture2.c_str())){
+                    if(StringEqual(sBumpmapped.at(s).c_str(), node.Mesh.cTexture2.c_str(), true)){
                         node.Mesh.nMdxDataBitmap = node.Mesh.nMdxDataBitmap | MDX_FLAG_TANGENT2;
                     }
                 }
                 if(node.Mesh.cTexture3.c_str() != std::string("") && node.Mesh.cTexture3.c_str() != std::string("NULL")){
-                    if(StringEqual(sBumpmapped.at(s).c_str(), node.Mesh.cTexture3.c_str())){
+                    if(StringEqual(sBumpmapped.at(s).c_str(), node.Mesh.cTexture3.c_str(), true)){
                         node.Mesh.nMdxDataBitmap = node.Mesh.nMdxDataBitmap | MDX_FLAG_TANGENT3;
                     }
                 }
                 if(node.Mesh.cTexture4.c_str() != std::string("") && node.Mesh.cTexture4.c_str() != std::string("NULL")){
-                    if(StringEqual(sBumpmapped.at(s).c_str(), node.Mesh.cTexture4.c_str())){
+                    if(StringEqual(sBumpmapped.at(s).c_str(), node.Mesh.cTexture4.c_str(), true)){
                         node.Mesh.nMdxDataBitmap = node.Mesh.nMdxDataBitmap | MDX_FLAG_TANGENT4;
                     }
                 }
@@ -155,65 +411,98 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
     /// PART 1 ///
     /// Gather all the children (the indices!!!)
     /// This part means going from every node only specifying its parent to every node also specifying its children
-    Report("Building node hierarchies...");
     // 1. Gather children for animations
     for(Animation & anim : Data.MH.Animations){
-        for(Node & animnode : anim.ArrayOfNodes){
-            if(!animnode.Head.nParentIndex.Valid()){
-                //anim.RootAnimationNode = anim.ArrayOfNodes[n];
-                std::vector<MdlInteger<unsigned short>> indices; /// Must keep track of all the indices of its parents because we must stop recursion in the case of a loop
-                indices.reserve(anim.ArrayOfNodes.size());
-                GatherChildren(animnode, anim.ArrayOfNodes, Vector(), Quaternion(), indices);
-                break;
+        Node * pRoot = FindAsciiRootNode(anim.ArrayOfNodes, "animation '" + std::string(anim.sName.c_str()) + "'");
+        if(pRoot == nullptr){
+            if(!anim.ArrayOfNodes.empty()){
+                throw mdlexception("ASCII post-processing could not find a root node for animation '" + std::string(anim.sName.c_str()) + "'.");
             }
         }
+        else GatherChildren(*pRoot, anim.ArrayOfNodes, Vector());
     }
     // 2. Gather children for geometry
-    unsigned long nNumFacesTotal = 0;
-    for(Node & node : Data.MH.ArrayOfNodes){
-        if(!node.Head.nParentIndex.Valid()){
-            //Data.MH.RootNode = Data.MH.ArrayOfNodes[n];
-            std::vector<MdlInteger<unsigned short>> indices; /// Must keep track of all the indices of its parents because we must stop recursion in the case of a loop
-            indices.reserve(Data.MH.ArrayOfNodes.size());
-            GatherChildren(node, Data.MH.ArrayOfNodes, Vector(), Quaternion(), indices, &nNumFacesTotal);
-            break;
-        }
+    Node * pGeometryRoot = FindAsciiRootNode(Data.MH.ArrayOfNodes, "geometry");
+    if(pGeometryRoot == nullptr){
+        throw mdlexception("ASCII post-processing could not find a geometry root node.");
     }
+    GatherChildren(*pGeometryRoot, Data.MH.ArrayOfNodes, Vector());
 
     /// PART 2 ///
     /// Do supernodes
     /// This loads up all the supermodels and calculates the supernode numbers
-    Report("Processing supermodel...");
-    Data.MH.GH.nTotalNumberOfNodes = Data.MH.nNodeCount;
+    if(!Data.MH.bPreserveTotalNumberOfNodes){
+        Data.MH.GH.nTotalNumberOfNodes = Data.MH.nNodeCount;
+    }
     nSupermodel = 0; // As far as we're concerned, supermodel not loaded (yet).
     if(Data.MH.cSupermodelName != "NULL" && Data.MH.cSupermodelName != ""){
         std::unique_ptr<MDL> Supermodel;
-        LoadSupermodel(*this, Supermodel);
-        //First, update the TotalNodeCount
+        ModelHeader embeddedSupermodelHeader;
+        ModelHeader * pSupermodelHeader = nullptr;
+
+        // A correct neighboring binary remains authoritative, which preserves
+        // support for custom or modified supermodels. For the stock K1/K2
+        // humanoid supermodels, suppress the missing-file dialog because a
+        // generated metadata-only fallback is available.
+        const bool bEmbeddedAvailable = HasEmbeddedSupermodel(bK2, Data.MH.cSupermodelName);
+        LoadSupermodel(*this, Supermodel, !bEmbeddedAvailable);
         if(Supermodel){
-            /// Supernode loaded, record its status
+            pSupermodelHeader = &Supermodel->GetFileData()->MH;
+            ReportMdl << "Using neighboring binary supermodel metadata.\n";
+        }
+        else if(BuildEmbeddedSupermodel(bK2, Data.MH.cSupermodelName, embeddedSupermodelHeader)){
+            pSupermodelHeader = &embeddedSupermodelHeader;
+            ReportMdl << "Using embedded " << (bK2 ? "K2" : "K1")
+                      << " stock supermodel metadata for "
+                      << Data.MH.cSupermodelName << ".\n";
+        }
+
+        // First, update the TotalNodeCount.
+        if(pSupermodelHeader != nullptr){
+            /// Supernode metadata loaded, record its status.
             nSupermodel = bK2 ? 2 : 1;
 
-            unsigned nTotalSupermodelNodes = Supermodel->GetFileData()->MH.GH.nTotalNumberOfNodes;
+            int nTotalSupermodelNodes = static_cast<int>(pSupermodelHeader->GH.nTotalNumberOfNodes);
             ReportMdl << "Total Supermodel Nodes: " << nTotalSupermodelNodes << "\n";
-            if(nTotalSupermodelNodes > 0)
+            if(nTotalSupermodelNodes > 0 && !Data.MH.bPreserveTotalNumberOfNodes)
                 Data.MH.GH.nTotalNumberOfNodes += 1 + nTotalSupermodelNodes;
 
-            //Next we need the largest supernode number.
+            // Next we need the largest supernode number.
             int nMaxSupernode = 0;
-            for(int n = 0; n < Supermodel->GetFileData()->MH.ArrayOfNodes.size(); n++){
-                nMaxSupernode = std::max(nMaxSupernode, (int) Supermodel->GetFileData()->MH.ArrayOfNodes.at(n).Head.nSupernodeNumber);
+            for(const Node & supermodelNode : pSupermodelHeader->ArrayOfNodes){
+                nMaxSupernode = std::max(nMaxSupernode,
+                                         static_cast<int>(supermodelNode.Head.nSupernodeNumber));
             }
-            unsigned nCurrentSupernode = nMaxSupernode + 1;
+            int nCurrentSupernode = nMaxSupernode + 1;
 
-            GetSupernodes(Data.MH, Supermodel->GetFileData()->MH, nCurrentSupernode, nTotalSupermodelNodes, 0, 0);
+            Node * pSuperRoot = FindAsciiRootNode(
+                pSupermodelHeader->ArrayOfNodes,
+                "supermodel '" + pSupermodelHeader->GH.sName + "'");
+            if(pSuperRoot == nullptr){
+                throw mdlexception("ASCII post-processing could not find a root node in supermodel '" +
+                                   pSupermodelHeader->GH.sName + "'.");
+            }
+            const unsigned short nGeometryRootNameIndex =
+                CheckedAsciiNameIndex(Data.MH,
+                                      pGeometryRoot->Head.nNameIndex,
+                                      "GetSupernodes() geometry root");
+            const unsigned short nSuperRootNameIndex =
+                CheckedAsciiNameIndex(*pSupermodelHeader,
+                                      pSuperRoot->Head.nNameIndex,
+                                      "GetSupernodes() supermodel root");
+            GetSupernodes(Data.MH,
+                          *pSupermodelHeader,
+                          nCurrentSupernode,
+                          nTotalSupermodelNodes,
+                          nGeometryRootNameIndex,
+                          nSuperRootNameIndex);
         }
     }
     /// Apply supernode numbers to anim nodes
     for(Animation & anim : Data.MH.Animations){
         for(Node & anim_node : anim.ArrayOfNodes){
-            MdlInteger<unsigned short> nNodeIndex = GetNodeIndexByNameIndex(anim_node.Head.nNameIndex);
-            if(nNodeIndex.Valid()){
+            int nNodeIndex = GetNodeIndexByNameIndex(anim_node.Head.nNameIndex);
+            if(nNodeIndex != -1){
                 anim_node.Head.nSupernodeNumber = Data.MH.ArrayOfNodes.at(nNodeIndex).Head.nSupernodeNumber;
             }
             else{
@@ -222,31 +511,42 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
         }
     }
     /// Build Array of Indices By Tree Order
+    if(Data.MH.ArrayOfNodes.empty()){
+        throw mdlexception("ASCII post-processing produced no geometry nodes.");
+    }
     Data.MH.NameIndicesInTreeOrder.reserve(Data.MH.ArrayOfNodes.size());
-    Data.MH.BuildTreeOrderArray(Data.MH.ArrayOfNodes.front());
+    pGeometryRoot = FindAsciiRootNode(Data.MH.ArrayOfNodes, "geometry");
+    if(pGeometryRoot == nullptr){
+        throw mdlexception("ASCII post-processing could not find a geometry root node for tree-order construction.");
+    }
+    Data.MH.BuildTreeOrderArray(*pGeometryRoot);
 
     /// PART 3 ///
     /// Interpret ascii data
     /// This constructs the Mesh.Vertices, Mesh.VertIndices, Dangly.Data2, Dangly.Constraints and Saber.SaberData structures.
     /// And not to forget the weights. Also face normals, average, aabb tree .... everything.
-    unsigned long nFaceCounter = 0;
     Report("Interpreting ascii data...");
-    ProgressSize(0, 100);
-    unsigned long nStepper = 0;
-    unsigned nUnit = std::max((unsigned long) 1, 2 * nNumFacesTotal / 100);
+    ProgressSize(0, Data.MH.ArrayOfNodes.size());
     ProgressPos(0);
-    ProgressSetStep(1);
-    for(int n = 0; n < Data.MH.ArrayOfNodes.size(); n++){
+    for(int n = 0; n < static_cast<int>(Data.MH.ArrayOfNodes.size()); n++){
         //ReportMdl << "n = " << n << "\n";
         Node & node = Data.MH.ArrayOfNodes.at(n);
-        Report("Interpreting ascii data... (" + GetNodeName(node) + ")");
         //std::cout << "Processing: " << GetNodeName(node) << std::endl;
         //ReportMdl << "Analyzing node " << Data.MH.Names.at(node.Head.nNameIndex).sName << " (" << n << "/" << Data.MH.ArrayOfNodes.size() << ")\n";
 
         //ReportMdl << "PART 3 - stage 1" << "\n";
         if(node.Head.nType & NODE_SABER){
             /// Saber interpretation goes here.
-            if((node.Mesh.TempVerts.size() == 16 && node.Mesh.TempTverts.size() == 16) ||
+            const bool bHasPreservedSaberData = node.Saber.bPreserveSaberData;
+            if(bHasPreservedSaberData){
+                // Exact binary saber payload was supplied through ASCII. Do not regenerate it
+                // from the old 16-point blade recipe. Keep parsed faces as-is and rebuild
+                // only Mesh.Vertices for shared bookkeeping/bounding calculations.
+                node.Mesh.Vertices.clear();
+                node.Mesh.Vertices.reserve(node.Saber.SaberData.size());
+                for(VertexData & sd : node.Saber.SaberData) node.Mesh.Vertices.push_back(Vertex().assign(sd.vVertex));
+            }
+            else if((node.Mesh.TempVerts.size() == 16 && node.Mesh.TempTverts.size() == 16) ||
                 (node.Mesh.TempVerts.size() == 176 && node.Mesh.TempTverts.size() == 176)){
 
                 int nBase = 8;
@@ -269,7 +569,8 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                 Vector v14 = node.Mesh.TempVerts.at(nBase+6);
                 Vector v15 = node.Mesh.TempVerts.at(nBase+7);
 
-                node.Saber.SaberData.reserve(50);
+                node.Saber.SaberData.clear();
+                    node.Saber.SaberData.reserve(176);
                 node.Saber.SaberData.push_back(VertexData(v0, node.Mesh.TempTverts.at(0)));
                 node.Saber.SaberData.push_back(VertexData(v1, node.Mesh.TempTverts.at(1)));
                 node.Saber.SaberData.push_back(VertexData(v2, node.Mesh.TempTverts.at(2)));
@@ -311,16 +612,27 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
 
         if(node.Head.nType & NODE_MESH && !(node.Head.nType & NODE_SABER)){
             std::vector<Vector> vectorarray;
-            vectorarray.reserve(node.Mesh.Faces.size()*3);
+            if(node.Mesh.Faces.size() > vectorarray.max_size() / 3u){
+                throw mdlexception("Node '" + Data.MH.Names.at(node.Head.nNameIndex).sName + "' has too many faces to allocate temporary vertex data safely.");
+            }
+            vectorarray.reserve(node.Mesh.Faces.size()*3u);
             node.Mesh.fTotalArea = 0.0;
 
             /// Build mdx bitmap
             if(node.Mesh.TempVerts.size() > 0) node.Mesh.nMdxDataBitmap |= (MDX_FLAG_VERTEX | MDX_FLAG_NORMAL);
+            if(node.Mesh.TempNormals.size() > 0){
+                node.Mesh.nMdxDataBitmap |= MDX_FLAG_NORMAL;
+                node.Mesh.bPreserveMdxNormals = true;
+            }
             if(node.Mesh.TempColors.size() > 0) node.Mesh.nMdxDataBitmap |= (MDX_FLAG_COLOR);
             if(node.Mesh.TempTverts.size() > 0) node.Mesh.nMdxDataBitmap |= (MDX_FLAG_UV1);
             if(node.Mesh.TempTverts1.size() > 0) node.Mesh.nMdxDataBitmap |= (MDX_FLAG_UV2);
             if(node.Mesh.TempTverts2.size() > 0) node.Mesh.nMdxDataBitmap |= (MDX_FLAG_UV3);
             if(node.Mesh.TempTverts3.size() > 0) node.Mesh.nMdxDataBitmap |= (MDX_FLAG_UV4);
+            if(node.Mesh.TempTangent1.size() > 0){
+                node.Mesh.TangentSpace.at(0) = true;
+                node.Mesh.bPreserveMdxTangent1 = true;
+            }
             if(node.Mesh.TangentSpace.at(0)) node.Mesh.nMdxDataBitmap |= (MDX_FLAG_TANGENT1);
             if(node.Mesh.TangentSpace.at(1)) node.Mesh.nMdxDataBitmap |= (MDX_FLAG_TANGENT2);
             if(node.Mesh.TangentSpace.at(2)) node.Mesh.nMdxDataBitmap |= (MDX_FLAG_TANGENT3);
@@ -329,75 +641,145 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
             /// If this a skin, we need to build the bonemap, the bone indices and convert the name indices in the weights to bone indices
             if(node.Head.nType & NODE_SKIN){
                 /// First, get the correct name index to all the bones
-                for(int nb = 0; nb < node.Skin.Bones.size(); nb++){
+                for(int nb = 0; nb < static_cast<int>(node.Skin.Bones.size()); nb++){
                     Bone & bone = node.Skin.Bones.at(nb);
                     bone.nNameIndex = Data.MH.NameIndicesInTreeOrder.at(nb);
                 }
 
-                /// Next, go through the weights and build the actual bones
-                std::vector<int> nBoneIndices;
-                nBoneIndices.reserve(16);
+                /// Next, go through the weights and build the actual bones.
+                /// Keep the compact palette order from decompiled ASCII when present.
+                /// TSL/K2 has one more compact skin slot than K1; in the binary header
+                /// that 17th reverse-map slot lives in nPadding1. K1 uses nPadding1
+                /// as an actual padding short, and vanilla K1 models often contain
+                /// arbitrary non-zero values there, so do not treat it as slot 16.
+                const unsigned int nMaxCompactSlots = bK2 ? 17 : 16;
+                std::vector<int> nBoneIndices(nMaxCompactSlots, -1); // compact slot -> full/tree-order bone index
+
+                // Preserve raw compact reverse-map header values before applying
+                // semantic compactbonemap overrides or assigning slots for edited
+                // weights. The binary header stores 18 uint16 values: 16 compact
+                // slots, then nPadding1 and nPadding2. K2 treats nPadding1 as
+                // semantic slot 16; K1 treats both trailing shorts as raw padding.
+                const unsigned int nRawCompactHeaderShorts = 18;
+                for(unsigned int nSlot = 0; nSlot < node.Skin.TempCompactBoneRawIndices.size() && nSlot < nRawCompactHeaderShorts; nSlot++){
+                    MdlInteger<unsigned short> nRawFullBone = node.Skin.TempCompactBoneRawIndices.at(nSlot);
+                    if(!nRawFullBone.Valid()) continue;
+                    if(nSlot < 16) node.Skin.nBoneIndices.at(nSlot) = static_cast<unsigned short>(nRawFullBone);
+                    else if(nSlot == 16) node.Skin.nPadding1 = static_cast<unsigned short>(nRawFullBone);
+                    else node.Skin.nPadding2 = static_cast<unsigned short>(nRawFullBone);
+
+                    if(nSlot < nMaxCompactSlots &&
+                       static_cast<unsigned short>(nRawFullBone) < node.Skin.Bones.size() &&
+                       node.Skin.Bones.at(static_cast<unsigned short>(nRawFullBone)).nBonemap.Valid() &&
+                       static_cast<unsigned short>(node.Skin.Bones.at(static_cast<unsigned short>(nRawFullBone)).nBonemap) == nSlot){
+                        nBoneIndices.at(nSlot) = static_cast<unsigned short>(nRawFullBone);
+                    }
+                }
+                for(unsigned int nSlot = nRawCompactHeaderShorts; nSlot < node.Skin.TempCompactBoneRawIndices.size(); nSlot++){
+                    if(node.Skin.TempCompactBoneRawIndices.at(nSlot).Valid()){
+                        throw mdlexception("compactbonemapraw on node '" + Data.MH.Names.at(node.Head.nNameIndex).sName +
+                                           "' contains more raw header values than the binary skin header can store.");
+                    }
+                }
+
+                auto FindTreeOrderIndex = [&](MdlInteger<unsigned short> nNameIndex, unsigned short & nNodeIndex) -> bool {
+                    if(!nNameIndex.Valid()) return false;
+                    for(unsigned short ind2 = 0; ind2 < Data.MH.NameIndicesInTreeOrder.size(); ind2++){
+                        if(nNameIndex == Data.MH.NameIndicesInTreeOrder.at(ind2)){
+                            nNodeIndex = ind2;
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+
+                auto SetCompactSlot = [&](unsigned short nSlot, unsigned short nNodeIndex, MdlInteger<unsigned short> nNameIndex){
+                    if(nSlot >= nMaxCompactSlots) throw mdlexception("Skin compact slot is outside the active game range.");
+                    if(nBoneIndices.at(nSlot) != -1 && nBoneIndices.at(nSlot) != nNodeIndex){
+                        throw mdlexception("Conflicting compact skin palette data on node '" + Data.MH.Names.at(node.Head.nNameIndex).sName + "'.");
+                    }
+                    nBoneIndices.at(nSlot) = nNodeIndex;
+                    if(node.Skin.BoneNameIndices.size() <= nSlot) node.Skin.BoneNameIndices.resize(nSlot + 1);
+                    node.Skin.BoneNameIndices.at(nSlot) = nNameIndex;
+                    node.Skin.Bones.at(nNodeIndex).nBonemap = nSlot;
+                    if(nSlot < 16) node.Skin.nBoneIndices.at(nSlot) = nNodeIndex;
+                    else node.Skin.nPadding1 = nNodeIndex;
+                };
+
+                for(unsigned int nSlot = 0; nSlot < node.Skin.TempCompactBoneNameIndices.size() && nSlot < nMaxCompactSlots; nSlot++){
+                    MdlInteger<unsigned short> nNameIndex = node.Skin.TempCompactBoneNameIndices.at(nSlot);
+                    if(!nNameIndex.Valid()) continue;
+
+                    unsigned short nNodeIndex = 0;
+                    if(!FindTreeOrderIndex(nNameIndex, nNodeIndex)){
+                        throw mdlexception("compactbonemap on node '" + Data.MH.Names.at(node.Head.nNameIndex).sName +
+                                           "' references a bone that is not present in the geometry tree.");
+                    }
+                    SetCompactSlot(nSlot, nNodeIndex, nNameIndex);
+                }
+                for(unsigned int nSlot = nMaxCompactSlots; nSlot < node.Skin.TempCompactBoneNameIndices.size(); nSlot++){
+                    if(node.Skin.TempCompactBoneNameIndices.at(nSlot).Valid()){
+                        throw mdlexception("compactbonemap on node '" + Data.MH.Names.at(node.Head.nNameIndex).sName +
+                                           "' defines a compact slot that this game does not support.");
+                    }
+                }
+
                 for(Weight & w : node.Skin.TempWeights){
-                    for(MdlInteger<unsigned short> & ind : w.nWeightIndex){
-                        // We have found the name index for the current name, now we need to make sure this name has been indexed in the skin
-                        // Check if we already have this name indexed in the skin
+                    for(int nWeightSlot = 0; nWeightSlot < 4; nWeightSlot++){
+                        MdlInteger<unsigned short> & ind = w.nWeightIndex.at(nWeightSlot);
+                        double fWeightValue = w.fWeightValue.at(nWeightSlot);
 
-                        /// If the index is -1, we may just skip
-                        if(!ind.Valid()) continue;
+                        if(abs(fWeightValue) < 0.0000001){
+                            ind = -1;
+                            continue;
+                        }
+                        if(!std::isfinite(fWeightValue)){
+                            throw mdlexception("Skin weight on node '" + Data.MH.Names.at(node.Head.nNameIndex).sName + "' is not finite.");
+                        }
+                        if(!ind.Valid()){
+                            throw mdlexception("Active skin weight on node '" + Data.MH.Names.at(node.Head.nNameIndex).sName +
+                                               "' has no valid bone. 'root' is not a valid active skin influence in compiled MDX data.");
+                        }
 
-                        /// First, convert the name index into the tree order index
                         unsigned short nNodeIndex = 0;
-                        for(unsigned short ind2 = 0; ind2 < Data.MH.NameIndicesInTreeOrder.size(); ind2++)
-                            if(ind == Data.MH.NameIndicesInTreeOrder.at(ind2))
-                                nNodeIndex = ind2;
-
-                        /// nNodeIndex is now the index of the bone node in tree order, now let's see if there is already a bone index for it
-                        bool bPresent = false;
-                        int nBoneIndex = 0;
-                        while(nBoneIndex < nBoneIndices.size() && !bPresent){
-                            if(nBoneIndices.at(nBoneIndex) == nNodeIndex){
-                                bPresent = true;
-                            }
-                            else nBoneIndex++;
+                        if(!FindTreeOrderIndex(ind, nNodeIndex)){
+                            throw mdlexception("Skin weight on node '" + Data.MH.Names.at(node.Head.nNameIndex).sName +
+                                               "' references a bone that is not present in the geometry tree.");
                         }
 
-                        /// If this is a new bone index:
-                        if(!bPresent){
-                            /// Add it to the list of bone node indices. Here the value is the node index and the order is the bone index.
-                            /// This is used in the skin. It is the same as the one in the skin header, but this one is not limited to 16 bones, in case that happens.
-                            nBoneIndices.push_back(nNodeIndex);
-
-                            /// Add it to the list of bone name indices. Here the value is the name index and the order is the bone index
-                            /// This is used for getting the name index from the bone index.
-                            node.Skin.BoneNameIndices.push_back(ind);
-
-                            //std::cout << "Saving node index " << nNodeIndex << " (name index " << ind << " - " << (ind > 0 && ind < Data.MH.Names.size() ? Data.MH.Names.at(ind).sName : std::string("None")) << ") under bone index " << nBoneIndex << std::endl;
-                            //nBoneIndex = nBoneIndices.size() - 1; //Update nBoneIndex so it always points to the correct bone
-
-                            /// Add it to the bonemap. The value is the bone index and the order is the node index.
-                            node.Skin.Bones.at(nNodeIndex).nBonemap = nBoneIndex;
-
-                            /// Add it to the skin header's bone list if there are less than 16 bones. Here the value is the node index and the order is the bone index.
-                            if(nBoneIndex < 16){
-                                node.Skin.nBoneIndices.at(nBoneIndex) = nNodeIndex;
+                        int nBoneIndex = -1;
+                        for(int nSlot = 0; nSlot < static_cast<int>(nBoneIndices.size()); nSlot++){
+                            if(nBoneIndices.at(nSlot) == nNodeIndex){
+                                nBoneIndex = nSlot;
+                                break;
                             }
-                            else Warning(std::string("Warning! The skin node '") + Data.MH.Names.at(node.Head.nNameIndex).sName + "' has more than 16 bones, which is the number of available slots in one of the lists. "
-                                         "The extra bones will simply not be included in that list, but I do not know how this will affect the game.");
                         }
 
-                        /// Now that we have a bone index, update the one in the weights
-                        ind = nBoneIndex;
+                        if(nBoneIndex == -1){
+                            for(int nSlot = 0; nSlot < static_cast<int>(nBoneIndices.size()); nSlot++){
+                                if(nBoneIndices.at(nSlot) == -1){
+                                    nBoneIndex = nSlot;
+                                    break;
+                                }
+                            }
+                            if(nBoneIndex == -1){
+                                throw mdlexception("Skin node '" + Data.MH.Names.at(node.Head.nNameIndex).sName +
+                                                   "' uses more active compact bones than this game supports.");
+                            }
+                            SetCompactSlot(static_cast<unsigned short>(nBoneIndex), nNodeIndex, ind);
+                        }
+
+                        /// Now that we have a compact bone index, update the one in the weights.
+                        ind = static_cast<unsigned short>(nBoneIndex);
                     }
                 }
             }
             //std::cout << "Done with bones" << std::endl;
 
             /// Go through all the faces
-            for(int f = 0; f < node.Mesh.Faces.size(); f++){
+            for(int f = 0; f < static_cast<int>(node.Mesh.Faces.size()); f++){
                 Face & face = node.Mesh.Faces.at(f);
                 face.nID = f; /// Why is this necessary?
-                nStepper++;
-                if(nStepper % nUnit == 0) ProgressStepIt();
 
                 /// MDLOps may leave out texindicesX arrays, I need to check for unset indices and make them use the diffuse ones instead.
                 for(int i = 0; i < 3; i++){
@@ -415,7 +797,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                 /// Go through all the verts in the face
                 for(int i = 0; i < 3; i++){
                     if(!face.bProcessed[i]){
-                        bool bIgnoreVert = true, bIgnoreTvert = true, bIgnoreTvert1 = true, bIgnoreTvert2 = true, bIgnoreTvert3 = true, bIgnoreColor = true;
+                        bool bIgnoreVert = true, bIgnoreTvert = true, bIgnoreTvert1 = true, bIgnoreTvert2 = true, bIgnoreTvert3 = true, bIgnoreColor = true, bIgnoreNormal = true, bIgnoreTangent1 = true;
                         Vertex vert;
                         vert.MDXData.nNameIndex = node.Head.nNameIndex;
 
@@ -425,7 +807,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
 
                             //Add to vectorarray if no identical
                             bool bAdd = true;
-                            for(int v = 0; v < vectorarray.size() && bAdd; v++){
+                            for(int v = 0; v < static_cast<int>(vectorarray.size()) && bAdd; v++){
                                 if(vectorarray.at(v).Compare(node.Mesh.TempVerts.at((unsigned short) face.nIndexVertex[i]))) bAdd = false;
                             }
                             if(bAdd){
@@ -433,7 +815,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                             }
 
                             vert.vFromRoot = node.Mesh.TempVerts.at((unsigned short) face.nIndexVertex[i]);
-                            vert.vFromRoot.Rotate(node.Head.qFromRoot);
+                            vert.vFromRoot.Rotate(node.GetLocation().oOrientation.GetQuaternion());
                             vert.vFromRoot += node.Head.vFromRoot;
 
                             vert.MDXData.vVertex = node.Mesh.TempVerts.at((unsigned short) face.nIndexVertex[i]);
@@ -473,9 +855,19 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                             bIgnoreColor = false;
                             vert.MDXData.cColor = node.Mesh.TempColors.at((unsigned short) face.nIndexColor[i]);
                         }
+                        if(node.Mesh.TempNormals.size() > 0){
+                            bIgnoreNormal = false;
+                            MdlInteger<unsigned short> nNormalIndex = face.nIndexNormal[i];
+                            if(!nNormalIndex.Valid()) nNormalIndex = face.nIndexVertex[i];
+                            vert.MDXData.vNormal = node.Mesh.TempNormals.at((unsigned short) nNormalIndex);
+                        }
+                        if(node.Mesh.TempTangent1.size() > 0){
+                            bIgnoreTangent1 = false;
+                            vert.MDXData.vTangent1 = node.Mesh.TempTangent1.at((unsigned short) face.nIndexVertex[i]);
+                        }
 
                         //Find identical verts
-                        for(int f2 = f; f2 < node.Mesh.Faces.size(); f2++){
+                        for(int f2 = f; f2 < static_cast<int>(node.Mesh.Faces.size()); f2++){
                             Face & face2 = node.Mesh.Faces.at(f2);
                             for(int i2 = 0; i2 < 3; i2++){
                                 //Make sure that we're only changing what's past our current position if we are in the same face.
@@ -483,7 +875,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                                     if(bMinimizeVerts){
                                         try{
                                             if( !face2.bProcessed[i2] &&
-                                                (bIgnoreVert || node.Mesh.TempVerts.at(face2.nIndexVertex[i2]) == node.Mesh.TempVerts.at(face.nIndexVertex[i]) ) &&
+                                                (bIgnoreVert || node.Mesh.TempVerts.at(face2.nIndexVertex[i2]).Compare(node.Mesh.TempVerts.at(face.nIndexVertex[i]), 0.00001) ) &&
                                                 (bIgnoreVert || !(node.Head.nType & NODE_DANGLY) || node.Dangly.TempConstraints.at(face2.nIndexVertex[i2]) == node.Dangly.TempConstraints.at(face.nIndexVertex[i]) ) &&
                                                 (bIgnoreVert || !(node.Head.nType & NODE_SKIN) || node.Skin.TempWeights.at(face2.nIndexVertex[i2]) == node.Skin.TempWeights.at(face.nIndexVertex[i]) ) &&
                                                 (bIgnoreTvert || node.Mesh.TempTverts.at(face2.nIndexTvert[i2]) == node.Mesh.TempTverts.at(face.nIndexTvert[i]) ) &&
@@ -491,11 +883,16 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                                                 (bIgnoreTvert2 || node.Mesh.TempTverts2.at(face2.nIndexTvert2[i2]) == node.Mesh.TempTverts2.at(face.nIndexTvert2[i]) ) &&
                                                 (bIgnoreTvert3 || node.Mesh.TempTverts3.at(face2.nIndexTvert3[i2]) == node.Mesh.TempTverts3.at(face.nIndexTvert3[i]) ) &&
                                                 (bIgnoreColor || node.Mesh.TempColors.at(face2.nIndexColor[i2]) == node.Mesh.TempColors.at(face.nIndexColor[i]) ) &&
-                                                face.nSmoothingGroup & face2.nSmoothingGroup)
+                                                (bIgnoreNormal || node.Mesh.TempNormals.at(face2.nIndexNormal[i2].Valid() ? static_cast<unsigned short>(face2.nIndexNormal[i2]) : static_cast<unsigned short>(face2.nIndexVertex[i2])) == node.Mesh.TempNormals.at(face.nIndexNormal[i].Valid() ? static_cast<unsigned short>(face.nIndexNormal[i]) : static_cast<unsigned short>(face.nIndexVertex[i])) ) &&
+                                                (bIgnoreTangent1 ||
+                                                    (node.Mesh.TempTangent1.at(face2.nIndexVertex[i2]).at(0) == node.Mesh.TempTangent1.at(face.nIndexVertex[i]).at(0) &&
+                                                     node.Mesh.TempTangent1.at(face2.nIndexVertex[i2]).at(1) == node.Mesh.TempTangent1.at(face.nIndexVertex[i]).at(1) &&
+                                                     node.Mesh.TempTangent1.at(face2.nIndexVertex[i2]).at(2) == node.Mesh.TempTangent1.at(face.nIndexVertex[i]).at(2))) &&
+                                                (!bIgnoreNormal || (face.nSmoothingGroup & face2.nSmoothingGroup)))
                                             {
                                                 //If we find a reference to the exact same vert, we have to link to it
                                                 //Actually we only need to link vert indices, the correct UV are now already included in the Vertex struct
-                                                face2.nIndexVertex[i2] = node.Mesh.Vertices.size();
+                                                face2.nIndexVertex[i2] = CheckedAsciiVertexIndex(node.Mesh.Vertices.size(), "ASCII mesh post-processing");
                                                 face2.bProcessed[i2] = true;
                                             }
                                         }
@@ -510,12 +907,14 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                                             (bIgnoreTvert2 || face2.nIndexTvert2[i2] == face.nIndexTvert2[i] ) &&
                                             (bIgnoreTvert3 || face2.nIndexTvert3[i2] == face.nIndexTvert3[i] ) &&
                                             (bIgnoreColor || face2.nIndexColor[i2] == face.nIndexColor[i] ) &&
+                                            (bIgnoreNormal || face2.nIndexNormal[i2] == face.nIndexNormal[i] ) &&
+                                            (bIgnoreTangent1 || face2.nIndexVertex[i2] == face.nIndexVertex[i] ) &&
                                             !face2.bProcessed[i2] &&
-                                            face.nSmoothingGroup & face2.nSmoothingGroup)
+                                            (!bIgnoreNormal || (face.nSmoothingGroup & face2.nSmoothingGroup)))
                                         {
                                             //If we find a reference to the exact same vert, we have to link to it
                                             //Actually we only need to link vert indices, the correct UV are now already included in the Vertex struct
-                                            face2.nIndexVertex[i2] = node.Mesh.Vertices.size();
+                                            face2.nIndexVertex[i2] = CheckedAsciiVertexIndex(node.Mesh.Vertices.size(), "ASCII mesh post-processing");
                                             face2.bProcessed[i2] = true;
                                         }
                                     }
@@ -524,7 +923,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                         }
 
                         //Now we're allowed to link the original vert as well
-                        face.nIndexVertex[i] = node.Mesh.Vertices.size();
+                        face.nIndexVertex[i] = CheckedAsciiVertexIndex(node.Mesh.Vertices.size(), "ASCII mesh post-processing");
                         face.bProcessed[i] = true;
 
                         //Put the new vert into the array
@@ -558,6 +957,16 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                                     face.vNormal.fY * v1.fY +
                                     face.vNormal.fZ * v1.fZ);
 
+                // When the binary face runtime fields were
+                // supplied, keep them rather than mutating them during compile.
+                // Area/bounds/tangent calculations below still use the preserved
+                // face plane so user-visible edits can coexist with preservation.
+                if(face.bPreserveRuntimeFaceData){
+                    face.vNormal = face.vPreservedNormal;
+                    face.fDistance = face.fPreservedDistance;
+                    face.nAdjacentFaces = face.nPreservedAdjacentFaces;
+                }
+
                 /// Area calculation
                 face.fArea = HeronFormulaEdge(Edge1, Edge2, Edge3);
                 face.fAreaUV = HeronFormulaEdge(EUV1, EUV2, EUV3);
@@ -572,13 +981,13 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                     r = 1.0 / r;
                 }
                 else{
-                    /**
+                    /*
                     It can be 0 in several ways.
                     1. any of the two edges is zero (ie. we're dealing with a line, not a triangle) - this happens
                     2. both x's or both y's are zero, implying parallel edges, but we cannot have any in a triangle
                     3. both x's are the same and both y's are the same, therefore they have the same angle and are parallel
                     4. both edges have the same x and y, they both have a 45° angle and are therefore parallel
-                    /**/
+                    */
                     //ndix UR's magic factor
                     r = 2406.6388;
                 }
@@ -623,7 +1032,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
             node.Mesh.vAverage = Vector(0.0, 0.0, 0.0);
             node.Mesh.vBBmin = Vector(0.0, 0.0, 0.0); /// Wrong, but Bioware-correct
             node.Mesh.vBBmax = Vector(0.0, 0.0, 0.0); /// Wrong, but Bioware-correct
-            for(int v = 0; v < vectorarray.size(); v++){
+            for(int v = 0; v < static_cast<int>(vectorarray.size()); v++){
                 node.Mesh.vBBmin.fX = std::min(node.Mesh.vBBmin.fX, vectorarray.at(v).fX);
                 node.Mesh.vBBmin.fY = std::min(node.Mesh.vBBmin.fY, vectorarray.at(v).fY);
                 node.Mesh.vBBmin.fZ = std::min(node.Mesh.vBBmin.fZ, vectorarray.at(v).fZ);
@@ -638,71 +1047,80 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
 
             /// Now find the radius as well!
             node.Mesh.fRadius = 0.0;
-            for(int v = 0; v < vectorarray.size(); v++){
+            for(int v = 0; v < static_cast<int>(vectorarray.size()); v++){
                 node.Mesh.fRadius = std::max(node.Mesh.fRadius, Vector(vectorarray.at(v) - node.Mesh.vAverage).GetLength());
                 //if(v % 1000 == 0) std::cout << "Done with radius for vert " << v << std::endl;
             }
             //std::cout << "Done with radius for verts" << std::endl;
 
-            //Calculate adjacent faces
-            for(int f = 0; f < node.Mesh.Faces.size(); f++){
-                Face & face = node.Mesh.Faces.at(f);
-                nStepper++;
-                if(nStepper % nUnit == 0) ProgressStepIt();
+            //Calculate adjacent faces unless the ASCII supplied binary face
+            //runtime data for every face. In that case an invalid adjacency value
+            //is intentional boundary data, not something to fill in.
+            bool bPreserveAllRuntimeFaceData = !node.Mesh.Faces.empty();
+            for(Face & facePreserveCheck : node.Mesh.Faces){
+                if(!facePreserveCheck.bPreserveRuntimeFaceData){
+                    bPreserveAllRuntimeFaceData = false;
+                    break;
+                }
+            }
+            if(!bPreserveAllRuntimeFaceData){
+                for(int f = 0; f < static_cast<int>(node.Mesh.Faces.size()); f++){
+                    Face & face = node.Mesh.Faces.at(f);
 
-                // Skip if none is -1
-                if(face.nAdjacentFaces[0].Valid() &&
-                   face.nAdjacentFaces[1].Valid() &&
-                   face.nAdjacentFaces[2].Valid() ) continue;
-
-                //Go through all the faces coming after this one
-                for(int f2 = f+1; f2 < node.Mesh.Faces.size(); f2++){
-                    Face & compareface = node.Mesh.Faces.at(f2);
-                    std::vector<bool> VertMatches(3, false);
-                    std::vector<bool> VertMatchesCompare(3, false);
-                    for(int i3 = 0; i3 < 3; i3++){
-                        unsigned short nVertIndex = face.nIndexVertex[i3];
-                        Vector & ourvect = node.Mesh.Vertices.at(nVertIndex).vFromRoot;
-                        for(int i4 = 0; i4 < 3; i4++){
-                            Vector & othervect = node.Mesh.Vertices.at(compareface.nIndexVertex[i4]).vFromRoot;
-                            if(ourvect.Compare(othervect)){
-                                VertMatches.at(i3) = true;
-                                VertMatchesCompare.at(i4) = true;
-                                i4 = 3; // we can only have one matching vert in a face per vert. Once we find a match, we're done.
-                            }
-                        }
-                    }
-                    if(VertMatches.at(0) && VertMatches.at(1)){
-                        if(face.nAdjacentFaces[0].Valid()) ReportMdl<<"Found an additional adjacent face on edge 0 for face " << f << " on '" << Data.MH.Names.at(node.Head.nNameIndex).sName << "'...\n";
-                        else face.nAdjacentFaces[0] = f2;
-                    }
-                    else if(VertMatches.at(1) && VertMatches.at(2)){
-                        if(face.nAdjacentFaces[1].Valid()) ReportMdl<<"Found an additional adjacent face on edge 1 for face " << f << " on '" << Data.MH.Names.at(node.Head.nNameIndex).sName << "'...\n";
-                        else face.nAdjacentFaces[1] = f2;
-                    }
-                    else if(VertMatches.at(2) && VertMatches.at(0)){
-                        if(face.nAdjacentFaces[2].Valid()) ReportMdl<<"Found an additional adjacent face on edge 2 for face " << f << " on '" << Data.MH.Names.at(node.Head.nNameIndex).sName << "'...\n";
-                        else face.nAdjacentFaces[2] = f2;
-                    }
-                    if(VertMatchesCompare.at(0) && VertMatchesCompare.at(1)){
-                        if(compareface.nAdjacentFaces[0].Valid()) ReportMdl<<"Found an additional adjacent face on edge 0 for face " << f2 << " on '" << Data.MH.Names.at(node.Head.nNameIndex).sName << "'...\n";
-                        else compareface.nAdjacentFaces[0] = f;
-                    }
-                    else if(VertMatchesCompare.at(1) && VertMatchesCompare.at(2)){
-                        if(compareface.nAdjacentFaces[1].Valid()) ReportMdl<<"Found an additional adjacent face on edge 1 for face " << f2 << " on '" << Data.MH.Names.at(node.Head.nNameIndex).sName << "'...\n";
-                        else compareface.nAdjacentFaces[1] = f;
-                    }
-                    else if(VertMatchesCompare.at(2) && VertMatchesCompare.at(0)){
-                        if(compareface.nAdjacentFaces[2].Valid()) ReportMdl<<"Found an additional adjacent face on edge 2 for face " << f2 << " on '" << Data.MH.Names.at(node.Head.nNameIndex).sName << "'...\n";
-                        else compareface.nAdjacentFaces[2] = f;
-                    }
+                    // Skip if none is -1
                     if(face.nAdjacentFaces[0].Valid() &&
                        face.nAdjacentFaces[1].Valid() &&
-                       face.nAdjacentFaces[2].Valid() ){
-                        f2 = node.Mesh.Faces.size(); //Found them all, maybe I finish early?
+                       face.nAdjacentFaces[2].Valid() ) continue;
+
+                    //Go through all the faces coming after this one
+                    for(int f2 = f+1; f2 < static_cast<int>(node.Mesh.Faces.size()); f2++){
+                        Face & compareface = node.Mesh.Faces.at(f2);
+                        std::vector<bool> VertMatches(3, false);
+                        std::vector<bool> VertMatchesCompare(3, false);
+                        for(int i3 = 0; i3 < 3; i3++){
+                            unsigned short nVertIndex = face.nIndexVertex[i3];
+                            Vector & ourvect = node.Mesh.Vertices.at(nVertIndex).vFromRoot;
+                            for(int i4 = 0; i4 < 3; i4++){
+                                Vector & othervect = node.Mesh.Vertices.at(compareface.nIndexVertex[i4]).vFromRoot;
+                                if(ourvect.Compare(othervect)){
+                                    VertMatches.at(i3) = true;
+                                    VertMatchesCompare.at(i4) = true;
+                                    i4 = 3; // we can only have one matching vert in a face per vert. Once we find a match, we're done.
+                                }
+                            }
+                        }
+                        if(VertMatches.at(0) && VertMatches.at(1)){
+                            if(face.nAdjacentFaces[0].Valid()) ReportMdl<<"Found an additional adjacent face on edge 0 for face " << f << " on '" << Data.MH.Names.at(node.Head.nNameIndex).sName << "'...\n";
+                            else face.nAdjacentFaces[0] = f2;
+                        }
+                        else if(VertMatches.at(1) && VertMatches.at(2)){
+                            if(face.nAdjacentFaces[1].Valid()) ReportMdl<<"Found an additional adjacent face on edge 1 for face " << f << " on '" << Data.MH.Names.at(node.Head.nNameIndex).sName << "'...\n";
+                            else face.nAdjacentFaces[1] = f2;
+                        }
+                        else if(VertMatches.at(2) && VertMatches.at(0)){
+                            if(face.nAdjacentFaces[2].Valid()) ReportMdl<<"Found an additional adjacent face on edge 2 for face " << f << " on '" << Data.MH.Names.at(node.Head.nNameIndex).sName << "'...\n";
+                            else face.nAdjacentFaces[2] = f2;
+                        }
+                        if(VertMatchesCompare.at(0) && VertMatchesCompare.at(1)){
+                            if(compareface.nAdjacentFaces[0].Valid()) ReportMdl<<"Found an additional adjacent face on edge 0 for face " << f2 << " on '" << Data.MH.Names.at(node.Head.nNameIndex).sName << "'...\n";
+                            else compareface.nAdjacentFaces[0] = f;
+                        }
+                        else if(VertMatchesCompare.at(1) && VertMatchesCompare.at(2)){
+                            if(compareface.nAdjacentFaces[1].Valid()) ReportMdl<<"Found an additional adjacent face on edge 1 for face " << f2 << " on '" << Data.MH.Names.at(node.Head.nNameIndex).sName << "'...\n";
+                            else compareface.nAdjacentFaces[1] = f;
+                        }
+                        else if(VertMatchesCompare.at(2) && VertMatchesCompare.at(0)){
+                            if(compareface.nAdjacentFaces[2].Valid()) ReportMdl<<"Found an additional adjacent face on edge 2 for face " << f2 << " on '" << Data.MH.Names.at(node.Head.nNameIndex).sName << "'...\n";
+                            else compareface.nAdjacentFaces[2] = f;
+                        }
+                        if(face.nAdjacentFaces[0].Valid() &&
+                           face.nAdjacentFaces[1].Valid() &&
+                           face.nAdjacentFaces[2].Valid() ){
+                            f2 = node.Mesh.Faces.size(); //Found them all, maybe I finish early?
+                        }
                     }
+                    //if(f % 100 == 0) std::cout << "Done with face " << f << std::endl;
                 }
-                //if(f % 100 == 0) std::cout << "Done with face " << f << std::endl;
             }
             //std::cout << "Done with faces" << std::endl;
 
@@ -717,15 +1135,23 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
             node.Mesh.TempTverts1.resize(0);
             node.Mesh.TempTverts2.resize(0);
             node.Mesh.TempTverts3.resize(0);
+            node.Mesh.TempNormals.resize(0);
+            node.Mesh.TempTangent1.resize(0);
             node.Dangly.TempConstraints.resize(0);
             node.Skin.TempWeights.resize(0);
+            node.Skin.TempCompactBoneNameIndices.resize(0);
+            node.Skin.TempCompactBoneRawIndices.resize(0);
             node.Mesh.TempVerts.shrink_to_fit();
             node.Mesh.TempTverts.shrink_to_fit();
             node.Mesh.TempTverts1.shrink_to_fit();
             node.Mesh.TempTverts2.shrink_to_fit();
             node.Mesh.TempTverts3.shrink_to_fit();
+            node.Mesh.TempNormals.shrink_to_fit();
+            node.Mesh.TempTangent1.shrink_to_fit();
             node.Dangly.TempConstraints.shrink_to_fit();
             node.Skin.TempWeights.shrink_to_fit();
+            node.Skin.TempCompactBoneNameIndices.shrink_to_fit();
+            node.Skin.TempCompactBoneRawIndices.shrink_to_fit();
         }
         //ReportMdl << "PART 3 - stage 3" << "\n";
 
@@ -859,7 +1285,8 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                                   Blade1VertArray[7], Blade1VertArray[6], Blade1VertArray[5], Blade1VertArray[4]};
                     }
 
-                    node.Saber.SaberData.reserve(50);
+                    node.Saber.SaberData.clear();
+                    node.Saber.SaberData.reserve(176);
                     node.Saber.SaberData.push_back(VertexData(node.Mesh.Vertices.at(Blade1.at(0)), node.Mesh.Vertices.at(Blade1.at(0)).MDXData.vUV1));
                     node.Saber.SaberData.push_back(VertexData(node.Mesh.Vertices.at(Blade1.at(1)), node.Mesh.Vertices.at(Blade1.at(1)).MDXData.vUV1));
                     node.Saber.SaberData.push_back(VertexData(node.Mesh.Vertices.at(Blade1.at(2)), node.Mesh.Vertices.at(Blade1.at(2)).MDXData.vUV1));
@@ -898,7 +1325,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
         }
         //ReportMdl << "PART 3 - stage 4" << "\n";
 
-        if(node.Head.nType & NODE_SABER){
+        if(node.Head.nType & NODE_SABER && !node.Saber.bPreserveSaberData){
             std::array<std::array<int, 3>, 12> FaceIndices = {{{0,4,5},{1,0,5},{1,5,2},
                                                               {2,5,6},{3,2,6},{3,6,7},
                                                               {88+4,88+0,88+5},{88+0,88+1,88+5},{88+5,88+1,88+2},
@@ -928,7 +1355,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                     for(int i = 0; i < 3; i++){
                         if(FaceIndices[f][i] == nCurrent){
                             Vector vAdd = vFaceNormals[f];
-                            if(bSmoothAreaWeighting) vAdd *= fFaceAreas[f];
+                            if(bSmoothAreaWeighting) vAdd *= (fFaceAreas[f] > 0.000001 ? fFaceAreas[f] : 0.0);
                             if(bSmoothAngleWeighting){
                                 if(i == 0){
                                     vAdd *= Angle(node.Saber.SaberData.at(FaceIndices[f][2]).vVertex - node.Saber.SaberData.at(FaceIndices[f][0]).vVertex,
@@ -949,8 +1376,8 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                 }
                 vCurrent.Normalize();
             }
-            for(int v = 0; v < node.Saber.SaberData.size(); v++){
-                if(v < node.Saber.SaberData.size()/2) node.Saber.SaberData.at(v).vNormal = vVertNormals.at(v%4);
+            for(int v = 0; v < static_cast<int>(node.Saber.SaberData.size()); v++){
+                if(v < static_cast<int>(node.Saber.SaberData.size())/2) node.Saber.SaberData.at(v).vNormal = vVertNormals.at(v%4);
                 else node.Saber.SaberData.at(v).vNormal = vVertNormals.at(4 + v%4);
             }
             node.Mesh.Vertices.reserve(node.Saber.SaberData.size());
@@ -976,25 +1403,40 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
             else{
                 Wok.reset(new WOK());
                 std::vector<Face*> allfaces;
-                for(int f = 0; f < node.Mesh.Faces.size(); f++){
+                for(int f = 0; f < static_cast<int>(node.Mesh.Faces.size()); f++){
                     allfaces.push_back(&node.Mesh.Faces.at(f));
                 }
                 std::stringstream file2;
-                BuildAabbTree(node.Walkmesh.RootAabb, allfaces, &file2);
+                bool bUsedPreservedAabb = false;
+                if(node.Walkmesh.bPreserveAabbTree && !node.Walkmesh.TempAabbNodes.empty()){
+                    unsigned int nAabbCursor = 0;
+                    Aabb preservedRoot;
+                    bUsedPreservedAabb = BuildPreservedAabbRecursive(node.Walkmesh.TempAabbNodes, nAabbCursor, preservedRoot) &&
+                                         nAabbCursor == node.Walkmesh.TempAabbNodes.size();
+                    if(bUsedPreservedAabb){
+                        node.Walkmesh.RootAabb = preservedRoot;
+                    }
+                    else{
+                        throw mdlexception("Preserved AABB tree for '" + Data.MH.Names.at(node.Head.nNameIndex).sName +
+                                           "' is malformed; refusing to rebuild it from faces and erase the supplied tree structure.");
+                    }
+                }
+                if(!bUsedPreservedAabb){
+                    BuildAabb(node.Walkmesh.RootAabb, allfaces, &file2);
+                }
+                else{
+                    file2 << "Preserved AABB tree from ASCII; offsets will be regenerated during binary write.\r\n";
+                }
 
                 //Write to Wok
                 std::stringstream file;
-                ReportMdl << "Generating WOK.\n";
-                Wok->CalculateWokData(node, Data.MH.vLytPosition, &file);
+                ReportMdl << "Should write wok.\n";
+                Wok->WriteWok(node, Data.MH.vLytPosition, &file);
                 file << "\r\n\r\nAABB\r\n";
                 file << file2.str();
 
                 if(bDebug){
-                    std::wstring sDir = GetFullPath();
-                    sDir.reserve(MAX_PATH);
-                    PathRemoveFileSpecW(&sDir[0]);
-                    sDir.resize(wcslen(sDir.c_str()));
-                    sDir += L"\\debug_aabb.txt";
+                    std::wstring sDir = JoinPath(ParentPath(GetFullPath()), L"debug_aabb.txt");
                     ReportMdl << "Will write aabb debug to: " << to_ansi(sDir.c_str()) << "\n";
                     HANDLE hFile = bead_CreateWriteFile(sDir);
 
@@ -1012,9 +1454,10 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
             }
         }
         //ReportMdl << "PART 3 - stage 6" << "\n";
+        ProgressPos(n);
     }
     //ReportMdl << "Done with PART 3\n";
-    ProgressPos(nNumFacesTotal);
+    ProgressPos(Data.MH.ArrayOfNodes.size());
 
     /// PART 4 ///
     /// Do the necessary mesh calculations
@@ -1022,7 +1465,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
     /// Skin: T-bones, Q-bones
     /// Saber: inverted counter
     int nMeshCounter = 0;
-    for(int n = 0; n < Data.MH.ArrayOfNodes.size(); n++){
+    for(int n = 0; n < static_cast<int>(Data.MH.ArrayOfNodes.size()); n++){
         Node & node = Data.MH.ArrayOfNodes.at(n);
 
         if(node.Head.nType & NODE_SABER && !node.Saber.nInvCount1.Valid() && !node.Saber.nInvCount2.Valid()){
@@ -1054,8 +1497,8 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                 /// Now we need to construct a path by adding all the locations from this node through all its parents to the root
                 MdlInteger<unsigned short> nIndex = node.Head.nNameIndex; /// The first name index is the name index of the skin we are processing
                 while(nIndex.Valid()){
-                    MdlInteger<unsigned short> nNodeIndex = GetNodeIndexByNameIndex(nIndex); /// Get the node index for the ancestor
-                    if(!nNodeIndex.Valid()) throw mdlexception("T and Q bone calculation error: dealing with a name index that does not have a node in geometry.");
+                    int nNodeIndex = GetNodeIndexByNameIndex(nIndex); /// Get the node index for the ancestor
+                    if(nNodeIndex == -1) throw mdlexception("T and Q bone calculation error: dealing with a name index that does not have a node in geometry.");
                     Node & ancestor = Data.MH.ArrayOfNodes.at(nNodeIndex); /// Get the ancestor
 
                     /// Get ancestor location and get the vectors from it
@@ -1090,15 +1533,15 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                 std::vector<int> Indices; // This vector will contain the indices from the skin to the root in order.
                 while(nIndex.Valid()){ // The price we have to pay for not going recursive
                     Indices.push_back(nIndex);
-                    MdlInteger<unsigned short> nNodeIndex = GetNodeIndexByNameIndex(nIndex);
-                    if(!nNodeIndex.Valid()) throw mdlexception("T and Q bone calculation error: dealing with a name index that does not have a node in geometry.");
+                    int nNodeIndex = GetNodeIndexByNameIndex(nIndex);
+                    if(nNodeIndex == -1) throw mdlexception("T and Q bone calculation error: dealing with a name index that does not have a node in geometry.");
                     nIndex = Data.MH.ArrayOfNodes.at(nNodeIndex).Head.nParentIndex;
                 }
 
                 /// Now we go from the root to the skin...
-                for(int a = Indices.size() - 1; a >= 0; a--){
-                    MdlInteger<unsigned short> nNodeIndex = GetNodeIndexByNameIndex(Indices.at(a)); /// Get the node index for the ancestor
-                    if(!nNodeIndex.Valid()) throw mdlexception("T and Q bone calculation error: dealing with a name index that does not have a node in geometry.");
+                for(std::size_t a = Indices.size(); a-- > 0;){
+                    int nNodeIndex = GetNodeIndexByNameIndex(Indices.at(a)); /// Get the node index for the ancestor
+                    if(nNodeIndex == -1) throw mdlexception("T and Q bone calculation error: dealing with a name index that does not have a node in geometry.");
                     Node & ancestor = Data.MH.ArrayOfNodes.at(nNodeIndex); /// Get the ancestor
 
                     /// Get ancestor location and get the vectors from it
@@ -1140,15 +1583,15 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
                     Indices.clear(); // Reuse the indices vector
                     while(nIndex.Valid()){ // The price we have to pay for not going recursive
                         Indices.push_back(nIndex);
-                        MdlInteger<unsigned short> nNodeIndex = GetNodeIndexByNameIndex(nIndex);
-                        if(!nNodeIndex.Valid()) throw mdlexception("T and Q bone calculation error: dealing with a name index that does not have a node in geometry.");
+                        int nNodeIndex = GetNodeIndexByNameIndex(nIndex);
+                        if(nNodeIndex == -1) throw mdlexception("T and Q bone calculation error: dealing with a name index that does not have a node in geometry.");
                         nIndex = Data.MH.ArrayOfNodes.at(nNodeIndex).Head.nParentIndex;
                     }
 
                     /// Now we go from the root to the bone...
-                    for(int a = Indices.size() - 1; a >= 0; a--){
-                        MdlInteger<unsigned short> nNodeIndex = GetNodeIndexByNameIndex(Indices.at(a)); /// Get the node index for the ancestor
-                        if(!nNodeIndex.Valid()) throw mdlexception("T and Q bone calculation error: dealing with a name index that does not have a node in geometry.");
+                    for(std::size_t a = Indices.size(); a-- > 0;){
+                        int nNodeIndex = GetNodeIndexByNameIndex(Indices.at(a)); /// Get the node index for the ancestor
+                        if(nNodeIndex == -1) throw mdlexception("T and Q bone calculation error: dealing with a name index that does not have a node in geometry.");
                         Node & ancestor = Data.MH.ArrayOfNodes.at(nNodeIndex); /// Get the ancestor
 
                         /// Get ancestor location and get the vectors from it
@@ -1179,7 +1622,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
 
                     /// Convert the name index into the tree order index
                     int nNodeIndex = 0;
-                    for(int ind2 = 0; ind2 < Data.MH.NameIndicesInTreeOrder.size(); ind2++)
+                    for(int ind2 = 0; ind2 < static_cast<int>(Data.MH.NameIndicesInTreeOrder.size()); ind2++)
                         if(Data.MH.NameIndicesInTreeOrder.at(ind2) == bone.Head.nNameIndex)
                             nNodeIndex = ind2;
 
@@ -1200,7 +1643,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
     /// PART 6 ///
     /// Calculate vertex normals and vertex tangent space vectors
     Report("Calculating vertex normals and vertex tangent space vectors...");
-    for(int pg = 0; pg < Data.MH.PatchArrayPointers.size(); pg++){
+    for(int pg = 0; pg < static_cast<int>(Data.MH.PatchArrayPointers.size()); pg++){
         std::vector<Patch> & patch_group = Data.MH.PatchArrayPointers.at(pg);
         int nPatchCount = Data.MH.PatchArrayPointers.at(pg).size();
 
@@ -1213,7 +1656,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
         for(int p = 0; p < nPatchCount; p++){
             Patch & patch = Data.MH.PatchArrayPointers.at(pg).at(p);
 
-            patch.CalculateWorld(true, true);
+            CalculateWorld(*this, Data, patch, true, true);
         }
 
         /*****************************/
@@ -1228,7 +1671,7 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
             Vertex & vert = Data.MH.ArrayOfNodes.at(patch.nNodeArrayIndex).Mesh.Vertices.at(patch.nVertex);
 
             /// Determine for this patch which patches it smooths to
-            for(int n = 0; n < patch_group.size(); n++){
+            for(int n = 0; n < static_cast<int>(patch_group.size()); n++){
                 Patch & curpatch = patch_group.at(n);
 
                 /// If this patch is not smoothed to, continue
@@ -1239,13 +1682,16 @@ void MDL::AsciiPostProcess(std::vector<std::string> & sBumpmapped){
             }
 
             /// Calculate both the vertex normals and tangent space vectors
-            patch.Calculate(true, true);
+            CalculateVertex(*this, Data, patch, true, true);
 
-            /// Apply the candidates
-            vert.MDXData.vNormal = patch.vVertexNormal;
-            vert.MDXData.vTangent1.at(0) = patch.vVertexB;
-            vert.MDXData.vTangent1.at(1) = patch.vVertexT;
-            vert.MDXData.vTangent1.at(2) = patch.vVertexN;
+            /// Apply the candidates. If ASCII supplied explicit normals, preserve
+            /// those binary normals instead of recomputing them from smoothing groups.
+            if(!node.Mesh.bPreserveMdxNormals) vert.MDXData.vNormal = patch.vVertexNormal;
+            if(!node.Mesh.bPreserveMdxTangent1){
+                vert.MDXData.vTangent1.at(0) = patch.vVertexB;
+                vert.MDXData.vTangent1.at(1) = patch.vVertexT;
+                vert.MDXData.vTangent1.at(2) = patch.vVertexN;
+            }
         }
     }
 
@@ -1265,17 +1711,21 @@ void MDL::BwmAsciiPostProcess(BWMHeader & data, std::vector<Vector> & vertices, 
         data.vDwk2 = data.vUse2 + data.vPosition;
     }
 
-    for(int f = 0; f < data.faces.size(); f++){
+    for(int f = 0; f < static_cast<int>(data.faces.size()); f++){
         Face & face = data.faces.at(f);
         for(int i = 0; i < 3; i++){
             if(!face.bProcessed[i]){
                 Vertex vert;
 
-                if(vertices.size() > 0)
+                if(vertices.size() > 0){
+                    if(!face.nIndexVertex[i].Valid() || static_cast<unsigned short>(face.nIndexVertex[i]) >= vertices.size()){
+                        throw mdlexception("ASCII walkmesh face references a vertex outside the source vertex array.");
+                    }
                     vert.assign(vertices.at(face.nIndexVertex[i]));
+                }
 
                 //Find identical verts
-                for(int f2 = f; f2 < data.faces.size(); f2++){
+                for(int f2 = f; f2 < static_cast<int>(data.faces.size()); f2++){
                     Face & face2 = data.faces.at(f2);
                     for(int i2 = 0; i2 < 3; i2++){
                         //Make sure that we're only changing what's past our current position if we are in the same face.
@@ -1283,7 +1733,7 @@ void MDL::BwmAsciiPostProcess(BWMHeader & data, std::vector<Vector> & vertices, 
                             if( (face2.nIndexVertex[i2] == face.nIndexVertex[i]) &&
                                 !face2.bProcessed[i2] )
                             {
-                                face2.nIndexVertex[i2] = data.verts.size();
+                                face2.nIndexVertex[i2] = CheckedAsciiVertexIndex(data.verts.size(), "ASCII walkmesh post-processing");
                                 face2.bProcessed[i2] = true;
                             }
                         }
@@ -1291,7 +1741,7 @@ void MDL::BwmAsciiPostProcess(BWMHeader & data, std::vector<Vector> & vertices, 
                 }
 
                 //Now we're allowed to link the original vert as well
-                face.nIndexVertex[i] = data.verts.size();
+                face.nIndexVertex[i] = CheckedAsciiVertexIndex(data.verts.size(), "ASCII walkmesh post-processing");
                 face.bProcessed[i] = true;
 
                 //Put the new vert into the array
@@ -1304,7 +1754,6 @@ void MDL::BwmAsciiPostProcess(BWMHeader & data, std::vector<Vector> & vertices, 
         Vector & v3 = data.verts.at(face.nIndexVertex[2]);
         Vector Edge1 = v2 - v1;
         Vector Edge2 = v3 - v1;
-        Vector Edge3 = v3 - v2;
 
         //This is for face normal
         face.vNormal = cross(Edge1, Edge2); //Cross product, unnormalized
@@ -1318,7 +1767,7 @@ void MDL::BwmAsciiPostProcess(BWMHeader & data, std::vector<Vector> & vertices, 
 
     /*
     //Calculate adjacent edges
-    for(int f = 0; f < data.faces.size(); f++){
+    for(int f = 0; f < static_cast<int>(data.faces.size()); f++){
         Face & face = data.faces.at(f);
 
         face.nID = f;

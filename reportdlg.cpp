@@ -1,6 +1,6 @@
 #include "general.h"
+#include "win32_compat.h"
 #include "MDL.h"
-#include <Shlwapi.h>
 #include <fstream>
 #include <regex>
 #include <algorithm>
@@ -16,9 +16,6 @@ class ReportDlgWindow{
     HWND hMe;
     ReportDlgWindow(MDL & Mdl);
     bool Run();
-    void SetData(MDL & Mdl){
-        MdlPtr = &Mdl;
-    }
     friend LRESULT CALLBACK ReportDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 };
 
@@ -31,7 +28,7 @@ ReportDlgWindow::ReportDlgWindow(MDL & Mdl): MdlPtr(&Mdl) {
     // #1 Basics
     WindowClass.cbSize = sizeof(WNDCLASSEX); // Must always be sizeof(WNDCLASSEX)
     WindowClass.lpszClassName = cClassName; // Name of this class
-    WindowClass.hInstance = GetModuleHandle(NULL); // Instance of the application
+    WindowClass.hInstance = GetModuleHandle(nullptr); // Instance of the application
     WindowClass.lpfnWndProc = ReportDlgWindowProc; // Pointer to callback procedure
 
     // #2 Class styles
@@ -44,8 +41,8 @@ ReportDlgWindow::ReportDlgWindow(MDL & Mdl): MdlPtr(&Mdl) {
     WindowClass.hCursor = LoadCursor(NULL, IDC_ARROW); // Class cursor
 
     // #5 Icon
-    WindowClass.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Class Icon
-    WindowClass.hIconSm = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Small icon for this class
+    WindowClass.hIcon = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Class Icon
+    WindowClass.hIconSm = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Small icon for this class
 
     // #6 Menu
     WindowClass.lpszMenuName = MAKEINTRESOURCE(IDM_EDITOR_DLG); // Menu Resource
@@ -65,9 +62,9 @@ bool ReportDlgWindow::Run(){
         bRegistered = true;
     }
     //HMENU *has* to be NULL!!!!! Otherwise the function fails to create the window!
-    hMe = CreateWindowEx(NULL, WindowClass.lpszClassName, "", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    hMe = CreateWindowEx(0, WindowClass.lpszClassName, "", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                          CW_USEDEFAULT, CW_USEDEFAULT, 600, 300,
-                         HWND_DESKTOP, NULL, GetModuleHandle(NULL), this);
+                         HWND_DESKTOP, nullptr, GetModuleHandle(nullptr), this);
     if(!hMe) return false;
     ShowWindow(hMe, true);
     return true;
@@ -114,9 +111,9 @@ LRESULT CALLBACK ReportDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPA
             );
 
             GetClientRect(hwnd, &rcClient);
-            hEdit = CreateWindowEx(NULL, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOHSCROLL | ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY,
+            hEdit = CreateWindowEx(0, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOHSCROLL | ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY,
                            rcClient.left, rcClient.top, rcClient.right, rcClient.bottom,
-                           hwnd, (HMENU) IDDB_EDIT, GetModuleHandle(NULL), NULL);
+                           hwnd, (HMENU) IDDB_EDIT, GetModuleHandle(nullptr), nullptr);
             SendMessage(hEdit, WM_SETFONT, (WPARAM) hFont1, MAKELPARAM(TRUE, 0));
 
             std::string sContents (reportdlg->MdlPtr->GetReport().str());
@@ -128,9 +125,7 @@ LRESULT CALLBACK ReportDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPA
         break;
         case WM_COMMAND:
         {
-            int nNotification = HIWORD(wParam);
             int nID = LOWORD(wParam);
-            HWND hControl = (HWND) lParam;
             switch(nID){
                 case IDDB_SAVE:
                 {
@@ -142,8 +137,19 @@ LRESULT CALLBACK ReportDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPA
                     if(safesubstr(sFile, sFile.size() - 4, 4) == L".mdl") sFile = safesubstr(sFile, 0, sFile.size() - 4);
                     sFile += L"_report.txt";
 
-                    OPENFILENAMEW ofn;                    ZeroMemory(&ofn, sizeof(ofn));                    ofn.lStructSize = sizeof(ofn);                    ofn.hwndOwner = hwnd;                    ofn.nMaxFile = MAX_PATH;                    ofn.lpstrFile = &sFile.front(); //The open dialog will update sFile with the file path                    ofn.lpstrFilter = L"Text file (*.txt)\0*.txt\0";                    ofn.nFilterIndex = 1;                    ofn.Flags = OFN_PATHMUSTEXIST;
-                    while(true){                        if(GetSaveFileNameW(&ofn)){
+                    OPENFILENAMEW ofn;
+                    ZeroMemory(&ofn, sizeof(ofn));
+                    ofn.lStructSize = sizeof(ofn);
+                    ofn.hwndOwner = hwnd;
+                    ofn.nMaxFile = MAX_PATH;
+                    ofn.lpstrFilter = L"Text file (*.txt)\0*.txt\0";
+                    ofn.nFilterIndex = 1;
+                    ofn.Flags = OFN_PATHMUSTEXIST;
+                    while(true){
+                        PrepareFileDialogBuffer(sFile);
+                        ofn.lpstrFile = &sFile.front(); //The open dialog will update sFile with the file path
+                        if(GetSaveFileNameW(&ofn)){
+                            TrimFileDialogBuffer(sFile);
                             /// Now we check if this file exists already
                             if(PathFileExistsW(sFile.c_str())){
                                 int nDecision = WarningYesNoCancel(L"The file '" + std::wstring(PathFindFileNameW(sFile.c_str())) + L"' already exists! Do you want to overwrite?");
@@ -168,7 +174,9 @@ LRESULT CALLBACK ReportDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 
                             /// Write and close file
                             //file << reportdlg->MdlPtr->GetReport().str();
-                            bead_WriteFile(hFile, reportdlg->MdlPtr->GetReport().str());
+                            if(!bead_WriteFile(hFile, reportdlg->MdlPtr->GetReport().str())){
+                                std::cout << "File write failed for " << to_ansi(sFile) << ".\n";
+                            }
                             //file.close();
                             CloseHandle(hFile);
 
@@ -185,7 +193,7 @@ LRESULT CALLBACK ReportDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPA
         break;
         case WM_SIZE:
         {
-            SetWindowPos(hEdit, NULL, rcClient.left, rcClient.top, rcClient.right, rcClient.bottom, NULL);
+            SetWindowPos(hEdit, nullptr, rcClient.left, rcClient.top, rcClient.right, rcClient.bottom, 0);
         }
         break;
         case WM_CTLCOLORSTATIC:

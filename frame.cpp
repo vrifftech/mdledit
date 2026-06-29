@@ -1,7 +1,7 @@
 #include "frame.h"
 //#include "edits.h"
 #include <windowsx.h>
-#include <Shlwapi.h>
+#include <shlwapi.h>
 #include "MDL.h"
 
 char Frame::cClassName[] = "mdleditframe";
@@ -19,28 +19,30 @@ ReportObject ReportModel(Model);
 bool bSaveReport = false;
 bool bShowHex = false;
 bool bShowDiff = true;
-bool bShowCmpHilite = true;
 bool bShowGroup = false;
 bool bShowDataStruct = false;
 bool bHexLocation = false;
 bool bAnalyze = false;
 bool bModelHierarchy = false;
-bool bAutoScroll = true;
 unsigned nEditSize = ME_DISPLAY_SIZE_Y;
 const int nCompactOffsetTop = 1;
 const int nCompactOffsetBottom = 1;
 const int nCompactOffsetLeft = 1;
 const int nCompactOffsetRight = 1;
 std::wstring sExePath;
-Version version (1,1,0, false);
+Version version (1,0,5, true);
 WNDPROC MainTreeProc = NULL;
 WNDPROC MainDisplayProc = NULL;
 LRESULT APIENTRY TreeSubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 LRESULT APIENTRY DisplaySubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 bool bEditDrag = false;
 HHOOK hMessageHook = NULL;
-RECT rcWindowHex, rcWindowNonHex;
-bool bNoSaveWindowPos = false;
+namespace {
+    constexpr int WINDOW_NONHEX_WIDTH = 368;
+    constexpr int WINDOW_NONHEX_HEIGHT = 610;
+    constexpr int WINDOW_HEX_WIDTH = 980;
+    constexpr int WINDOW_HEX_HEIGHT = 610;
+}
 HFONT hMonospace = NULL, hShell = NULL, hTimes = NULL;
 
 void FixHead(){
@@ -59,9 +61,24 @@ Frame::Frame(HINSTANCE hInstanceCreate){
     hInstance = hInstanceCreate; // Save Instance handle
 
     /// Save executable path
-    sExePath.resize(MAX_PATH + 1, 0);
-    GetModuleFileNameW(hInstance, &sExePath.front(), MAX_PATH + 1);
-    sExePath = sExePath.c_str();
+    DWORD nExePathSize = MAX_PATH;
+    for(;;){
+        sExePath.assign(nExePathSize, L'\0');
+        DWORD nChars = GetModuleFileNameW(hInstance, &sExePath.front(), nExePathSize);
+        if(nChars == 0){
+            sExePath.clear();
+            break;
+        }
+        if(nChars < nExePathSize - 1){
+            sExePath.resize(nChars);
+            break;
+        }
+        if(nExePathSize > 32768){
+            sExePath.resize(nChars);
+            break;
+        }
+        nExePathSize *= 2;
+    }
     std::cout << "Running " << to_ansi(sExePath) << "\n";
 
     // #1 Basics
@@ -94,35 +111,22 @@ Frame::Frame(HINSTANCE hInstanceCreate){
 bool Frame::Run(int nCmdShow){
     if(!RegisterClassEx(&WindowClass)) return false;
 
-    // Initialize Common controls
-    /*
+    // Legacy common-control initialization alternatives retained for reference.
+#if 0
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_BAR_CLASSES; // ICC_WIN95_CLASSES;
     InitCommonControlsEx(&icc);
-    /** /
 
-    // Ensure common control DLL is loaded
     INITCOMMONCONTROLSEX icx;
     icx.dwSize = sizeof(INITCOMMONCONTROLSEX);
     icx.dwICC = ICC_BAR_CLASSES; // Specify BAR classes
     InitCommonControlsEx(&icx); // Load the common control DLL
-    /**/
+#endif
 
-    /// Define window rects
-    rcWindowNonHex.left = 0;
-    rcWindowNonHex.top = 0;
-    rcWindowNonHex.right = 368;
-    rcWindowNonHex.bottom = 610;
-
-    rcWindowHex.left = 0;
-    rcWindowHex.top = 0;
-    rcWindowHex.right = 980;
-    rcWindowHex.bottom = 610;
-
-    hFrame = CreateWindowEx(NULL, cClassName, std::string("MDLedit "+version.Print()).c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                        CW_USEDEFAULT, CW_USEDEFAULT, rcWindowNonHex.right, rcWindowNonHex.bottom,
-                        HWND_DESKTOP, NULL, hInstance, NULL);
+    hFrame = CreateWindowEx(0, cClassName, std::string("MDLedit "+version.Print()).c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                        CW_USEDEFAULT, CW_USEDEFAULT, WINDOW_NONHEX_WIDTH, WINDOW_NONHEX_HEIGHT,
+                        HWND_DESKTOP, nullptr, hInstance, nullptr);
     hMe = hFrame;
     if(!hMe) return false;
     ShowWindow(hMe, nCmdShow);
@@ -131,7 +135,7 @@ bool Frame::Run(int nCmdShow){
 }
 
 LRESULT CALLBACK GetMsgProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if(nCode < 0) return CallNextHookEx(NULL, nCode, wParam, lParam);
+    if(nCode < 0) return CallNextHookEx(nullptr, nCode, wParam, lParam);
 
     MSG & msg = * (MSG*) lParam;
     POINT pt = msg.pt;
@@ -153,15 +157,13 @@ LRESULT CALLBACK GetMsgProc(int nCode, WPARAM wParam, LPARAM lParam) {
         }
     }
 
-    return CallNextHookEx(NULL, nCode, wParam, lParam);
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
 LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam){
     static RECT rcClient;
-    static int nEditDrag = 0;
     //static char cFile[MAX_PATH];
     static std::wstring sFile = std::wstring(1, '\0');
-    if(DEBUG_LEVEL > 500) std::cout << "FrameProc(): " << (int) message << "\n";
     /* handle the messages */
 
     static HWND hIntLabel;
@@ -234,15 +236,15 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
             int nEditOffsetX = ME_HEX_WIN_OFFSET_X + ME_HEX_WIN_SIZE_X + ME_DATA_LABEL_OFFSET_X + ME_DATA_LABEL_SIZE_X + ME_DATA_EDIT_OFFSET_X;
             int nDataOffsetY [5];
             for(int n = 0; n < 5; n++) nDataOffsetY[n] = ME_BASIC_OFFSET_Y + n * ME_DATA_NEXT_ROW;
-            hIntLabel = CreateWindowEx(NULL, "STATIC", "Int:", WS_VISIBLE | WS_CHILD | SS_RIGHT,
+            hIntLabel = CreateWindowEx(0, "STATIC", "Int:", WS_VISIBLE | WS_CHILD | SS_RIGHT,
                                         nLabelOffsetX, nDataOffsetY[0] + ME_DATA_LABEL_ROW_OFFSET_Y, ME_DATA_LABEL_SIZE_X, ME_DATA_LABEL_SIZE_Y,
-                                        hwnd, (HMENU) IDC_LBL_INT, GetModuleHandle(NULL), NULL);
-            hUIntLabel = CreateWindowEx(NULL, "STATIC", "uInt:", WS_VISIBLE | WS_CHILD | SS_RIGHT,
+                                        hwnd, (HMENU) IDC_LBL_INT, GetModuleHandle(nullptr), nullptr);
+            hUIntLabel = CreateWindowEx(0, "STATIC", "uInt:", WS_VISIBLE | WS_CHILD | SS_RIGHT,
                                         nLabelOffsetX, nDataOffsetY[1] + ME_DATA_LABEL_ROW_OFFSET_Y, ME_DATA_LABEL_SIZE_X, ME_DATA_LABEL_SIZE_Y,
-                                        hwnd, (HMENU) IDC_LBL_UINT, GetModuleHandle(NULL), NULL);
-            hFloatLabel = CreateWindowEx(NULL, "STATIC", "Float:", WS_VISIBLE | WS_CHILD | SS_RIGHT,
+                                        hwnd, (HMENU) IDC_LBL_UINT, GetModuleHandle(nullptr), nullptr);
+            hFloatLabel = CreateWindowEx(0, "STATIC", "Float:", WS_VISIBLE | WS_CHILD | SS_RIGHT,
                                         nLabelOffsetX, nDataOffsetY[2] + ME_DATA_LABEL_ROW_OFFSET_Y, ME_DATA_LABEL_SIZE_X, ME_DATA_LABEL_SIZE_Y,
-                                        hwnd, (HMENU) IDC_LBL_FLOAT, GetModuleHandle(NULL), NULL);
+                                        hwnd, (HMENU) IDC_LBL_FLOAT, GetModuleHandle(nullptr), nullptr);
             SendMessage(hIntLabel, WM_SETFONT, (WPARAM) hShell, MAKELPARAM(TRUE, 0));
             SendMessage(hUIntLabel, WM_SETFONT, (WPARAM) hShell, MAKELPARAM(TRUE, 0));
             SendMessage(hFloatLabel, WM_SETFONT, (WPARAM) hShell, MAKELPARAM(TRUE, 0));
@@ -252,13 +254,13 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
 
             Edits::hIntEdit = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE | WS_CHILD | ES_READONLY, // | ES_RIGHT,
                                         nEditOffsetX, nDataOffsetY[0], ME_DATA_EDIT_SIZE_X, ME_DATA_EDIT_SIZE_Y,
-                                        hwnd, (HMENU) IDC_EDIT_INT, GetModuleHandle(NULL), NULL);
+                                        hwnd, (HMENU) IDC_EDIT_INT, GetModuleHandle(nullptr), nullptr);
             Edits::hUIntEdit = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE | WS_CHILD | ES_READONLY, // | ES_RIGHT,
                                         nEditOffsetX, nDataOffsetY[1], ME_DATA_EDIT_SIZE_X, ME_DATA_EDIT_SIZE_Y,
-                                        hwnd, (HMENU) IDC_EDIT_UINT, GetModuleHandle(NULL), NULL);
+                                        hwnd, (HMENU) IDC_EDIT_UINT, GetModuleHandle(nullptr), nullptr);
             Edits::hFloatEdit = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE | WS_CHILD | ES_READONLY, // | ES_RIGHT,
                                         nEditOffsetX, nDataOffsetY[2], ME_DATA_EDIT_SIZE_X, ME_DATA_EDIT_SIZE_Y,
-                                        hwnd, (HMENU) IDC_EDIT_FLOAT, GetModuleHandle(NULL), NULL);
+                                        hwnd, (HMENU) IDC_EDIT_FLOAT, GetModuleHandle(nullptr), nullptr);
             SendMessage(Edits::hIntEdit, WM_SETFONT, (WPARAM) hMonospace, MAKELPARAM(TRUE, 0));
             SendMessage(Edits::hUIntEdit, WM_SETFONT, (WPARAM) hMonospace, MAKELPARAM(TRUE, 0));
             SendMessage(Edits::hFloatEdit, WM_SETFONT, (WPARAM) hMonospace, MAKELPARAM(TRUE, 0));
@@ -269,15 +271,15 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
             int nButtonOffsetX [3];
             int nButtonSizeX = (rcClient.right - rcClient.left - ME_TREE_OFFSET_X - 5 - 10) / 3;
             for(int n = 0; n < 3; n++) nButtonOffsetX[n] = ME_TREE_OFFSET_X + n * (nButtonSizeX + 5);
-            hGame = CreateWindowEx(NULL, "BUTTON", "Game", WS_VISIBLE | WS_CHILD,
+            hGame = CreateWindowEx(0, "BUTTON", "Game", WS_VISIBLE | WS_CHILD,
                                    nButtonOffsetX[0], nDataOffsetY[3], nButtonSizeX, ME_DATA_EDIT_SIZE_Y,
-                                   hwnd, (HMENU) IDC_BTN_GAME, GetModuleHandle(NULL), NULL);
-            hPlatform = CreateWindowEx(NULL, "BUTTON", "Platform", WS_VISIBLE | WS_CHILD,
+                                   hwnd, (HMENU) IDC_BTN_GAME, GetModuleHandle(nullptr), nullptr);
+            hPlatform = CreateWindowEx(0, "BUTTON", "Platform", WS_VISIBLE | WS_CHILD,
                                    nButtonOffsetX[1], nDataOffsetY[3], nButtonSizeX, ME_DATA_EDIT_SIZE_Y,
-                                   hwnd, (HMENU) IDC_BTN_PLATFORM, GetModuleHandle(NULL), NULL);
-            hNeck = CreateWindowEx(NULL, "BUTTON", "Head Link", WS_VISIBLE | WS_CHILD | BS_CHECKBOX | BS_PUSHLIKE | WS_DISABLED,
+                                   hwnd, (HMENU) IDC_BTN_PLATFORM, GetModuleHandle(nullptr), nullptr);
+            hNeck = CreateWindowEx(0, "BUTTON", "Head Link", WS_VISIBLE | WS_CHILD | BS_CHECKBOX | BS_PUSHLIKE | WS_DISABLED,
                                    nButtonOffsetX[2], nDataOffsetY[3], nButtonSizeX, ME_DATA_EDIT_SIZE_Y,
-                                   hwnd, (HMENU) IDC_BTN_NECK, GetModuleHandle(NULL), NULL);
+                                   hwnd, (HMENU) IDC_BTN_NECK, GetModuleHandle(nullptr), nullptr);
             SendMessage(hGame, WM_SETFONT, (WPARAM) hTimes, MAKELPARAM(TRUE, 0));
             SendMessage(hPlatform, WM_SETFONT, (WPARAM) hTimes, MAKELPARAM(TRUE, 0));
             SendMessage(hNeck, WM_SETFONT, (WPARAM) hTimes, MAKELPARAM(TRUE, 0));
@@ -293,17 +295,17 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
 
             hTree = CreateWindowEx(WS_EX_TOPMOST, WC_TREEVIEW, "Structure", WS_CHILD | WS_VISIBLE | WS_BORDER | TVS_HASLINES | TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS,
                            ME_TREE_OFFSET_X, ME_DISPLAY_OFFSET_Y + nEditSize + 1, ME_TREE_SIZE_X, rcClient.bottom - ME_DISPLAY_OFFSET_Y - 1 - nEditSize - ME_STATUSBAR_Y - ME_TREE_SIZE_DIFF_Y,//rcClient.bottom - ME_TREE_OFFSET_Y - ME_STATUSBAR_Y - ME_TREE_SIZE_DIFF_Y,
-                           hwnd, (HMENU) IDC_TREEVIEW, GetModuleHandle(NULL), NULL);
+                           hwnd, (HMENU) IDC_TREEVIEW, GetModuleHandle(nullptr), nullptr);
             hDisplayEdit = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE | WS_CHILD | ES_READONLY | ES_AUTOVSCROLL | ES_MULTILINE | WS_VSCROLL,
                                         ME_TREE_OFFSET_X, nDataOffsetY[4], ME_TREE_SIZE_X, nEditSize,
-                                        hwnd, (HMENU) IDC_EDIT_DISPLAY, GetModuleHandle(NULL), NULL);
+                                        hwnd, (HMENU) IDC_EDIT_DISPLAY, GetModuleHandle(nullptr), nullptr);
             SendMessage(hDisplayEdit, WM_SETFONT, (WPARAM) hMonospace, MAKELPARAM(TRUE, 0));
             //MainTreeProc = (WNDPROC) SetWindowLong(hTree, GWLP_WNDPROC, (LONG) TreeSubclassProc);
             //MainDisplayProc = (WNDPROC) SetWindowLong(hDisplayEdit, GWLP_WNDPROC, (LONG) DisplaySubclassProc);
 
-            hTabs = CreateWindowEx(NULL, WC_TABCONTROL, "", WS_VISIBLE | WS_CHILD | TCS_FOCUSNEVER | TCS_FIXEDWIDTH,
+            hTabs = CreateWindowEx(0, WC_TABCONTROL, "", WS_VISIBLE | WS_CHILD | TCS_FOCUSNEVER | TCS_FIXEDWIDTH,
                                    ME_HEX_WIN_OFFSET_X, 0, ME_HEX_WIN_OFFSET_X + ME_TABS_SIZE_X, rcClient.bottom - ME_STATUSBAR_Y,
-                                   hwnd, (HMENU) IDC_TABS, GetModuleHandle(NULL), NULL);
+                                   hwnd, (HMENU) IDC_TABS, GetModuleHandle(nullptr), nullptr);
             SendMessage(hTabs, WM_SETFONT, (WPARAM) hTimes, MAKELPARAM(TRUE, 0));
             ShowWindow(hTabs, false);
 
@@ -335,9 +337,6 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
             else mii.fState = MFS_UNCHECKED;
             SetMenuItemInfo(GetMenu(hwnd), IDM_SHOW_DATASTRUCT, false, &mii);
 
-            if(bAutoScroll) mii.fState = MFS_CHECKED;
-            else mii.fState = MFS_UNCHECKED;
-            SetMenuItemInfo(GetMenu(hwnd), IDM_AUTO_SCROLL, false, &mii);
 
             if(bModelHierarchy) mii.fState = MFS_CHECKED;
             else mii.fState = MFS_UNCHECKED;
@@ -353,9 +352,8 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
         case WM_NOTIFY:
         {
             NMHDR * nmhdr = (NMHDR *) lParam;
-            HWND hControl = nmhdr->hwndFrom;
             int nID = nmhdr->idFrom;
-            int nNotification = nmhdr->code;
+            UINT nNotification = nmhdr->code;
             switch(nID){
                 case IDC_TREEVIEW:
                 {
@@ -415,7 +413,7 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
                                 mla.nIndex++;
                             }
                             else if(mla.nIndex == 0){
-                                InsertMenu(mla.hMenu, mla.nIndex, MF_BYPOSITION | MF_STRING, NULL, "Nothing");
+                                InsertMenu(mla.hMenu, mla.nIndex, MF_BYPOSITION | MF_STRING, 0, "Nothing");
                                 mla.nIndex++;
                             }
 
@@ -437,7 +435,7 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
                                 mla.nIndex++;
                             }
 
-                            TrackPopupMenu(mla.hMenu, TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
+                            TrackPopupMenu(mla.hMenu, TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
                         }
                         else{
                             //It seems like I'm not on an item at all.
@@ -457,13 +455,11 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
         break;
         case WM_COMMAND:
         {
-            int nNotification = HIWORD(wParam);
             int nID = LOWORD(wParam);
-            HWND hControl = (HWND) lParam;
             switch(nID){
                 case IDM_FILE_EXIT:
                 {
-                    SendMessage(hwnd, WM_DESTROY, NULL, NULL);
+                    SendMessage(hwnd, WM_DESTROY, 0, 0);
                 }
                 break;
                 case IDM_HELP:
@@ -474,19 +470,6 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
                 case IDM_SHOW_REPORT:
                 {
                     OpenReportDlg(Model);
-                }
-                break;
-                case IDM_AUTO_SCROLL:
-                {
-                    MENUITEMINFO mii;
-                    mii.cbSize = sizeof(MENUITEMINFO);
-                    mii.fMask = MIIM_STATE;
-                    GetMenuItemInfo(GetMenu(hwnd), IDM_AUTO_SCROLL, false, &mii);
-                    bAutoScroll = !(mii.fState & MFS_CHECKED); //Revert it, because user just clicked it so we need to turn it off/on
-                    if(bAutoScroll) mii.fState = MFS_CHECKED;
-                    else mii.fState = MFS_UNCHECKED;
-                    SetMenuItemInfo(GetMenu(hwnd), IDM_AUTO_SCROLL, false, &mii);
-                    ManageIni(INI_WRITE);
                 }
                 break;
                 case IDM_TREE_SORT_LIN:
@@ -625,7 +608,7 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
                 break;
                 case IDM_BIN_COMPARE:
                 {
-                    bool bSuccess = FileEditor(hwnd, nID, sFile);
+                    FileEditor(hwnd, nID, sFile);
                     MENUITEMINFO mii;
                     mii.cbSize = sizeof(MENUITEMINFO);
                     mii.fMask = MIIM_STATE;
@@ -652,19 +635,17 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
                 break;
                 case IDM_BIN_SAVE:
                 {
-                    bool bSuccess = false;
                     int nReturn = IDOK;
                     if(Model.GetBuffer().empty()) nReturn = IDCANCEL;
-                    if(nReturn == IDOK) bSuccess = FileEditor(hwnd, nID, sFile);
+                    if(nReturn == IDOK) (void) FileEditor(hwnd, nID, sFile);
                 }
                 break;
                 case IDM_ASCII_SAVE:
                 {
-                    bool bSuccess = false;
                     int nReturn = IDOK;
                     if(!Model.GetFileData()) nReturn = IDCANCEL;
                     if(!Model.Mdx && nReturn == IDOK) nReturn = MessageBox(hwnd, "Warning! No MDX is loaded! MDLedit can still export without the MDX data, but this means exporting without weights, UVs, smoothing groups and for xbox binaries also vert coords.", "Warning!", MB_OKCANCEL | MB_ICONWARNING);
-                    if(nReturn == IDOK) bSuccess = FileEditor(hwnd, nID, sFile);
+                    if(nReturn == IDOK) (void) FileEditor(hwnd, nID, sFile);
                 }
                 break;
                 case IDC_BTN_NECK:
@@ -690,9 +671,8 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
                         FileHeader & Data = *Model.GetFileData();
 
                         if(Data.MH.cSupermodelName.c_str() != std::string("NULL"))
-                            bConfirm = IDYES == WarningYesNo("This model refers to a supermodel from the currently selected game. "
-                                                             "If the supermodel in the other game is not the same the model will not work properly. "
-                                                             "Are you sure you want to change the target game for this model?");
+                            bConfirm = IDYES == WarningYesNo("This model was loaded with a supermodel from the currently selected game. "
+                                                             "Are you sure you want to change the target game?");
                         //if(Model.nSupermodel == 2 && Model.bK2 || Model.nSupermodel == 1 && !Model.bK2)
                         //    bConfirm = IDYES == WarningYesNo("This model refers to a supermodel from the currently selected game. Are you sure you want to change the target game for this model?");
                     }
@@ -755,17 +735,6 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
                 break;
                 case IDM_VIEW_HEX:
                 {
-                    bNoSaveWindowPos = true;
-
-                    /// If our window is maximized, then we need to un-maximize it first.
-                    WINDOWPLACEMENT wp;
-                    wp.length = sizeof(WINDOWPLACEMENT);
-                    GetWindowPlacement(hwnd, &wp);
-                    if(wp.showCmd == SW_SHOWMAXIMIZED){
-                        wp.showCmd = SW_RESTORE;
-                        SetWindowPlacement(hwnd, &wp);
-                    }
-
                     MENUITEMINFO mii;
                     mii.cbSize = sizeof(MENUITEMINFO);
                     mii.fMask = MIIM_STATE;
@@ -786,7 +755,7 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
                         ShowWindow(hTabs, true);
                         ShowWindow(hStatusBar, true);
                         Edit1.UpdateEdit();
-                        SetWindowPos(hwnd, NULL, 0, 0, rcWindowHex.right, rcWindowHex.bottom, SWP_NOMOVE | SWP_NOZORDER);
+                        SetWindowPos(hwnd, nullptr, 0, 0, WINDOW_HEX_WIDTH, WINDOW_HEX_HEIGHT, SWP_NOMOVE | SWP_NOZORDER);
 
                     }
                     else{
@@ -798,10 +767,9 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
                         ShowWindow(GetDlgItem(hwnd, IDC_EDIT_FLOAT), false);
                         ShowWindow(hTabs, false);
                         ShowWindow(hStatusBar, false);
-                        SetWindowPos(hwnd, NULL, 0, 0, rcWindowNonHex.right, rcWindowNonHex.bottom, SWP_NOMOVE | SWP_NOZORDER);
+                        SetWindowPos(hwnd, nullptr, 0, 0, WINDOW_NONHEX_WIDTH, WINDOW_NONHEX_HEIGHT, SWP_NOMOVE | SWP_NOZORDER);
                     }
 
-                    bNoSaveWindowPos = false;
                 }
                 break;
                 case IDM_MDLEDIT:
@@ -861,100 +829,36 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
             }
         }
         break;
-        /*
-        case WM_MOUSEMOVE:
-        {
-            std::cout << "Frame coordinates: " << GET_X_LPARAM(lParam) << ", " << GET_Y_LPARAM(lParam) << "\n";
-            if(bEditDrag && (wParam & MK_LBUTTON)){
-                std::cout << "Dragging Edit...\n";
-                nEditSize += (GET_Y_LPARAM(lParam) - nEditDrag);
-                SendMessage(hwnd, WM_SIZE, NULL, NULL);
-            }
-            //else std::cout << "Moving mouse in Frame...\n";
-        }
-        break;
-        case WM_LBUTTONDOWN:
-        {
-            std::cout << "Clicked!";
-            if(bShowHex) std::cout <<
-                        " x: " << ME_TREE_OFFSET_X << " < " << GET_X_LPARAM(lParam) << " < " << ((rcClient.right - rcClient.left) - ME_HEX_WIN_OFFSET_X - ME_TREE_OFFSET_X - 5) <<
-                        " y: " << (ME_DISPLAY_OFFSET_Y + nEditSize - 5) << " < " << GET_Y_LPARAM(lParam) << " < " << (ME_DISPLAY_OFFSET_Y + nEditSize + 7) <<
-                        "\n";
-            else std::cout <<
-                        " x: " << nCompactOffsetLeft << " < " << GET_X_LPARAM(lParam) << " < " << ((rcClient.right - rcClient.left) - nCompactOffsetLeft - nCompactOffsetRight) <<
-                        " y: " << (ME_DATA_EDIT_SIZE_Y + nEditSize - 5) << " < " << GET_Y_LPARAM(lParam) << " < " << (ME_DATA_EDIT_SIZE_Y + nEditSize + 7) <<
-                        "\n";
-            if((bShowHex &&
-               GET_Y_LPARAM(lParam) < (ME_DISPLAY_OFFSET_Y + nEditSize) + 7 &&
-               GET_Y_LPARAM(lParam) > (ME_DISPLAY_OFFSET_Y + nEditSize) - 5 &&
-               GET_X_LPARAM(lParam) > ME_TREE_OFFSET_X &&
-               GET_X_LPARAM(lParam) < (rcClient.right - rcClient.left) - ME_HEX_WIN_OFFSET_X - ME_TREE_OFFSET_X - 5)
-               ||
-               (!bShowHex &&
-               GET_Y_LPARAM(lParam) < (ME_DATA_EDIT_SIZE_Y + nEditSize) + 7 &&
-               GET_Y_LPARAM(lParam) > (ME_DATA_EDIT_SIZE_Y + nEditSize) - 5 &&
-               GET_X_LPARAM(lParam) > nCompactOffsetLeft &&
-               GET_X_LPARAM(lParam) < (rcClient.right - rcClient.left) - nCompactOffsetLeft - nCompactOffsetRight )){
-                std::cout << "Drag: on!\n";
-                SetCapture(hwnd);
-                bEditDrag = true;
-                nEditDrag = GET_Y_LPARAM(lParam);
-            }
-        }
-        break;
-        case WM_LBUTTONUP:
-        {
-            if(bEditDrag){
-                ReleaseCapture();
-                bEditDrag = false;
-            }
-        }
-        break;
-        */
         case WM_SIZE:
         {
             GetClientRect(hwnd, &rcClient);
-            RECT rcWindow;
-            GetWindowRect(hwnd, &rcWindow);
-
-            /// When saving the new window position, we must make sure we are not saving the maximized position.
-            WINDOWPLACEMENT wp;
-            wp.length = sizeof(WINDOWPLACEMENT);
-            GetWindowPlacement(hwnd, &wp);
-
             if(bShowHex){
-                if(wp.showCmd == SW_NORMAL && !bNoSaveWindowPos){
-                    /// Store new hex dimension
-                    rcWindowHex.right = rcWindow.right - rcWindow.left;
-                    rcWindowHex.bottom = rcWindow.bottom - rcWindow.top;
-                }
-
-                SetWindowPos(hDisplayEdit, NULL,
+                SetWindowPos(hDisplayEdit, nullptr,
                              ME_TREE_OFFSET_X,
                              ME_DISPLAY_OFFSET_Y,
                              (rcClient.right - rcClient.left) - ME_HEX_WIN_OFFSET_X - ME_TREE_OFFSET_X - 5,
                              nEditSize,
-                             NULL);
-                SetWindowPos(hTree, NULL,
+                             0);
+                SetWindowPos(hTree, nullptr,
                              ME_TREE_OFFSET_X,
                              ME_DISPLAY_OFFSET_Y + nEditSize + 2, //ME_TREE_OFFSET_Y,
                              (rcClient.right - rcClient.left) - ME_HEX_WIN_OFFSET_X - ME_TREE_OFFSET_X - 5,
                              rcClient.bottom - (ME_DISPLAY_OFFSET_Y + nEditSize + 2) - ME_STATUSBAR_Y - ME_TREE_SIZE_DIFF_Y + 5,
-                             NULL);
+                             0);
                 int nEditOffsetX = ME_HEX_WIN_OFFSET_X + ME_HEX_WIN_SIZE_X + ME_DATA_LABEL_OFFSET_X + ME_DATA_LABEL_SIZE_X + ME_DATA_EDIT_OFFSET_X;
-                SetWindowPos(Edits::hIntEdit, NULL,
+                SetWindowPos(Edits::hIntEdit, nullptr,
                              0,
                              0,
                              (rcClient.right - rcClient.left) - nEditOffsetX - 5,
                              ME_DATA_EDIT_SIZE_Y,
                              SWP_NOMOVE);
-                SetWindowPos(Edits::hUIntEdit, NULL,
+                SetWindowPos(Edits::hUIntEdit, nullptr,
                              0,
                              0,
                              (rcClient.right - rcClient.left) - nEditOffsetX - 5,
                              ME_DATA_EDIT_SIZE_Y,
                              SWP_NOMOVE);
-                SetWindowPos(Edits::hFloatEdit, NULL,
+                SetWindowPos(Edits::hFloatEdit, nullptr,
                              0,
                              0,
                              (rcClient.right - rcClient.left) - nEditOffsetX - 5,
@@ -963,66 +867,60 @@ LRESULT CALLBACK Frame::FrameProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
                 int nButtonSizeX = (rcClient.right - rcClient.left - ME_TREE_OFFSET_X + 1 - 4) / 3;
                 int nDataOffsetY [5];
                 for(int n = 0; n < 5; n++) nDataOffsetY[n] = ME_BASIC_OFFSET_Y + n * ME_DATA_NEXT_ROW;
-                SetWindowPos(hGame, NULL,
+                SetWindowPos(hGame, nullptr,
                              ME_TREE_OFFSET_X - 1,
                              nDataOffsetY[3],
                              nButtonSizeX,
                              ME_DATA_EDIT_SIZE_Y,
-                             NULL);
-                SetWindowPos(hPlatform, NULL,
+                             0);
+                SetWindowPos(hPlatform, nullptr,
                              ME_TREE_OFFSET_X - 1 + nButtonSizeX,
                              nDataOffsetY[3],
                              rcClient.right - rcClient.left - 4 - nButtonSizeX - ME_TREE_OFFSET_X + 1 - nButtonSizeX,
                              ME_DATA_EDIT_SIZE_Y,
-                             NULL);
-                SetWindowPos(hNeck, NULL,
+                             0);
+                SetWindowPos(hNeck, nullptr,
                              rcClient.right - rcClient.left - 4 - nButtonSizeX,
                              nDataOffsetY[3],
                              nButtonSizeX,
                              ME_DATA_EDIT_SIZE_Y,
-                             NULL);
+                             0);
             }
             else{
-                if(wp.showCmd == SW_NORMAL && !bNoSaveWindowPos){
-                    /// Store new hex dimension
-                    rcWindowNonHex.right = rcWindow.right - rcWindow.left;
-                    rcWindowNonHex.bottom = rcWindow.bottom - rcWindow.top;
-                }
-
-                SetWindowPos(hDisplayEdit, NULL,
+                SetWindowPos(hDisplayEdit, nullptr,
                               nCompactOffsetLeft,
                               ME_DATA_EDIT_SIZE_Y,
                               (rcClient.right - rcClient.left) - nCompactOffsetLeft - nCompactOffsetRight,
                               nEditSize,
-                              NULL);
-                SetWindowPos(hTree, NULL,
+                              0);
+                SetWindowPos(hTree, nullptr,
                               nCompactOffsetLeft,
                               nCompactOffsetTop + nEditSize + ME_DATA_EDIT_SIZE_Y,
                               (rcClient.right - rcClient.left) - nCompactOffsetLeft - nCompactOffsetRight,
                               rcClient.bottom - (nCompactOffsetTop + nEditSize + ME_DATA_EDIT_SIZE_Y + nCompactOffsetBottom),
-                              NULL);
+                              0);
                 int nButtonSizeX = (rcClient.right - rcClient.left - nCompactOffsetRight - nCompactOffsetLeft) / 3;
-                SetWindowPos(hGame, NULL,
+                SetWindowPos(hGame, nullptr,
                              0, //nCompactOffsetLeft,
                              0, //nCompactOffsetTop,
                              nButtonSizeX,
                              ME_DATA_EDIT_SIZE_Y,
-                             NULL);
-                SetWindowPos(hPlatform, NULL,
+                             0);
+                SetWindowPos(hPlatform, nullptr,
                              nButtonSizeX, //nCompactOffsetLeft + nButtonSizeX + 1,
                              0, //nCompactOffsetTop,
                              rcClient.right - rcClient.left - 2*nButtonSizeX, //rcClient.right - rcClient.left - nCompactOffsetRight - nCompactOffsetLeft - 2*nButtonSizeX - 2,
                              ME_DATA_EDIT_SIZE_Y,
-                             NULL);
-                SetWindowPos(hNeck, NULL,
+                             0);
+                SetWindowPos(hNeck, nullptr,
                              rcClient.right - rcClient.left - nButtonSizeX, //rcClient.right - rcClient.left - nCompactOffsetRight - nButtonSizeX,
                              0, //nCompactOffsetTop,
                              nButtonSizeX,
                              ME_DATA_EDIT_SIZE_Y,
-                             NULL);
+                             0);
             }
 
-            if(bShowHex) SetWindowPos(hTabs, NULL, ME_HEX_WIN_OFFSET_X, 0, ME_HEX_WIN_OFFSET_X + ME_TABS_SIZE_X, rcClient.bottom - ME_STATUSBAR_Y, NULL);
+            if(bShowHex) SetWindowPos(hTabs, nullptr, ME_HEX_WIN_OFFSET_X, 0, ME_HEX_WIN_OFFSET_X + ME_TABS_SIZE_X, rcClient.bottom - ME_STATUSBAR_Y, 0);
             if(bShowHex) Edit1.Resize();
 
             // Resize the statusbar;
@@ -1123,120 +1021,66 @@ LRESULT APIENTRY DisplaySubclassProc(HWND hwnd, UINT message, WPARAM wParam, LPA
     return CallWindowProc(MainDisplayProc, hwnd, message, wParam, lParam);
 }
 
-std::vector<DataRegion> currentDataRegions;
-std::vector<DataRegion> * GetDataRegions(const std::vector<std::string> & cItem, LPARAM lParam){
-    /// Here we assume lParam is also the pointer to the vector of data regions. Hopefully all the data is set up correctly because otherwise...
-    std::vector<DataRegion> * p_data = reinterpret_cast<std::vector<DataRegion> *>(lParam);
 
-    /// Special case of Vertices
-    if(safesubstr(cItem.at(0), 0, 7) == "Vertex ") p_data = & reinterpret_cast<Vertex *>(lParam)->dataRegions;
-    else if(safesubstr(cItem.at(0), 0, 14) == "Dangly Vertex "){
-        unsigned nPos = 14;
-        MdlInteger<unsigned int> nIndex;
-        try{ nIndex = stoi(cItem.at(0).substr(nPos),(size_t*) NULL); }
-        catch(std::invalid_argument){
-            std::cout << "GetDataRegions() - Dangly Vertex: There was an error converting the string: " << cItem.at(0).substr(nPos) << ".\n";
-        }
-        if(!nIndex.Valid()) throw mdlexception("Dangly Vertex index that should be retreived from the name in the tree item is invalid.");
+void ScrollToData(MDL & /*Mdl*/, std::vector<std::string> cItem, LPARAM lParam, int nFile){
+    auto item = [&](unsigned n) -> std::string { return n < cItem.size() ? cItem.at(n) : std::string(); };
 
-        p_data = & reinterpret_cast<Node *>(lParam)->Dangly.v_dataRegions.at(nIndex);
+    if(cItem.empty() || item(0) == "" || !lParam) return;
+
+    auto scroll_to = [&](const std::string & sFile, long nOffset){
+        int nTabIndex = TabCtrl_GetTabIndexByText(hTabs, sFile);
+        if(nTabIndex == -1) return;
+
+        TabCtrl_SetCurSel(hTabs, nTabIndex);
+        Edit1.LoadData();
+
+        if(nOffset < 0) nOffset = 0;
+        long nTarget = (nOffset / 16) * ME_EDIT_NEXT_ROW;
+        Edit1.yCurrentScroll = std::min<long>(Edit1.yMaxScroll, nTarget);
+        if(Edit1.yCurrentScroll < 0) Edit1.yCurrentScroll = 0;
+        if(bShowHex) Edit1.UpdateEdit();
+    };
+
+    if(item(1) == "Geometry"){
+        scroll_to("MDL", static_cast<long>(reinterpret_cast<Node *>(lParam)->nOffset) + 12);
     }
-    else if(safesubstr(cItem.at(0), 0, 11) == "Lens Flare "){
-        unsigned nPos = 11;
-        MdlInteger<unsigned int> nIndex;
-        try{ nIndex = stoi(cItem.at(0).substr(nPos),(size_t*) NULL); }
-        catch(std::invalid_argument){
-            std::cout << "GetDataRegions() - Lens Flare: There was an error converting the string: " << cItem.at(0).substr(nPos) << ".\n";
-        }
-        if(!nIndex.Valid()) throw mdlexception("Lens Flare index that should be retreived from the name in the tree item is invalid.");
-
-        p_data = & reinterpret_cast<Node *>(lParam)->Light.v_dataRegions.at(nIndex);
+    else if(item(3) == "Geometry" && (item(1) == "Children" || safesubstr(item(0), 0, 7) == "Parent:")){
+        scroll_to("MDL", static_cast<long>(reinterpret_cast<Node *>(lParam)->nOffset) + 12);
     }
-
-    /// Exceptions
-    if(cItem.at(0) == "Children") return nullptr;
-    else if(cItem.at(0) == "Controllers") return nullptr;
-    else if(cItem.at(0) == "Faces") return nullptr;
-    else if(cItem.at(0) == "Vertices") return nullptr;
-    else if(cItem.at(0) == "Light") return nullptr;
-    else if(cItem.at(0) == "Emitter") return nullptr;
-    else if(cItem.at(0) == "Reference") return nullptr;
-    else if(cItem.at(0) == "Mesh") return nullptr;
-    else if(cItem.at(0) == "Skin") return nullptr;
-    else if(cItem.at(0) == "Danglymesh") return nullptr;
-    else if(cItem.at(0) == "Aabb") return nullptr;
-    else if(cItem.at(0) == "Lightsaber") return nullptr;
-    else if(cItem.at(0) == "Lens Flares") return nullptr;
-
-    return p_data;
+    else if(item(1) == "Animations"){
+        scroll_to("MDL", static_cast<long>(reinterpret_cast<Animation *>(lParam)->nOffset) + 12);
+    }
+    else if(item(2) == "Animations"){
+        scroll_to("MDL", static_cast<long>(reinterpret_cast<Node *>(lParam)->nOffset) + 12);
+    }
+    else if(item(4) == "Animations" && (item(1) == "Children" || safesubstr(item(0), 0, 7) == "Parent:")){
+        scroll_to("MDL", static_cast<long>(reinterpret_cast<Node *>(lParam)->nOffset) + 12);
+    }
+    else if(item(0) == "Vertices" && nFile == 0){
+        scroll_to("MDX", static_cast<long>(reinterpret_cast<Node *>(lParam)->Mesh.nOffsetIntoMdx));
+    }
 }
 
-void Edits::ScrollEdit(){
-    if(currentDataRegions.empty()) return;
-
-    int nTabIndex = -1;
-    for(DataRegion & region : currentDataRegions){
-        nTabIndex = TabCtrl_GetTabIndexByText(hTabs, region.sFile);
-        if(nTabIndex == -1) continue;
-
-        if(TabCtrl_GetCurSelName(hTabs) != region.sFile){
-            TabCtrl_SetCurSel(hTabs, nTabIndex);
-            LoadData();
-        }
-        int nTargetRow = (region.nOffset) / 16;
-        int nTargetRowEnd = (region.nOffset + region.nSize - 1) / 16;
-        if(nTargetRowEnd >= (yCurrentScroll + rcClient.bottom) / ME_EDIT_NEXT_ROW || nTargetRow < yCurrentScroll / ME_EDIT_NEXT_ROW){
-            yCurrentScroll = std::min((yMaxScroll / ME_EDIT_NEXT_ROW) * ME_EDIT_NEXT_ROW - (rcClient.bottom / ME_EDIT_NEXT_ROW + 1) * ME_EDIT_NEXT_ROW,
-                                      (long) nTargetRow * ME_EDIT_NEXT_ROW);
-            UpdateEdit();
-        }
-
-        break;
-    }
-
-    if(nTabIndex == -1) Error("The file where this data is located is not open in MDLedit.");
-}
-void UpdateCurrentTreeSelectionData(std::vector<std::string> & cItem, LPARAM lParam){
-    /// Add current selection data
-    currentDataRegions.clear();
-
-    if(lParam){
-        std::vector<DataRegion> * p_dataRegions = GetDataRegions(cItem, lParam);
-
-        if(p_dataRegions) currentDataRegions.insert(currentDataRegions.end(), p_dataRegions->begin(), p_dataRegions->end());
-    }
-
-    /// Report
-    /*/
-    for(DataRegion & region : currentDataRegions){
-        std::cout << "Marked region in " << region.sFile << " from " << region.nOffset << " for " << region.nSize << " bytes.\n";
-    }
-    /**/
-
-    if(bShowHex) Edit1.UpdateEdit();
-}
 
 void ProcessTreeAction(HTREEITEM hItem, const int & nAction, void * Pointer){
-    if(DEBUG_LEVEL > 1000) std::cout << "Processing Tree Action!";
     std::vector<std::string> cItem;
     cItem.reserve(40);
     LPARAM lParam;
 
     //Get our selected item
-    TVITEM tvNewSelect;
+    TVITEM tvNewSelect = {};
     tvNewSelect.mask = TVIF_TEXT | TVIF_PARAM;
     tvNewSelect.cchTextMax = 255;
-    char cGet [255];
+    char cGet[255] = {};
     tvNewSelect.hItem = hItem;
     tvNewSelect.pszText = cGet;
-    TreeView_GetItem(hTree, &tvNewSelect);
+    if(hTree == NULL || hItem == NULL || !TreeView_GetItem(hTree, &tvNewSelect)) return;
 
     //Get pointer to data and name
     cItem.push_back(cGet);
     lParam = tvNewSelect.lParam;
 
     //Fill cItem with all the ancestors of our item
-    int n = 1;
     std::string FilenameModel = to_ansi(Model.GetFilename());
     std::string FilenameWalkmesh = to_ansi(Model.Wok ? Model.Wok->GetFilename() : L"");
     std::string FilenamePwk = to_ansi(Model.Pwk ? Model.Pwk->GetFilename() : L"");
@@ -1263,7 +1107,6 @@ void ProcessTreeAction(HTREEITEM hItem, const int & nAction, void * Pointer){
         else if(cItem.back() == FilenameDwk1) nFile = 4;
         else if(cItem.back() == FilenameDwk2) nFile = 5;
         else{
-            n++;
             continue;
         }
         break;
@@ -1276,12 +1119,7 @@ void ProcessTreeAction(HTREEITEM hItem, const int & nAction, void * Pointer){
         if(hItem != NULL){
             DetermineDisplayText(cItem, sPrint, lParam);
 
-            if(bShowHex){
-                /// Add current selection data
-                UpdateCurrentTreeSelectionData(cItem, lParam);
-
-                if(bAutoScroll) Edit1.ScrollEdit();
-            }
+            if(bShowHex) Edit1.UpdateEdit();
         }
 
         //Update DisplayEdit
@@ -1297,20 +1135,12 @@ void ProcessTreeAction(HTREEITEM hItem, const int & nAction, void * Pointer){
         OpenEditorDlg(Model, cItem, lParam, nFile);
     }
     else if(nAction == ACTION_SCROLL){
-        if(bShowHex){
-            /// Add current selection data
-            UpdateCurrentTreeSelectionData(cItem, lParam);
-
-            Edit1.ScrollEdit();
-        }
+        if(bShowHex) ScrollToData(Model, cItem, lParam, nFile);
     }
 }
 
 void ManageIni(IniConst Action){
-    std::wstring sIni = sExePath;
-    PathRemoveFileSpecW(&sIni.front());
-    sIni = sIni.c_str();
-    sIni += L"\\mdledit.ini";
+    std::wstring sIni = JoinPath(ParentPath(sExePath), L"mdledit.ini");
 
     if(PathFileExistsW(sIni.c_str())){
         if(Action == INI_READ) std::cout << "Reading ";
@@ -1319,7 +1149,7 @@ void ManageIni(IniConst Action){
         IniFile Ini;
         Ini.AddIniOption("AreaWeighting", DT_bool, &Model.bSmoothAreaWeighting);
         Ini.AddIniOption("AngleWeighting", DT_bool, &Model.bSmoothAngleWeighting);
-        Ini.AddIniOption("BinaryPostProcess", DT_bool, &Model.bBinaryPostProcess);
+        Ini.AddIniOption("DetermineSmoothing", DT_bool, &Model.bDetermineSmoothing);
         Ini.AddIniOption("WriteAnimations", DT_bool, &Model.bWriteAnimations);
         Ini.AddIniOption("SkinToTrimesh", DT_bool, &Model.bSkinToTrimesh);
         Ini.AddIniOption("LightsaberToTrimesh", DT_bool, &Model.bLightsaberToTrimesh);
@@ -1338,7 +1168,6 @@ void ManageIni(IniConst Action){
         Ini.AddIniOption("UseCreaseAngle", DT_bool, &Model.bCreaseAngle);
         Ini.AddIniOption("CreaseAngle", DT_uint, &Model.nCreaseAngle);
         Ini.AddIniOption("TreeHierarchy", DT_bool, &bModelHierarchy);
-        Ini.AddIniOption("AutoScroll", DT_bool, &bAutoScroll);
         if(Model.bDebug || Action == INI_READ) Ini.AddIniOption("Debug", DT_bool, &Model.bDebug);
         if(Model.bWriteSmoothing || Action == INI_READ) Ini.AddIniOption("WriteSmoothingArray", DT_bool, &Model.bWriteSmoothing);
         if(bAnalyze || Action == INI_READ) Ini.AddIniOption("Analyze", DT_bool, &bAnalyze);

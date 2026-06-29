@@ -1,9 +1,64 @@
 #include "MDL.h"
 #include <algorithm>
+#include <limits>
 
-void WOK::CalculateWokData(Node & node, Vector vLytPos, std::stringstream * ptrssFile){
-    GetData().reset(new BWMHeader);
-    BWMHeader & Data = *GetData();
+namespace {
+    unsigned int CheckedFlatAabbIndex(std::size_t nIndex){
+        if(nIndex >= std::numeric_limits<unsigned int>::max()){
+            throw mdlexception("AABB tree is too large to flatten into 32-bit child indices without colliding with the invalid-child sentinel.");
+        }
+        return static_cast<unsigned int>(nIndex);
+    }
+
+    unsigned short CheckedBwmVertexIndex(std::size_t index, const std::string & sContext){
+        const std::size_t nInvalid = static_cast<std::size_t>(std::numeric_limits<unsigned short>::max());
+        if(index >= nInvalid){
+            throw mdlexception(sContext + " would require a vertex index outside the 16-bit walkmesh range.");
+        }
+        return static_cast<unsigned short>(index);
+    }
+
+    struct RestoreAabbOnFailure{
+        Aabb & target;
+        Aabb original;
+        bool committed = false;
+
+        explicit RestoreAabbOnFailure(Aabb & value) : target(value), original(value) {}
+        ~RestoreAabbOnFailure(){
+            if(!committed) target = std::move(original);
+        }
+        void Commit(){ committed = true; }
+
+        RestoreAabbOnFailure(const RestoreAabbOnFailure &) = delete;
+        RestoreAabbOnFailure & operator=(const RestoreAabbOnFailure &) = delete;
+    };
+
+    void ValidateWokSourceMesh(const Node & node){
+        const std::size_t nVertexCount = node.Mesh.Vertices.size();
+        for(std::size_t f = 0; f < node.Mesh.Faces.size(); ++f){
+            const Face & face = node.Mesh.Faces.at(f);
+            for(int i = 0; i < 3; ++i){
+                const MdlInteger<unsigned short> & nIndex = face.nIndexVertex.at(i);
+                if(!nIndex.Valid()){
+                    throw mdlexception("WOK export source face " + std::to_string(f) + " has an invalid vertex index.");
+                }
+                if(static_cast<unsigned short>(nIndex) >= nVertexCount){
+                    throw mdlexception("WOK export source face " + std::to_string(f) + " references vertex " +
+                                       std::to_string(static_cast<unsigned short>(nIndex)) +
+                                       ", but the source mesh only has " + std::to_string(nVertexCount) + " vertices.");
+                }
+            }
+        }
+    }
+}
+
+void WOK::WriteWok(Node & node, Vector vLytPos, std::stringstream * ptrssFile){
+    // Build into a temporary header and commit only after the full WOK data
+    // has been generated successfully. A failed WOK export should not erase
+    // or partially replace any existing walkmesh data attached to this object.
+    ValidateWokSourceMesh(node);
+    std::unique_ptr<BWMHeader> newData(new BWMHeader);
+    BWMHeader & Data = *newData;
 
     std::cout << "Writing wok.\n";
     Data.nType = 1;
@@ -48,20 +103,20 @@ void WOK::CalculateWokData(Node & node, Vector vLytPos, std::stringstream * ptrs
     }
 
     //Calculate adjacent edges
-    for(int f = 0; f < Data.faces.size(); f++){
+    for(std::size_t f = 0; f < Data.faces.size(); ++f){
         Face & face = Data.faces.at(f);
         //std::cout << "Checking aabb face (" << face.nIndexVertex[0] << "," << face.nIndexVertex[1] << "," << face.nIndexVertex[2] << ")\n";
 
         face.nID = f;
 
         // Skip if none is -1
-        if(face.nAdjacentFaces.at(0).Valid() &&
-           face.nAdjacentFaces.at(1).Valid() &&
-           face.nAdjacentFaces.at(2).Valid() ||
-           !IsMaterialWalkable(face.nMaterialID) ) continue;
+        if((face.nAdjacentFaces.at(0).Valid() &&
+            face.nAdjacentFaces.at(1).Valid() &&
+            face.nAdjacentFaces.at(2).Valid()) ||
+           !IsMaterialWalkable(face.nMaterialID)) continue;
 
         //Go through all the faces coming after this one
-        for(int f2 = f + 1; f2 < Data.faces.size(); f2++){
+        for(std::size_t f2 = f + 1; f2 < Data.faces.size(); ++f2){
             Face & compareface = Data.faces.at(f2);
 
             if(IsMaterialWalkable(compareface.nMaterialID)){
@@ -89,27 +144,27 @@ void WOK::CalculateWokData(Node & node, Vector vLytPos, std::stringstream * ptrs
                 else if(VertMatchesCompare.at(2) && VertMatchesCompare.at(0)) comparevertmatch = 2;
                 if(vertmatch != -1 && comparevertmatch != -1){
                     if(VertMatches.at(0) && VertMatches.at(1)){
-                        if(face.nAdjacentFaces[0].Valid()) std::cout << "Well, we found too many wok adjacent edges (to " << f << ") for edge 0...\n";
+                        if(face.nAdjacentFaces[0].Valid()) std::cout << "Well, we found too many adjacent edges (to " << f << ") for edge 0...\n";
                         else face.nAdjacentFaces[0] = f2*3 + comparevertmatch;
                     }
                     else if(VertMatches.at(1) && VertMatches.at(2)){
-                        if(face.nAdjacentFaces[1].Valid()) std::cout << "Well, we found too many wok adjacent edges (to " << f << ") for edge 1...\n";
+                        if(face.nAdjacentFaces[1].Valid()) std::cout << "Well, we found too many adjacent edges (to " << f << ") for edge 1...\n";
                         else face.nAdjacentFaces[1] = f2*3 + comparevertmatch;
                     }
                     else if(VertMatches.at(2) && VertMatches.at(0)){
-                        if(face.nAdjacentFaces[2].Valid()) std::cout << "Well, we found too many wok adjacent edges (to " << f << ") for edge 2...\n";
+                        if(face.nAdjacentFaces[2].Valid()) std::cout << "Well, we found too many adjacent edges (to " << f << ") for edge 2...\n";
                         else face.nAdjacentFaces[2] = f2*3 + comparevertmatch;
                     }
                     if(VertMatchesCompare.at(0) && VertMatchesCompare.at(1)){
-                        if(compareface.nAdjacentFaces[0].Valid()) std::cout << "Well, we found too wok many adjacent edges (to " << f2 << ") for edge 0...\n";
+                        if(compareface.nAdjacentFaces[0].Valid()) std::cout << "Well, we found too many adjacent edges (to " << f2 << ") for edge 0...\n";
                         else compareface.nAdjacentFaces[0] = f*3 + vertmatch;
                     }
                     else if(VertMatchesCompare.at(1) && VertMatchesCompare.at(2)){
-                        if(compareface.nAdjacentFaces[1].Valid()) std::cout << "Well, we found too wok many adjacent edges (to " << f2 << ") for edge 1...\n";
+                        if(compareface.nAdjacentFaces[1].Valid()) std::cout << "Well, we found too many adjacent edges (to " << f2 << ") for edge 1...\n";
                         else compareface.nAdjacentFaces[1] = f*3 + vertmatch;
                     }
                     else if(VertMatchesCompare.at(2) && VertMatchesCompare.at(0)){
-                        if(compareface.nAdjacentFaces[2].Valid()) std::cout << "Well, we found too many wok adjacent edges (to " << f2 << ") for edge 2...\n";
+                        if(compareface.nAdjacentFaces[2].Valid()) std::cout << "Well, we found too many adjacent edges (to " << f2 << ") for edge 2...\n";
                         else compareface.nAdjacentFaces[2] = f*3 + vertmatch;
                     }
                 }
@@ -154,8 +209,16 @@ void WOK::CalculateWokData(Node & node, Vector vLytPos, std::stringstream * ptrs
                     }
                 }
                 else{
-                    nFace = nAdjacent / 3;
-                    nEdge = nAdjacent % 3;
+                    if(Data.faces.size() > std::numeric_limits<unsigned int>::max() / 3u){
+                        throw mdlexception("WOK export generated too many faces to validate adjacent-face references safely.");
+                    }
+                    const unsigned int nAdjacentValue = static_cast<unsigned short>(nAdjacent);
+                    const unsigned int nMaxAdjacentValue = static_cast<unsigned int>(Data.faces.size() * 3u);
+                    if(nAdjacentValue >= nMaxAdjacentValue){
+                        throw mdlexception("WOK export encountered an adjacent-face reference outside the generated face array.");
+                    }
+                    nFace = nAdjacentValue / 3;
+                    nEdge = nAdjacentValue % 3;
                     nEdge = (nEdge+1) % 3;
                 }
             }
@@ -175,7 +238,7 @@ void WOK::CalculateWokData(Node & node, Vector vLytPos, std::stringstream * ptrs
     /**
         Verts are compared by position here, so they will be reduced / welded.
     **/
-    for(int f = 0; f < Data.faces.size(); f++){
+    for(std::size_t f = 0; f < Data.faces.size(); ++f){
         Face & face = Data.faces.at(f);
         //std::cout << "Checking4 aabb face (" << face.nIndexVertex[0] << "," << face.nIndexVertex[1] << "," << face.nIndexVertex[2] << ")\n";
         for(int i = 0; i < 3; i++){
@@ -187,7 +250,7 @@ void WOK::CalculateWokData(Node & node, Vector vLytPos, std::stringstream * ptrs
             Vertex vert;
             vert.assign(node.Mesh.Vertices.at(face.nIndexVertex[i]).vFromRoot);
 
-            for(int f2 = f; f2 < Data.faces.size(); f2++){
+            for(std::size_t f2 = f; f2 < Data.faces.size(); ++f2){
                 Face & face2 = Data.faces.at(f2);
                 for(int i2 = 0; i2 < 3; i2++){
                     //Make sure that we're only changing what's past our current position if we are in the same face.
@@ -197,12 +260,12 @@ void WOK::CalculateWokData(Node & node, Vector vLytPos, std::stringstream * ptrs
                     if(face2.bProcessed[i2] || !vert.Compare(node.Mesh.Vertices.at(face2.nIndexVertex[i2]).vFromRoot)) continue;
                     //std::cout << "Match found!\n";
 
-                    face2.nIndexVertex[i2] = Data.verts.size();
+                    face2.nIndexVertex[i2] = CheckedBwmVertexIndex(Data.verts.size(), "WOK/BWM vertex welding");
                     face2.bProcessed[i2] = true;
                 }
             }
 
-            face.nIndexVertex[i] = Data.verts.size();
+            face.nIndexVertex[i] = CheckedBwmVertexIndex(Data.verts.size(), "WOK/BWM vertex welding");
             face.bProcessed[i] = true;
 
             //std::cout << "Adding vertex " << face.nIndexVertex[i] << "\n";
@@ -228,12 +291,14 @@ void WOK::CalculateWokData(Node & node, Vector vLytPos, std::stringstream * ptrs
 
     //Create aabb tree
     std::vector<Face*> allfaces;
-    for(int f = 0; f < Data.faces.size(); f++){
+    for(std::size_t f = 0; f < Data.faces.size(); ++f){
         allfaces.push_back(&Data.faces.at(f));
     }
     Aabb rootaabb;
-    BuildAabbTree(rootaabb, allfaces, ptrssFile);
-    LinearizeAabbTree(rootaabb, Data.aabb);
+    BuildAabb(rootaabb, allfaces, ptrssFile);
+    LinearizeAabb(rootaabb, Data.aabb);
+
+    GetData() = std::move(newData);
 }
 
 
@@ -243,28 +308,30 @@ struct FaceSort{
     double maxdiff = 0.0;
     double fMax = 0.0;
     double fMin = 0.0;
-    bool operator<(const FaceSort & facesort){
-        if(centroid == facesort.centroid && p_face != nullptr && facesort.p_face != nullptr){
-            if(RoundDec(p_face->fDistance, 4) != RoundDec(facesort.p_face->fDistance, 4)){
-                return (abs(p_face->fDistance) < abs(facesort.p_face->fDistance));
-            }
-            /*
-            else{
-                return (p_face->nID < facesort.p_face->nID);
-            }
-            */
-        }
-        return (centroid < facesort.centroid);
-    }
-    bool operator==(const FaceSort & facesort){
+    bool operator<(const FaceSort & facesort) const;
+    bool operator==(const FaceSort & facesort) const{
         return (centroid == facesort.centroid);
     }
 };
 
+bool FaceSort::operator<(const FaceSort & facesort) const{
+    if(centroid == facesort.centroid && p_face != nullptr && facesort.p_face != nullptr){
+        if(RoundDec(p_face->fDistance, 4) != RoundDec(facesort.p_face->fDistance, 4)){
+            return (abs(p_face->fDistance) < abs(facesort.p_face->fDistance));
+        }
+        /*
+        else{
+            return (p_face->nID < facesort.p_face->nID);
+        }
+        */
+    }
+    return (centroid < facesort.centroid);
+}
+
 struct AxisSort{
     std::string sName;
     double fSort;
-    bool operator<(const AxisSort & axissort){
+    bool operator<(const AxisSort & axissort) const{
         return (fSort < axissort.fSort);
     }
     AxisSort(std::string sName = "", double fSort = 0.0): sName(sName), fSort(fSort) {}
@@ -273,18 +340,37 @@ struct AxisSort{
 struct AxisSort2{
     std::string sName;
     int nSize;
-    bool operator<(const AxisSort2 & axissort){
-        if(nSize == axissort.nSize){
-            if(sName == "Z" && (axissort.sName == "Y" || axissort.sName == "X")) return true;
-            if(sName == "Y" &&  axissort.sName == "X") return true;
-        }
-        return (nSize < axissort.nSize);
-    }
+    bool operator<(const AxisSort2 & axissort) const;
     AxisSort2(std::string sName = "", int nSize = 0): sName(sName), nSize(nSize) {}
 };
 
-void BuildAabbTree(Aabb & aabb, const std::vector<Face*> & faces, std::stringstream * file){
+bool AxisSort2::operator<(const AxisSort2 & axissort) const{
+    if(nSize == axissort.nSize){
+        if(sName == "Z" && (axissort.sName == "Y" || axissort.sName == "X")) return true;
+        if(sName == "Y" &&  axissort.sName == "X") return true;
+    }
+    return (nSize < axissort.nSize);
+}
+
+void BuildAabb(Aabb & aabb, const std::vector<Face*> & faces, std::stringstream * file){
     if(file != nullptr) (*file).precision(5);
+    if(faces.empty()){
+        throw mdlexception("BuildAabb(): cannot build an AABB tree from an empty face list.");
+    }
+
+    // BuildAabb() mutates the destination tree while it recursively splits
+    // faces. Restore the original tree if any later split/validation fails so
+    // a failed rebuild cannot erase or half-replace preserved AABB data.
+    RestoreAabbOnFailure restoreAabb(aabb);
+
+    // BuildAabb() is a rebuild path. Clear any preserved/previous child state
+    // before writing the new node so a fallback rebuild cannot inherit stale
+    // children from a malformed preserved AABB tree.
+    aabb.Child1.clear();
+    aabb.Child2.clear();
+    aabb.nChild1 = 0;
+    aabb.nChild2 = 0;
+
     if(faces.size() == 1){
         //This is the leaf
         Face & face = *faces.front();
@@ -305,7 +391,7 @@ void BuildAabbTree(Aabb & aabb, const std::vector<Face*> & faces, std::stringstr
         Vector vAxisBBmin = Vector(10000.0, 10000.0, 10000.0);
         Vector vAverage;
         Vector vAverageBB;
-        for(int f = 0; f < faces.size(); f++){
+        for(std::size_t f = 0; f < faces.size(); ++f){
             Face & face = *faces.at(f);
             aabb.vBBmax.fX = std::max(aabb.vBBmax.fX, face.vBBmax.fX);
             aabb.vBBmax.fY = std::max(aabb.vBBmax.fY, face.vBBmax.fY);
@@ -340,11 +426,11 @@ void BuildAabbTree(Aabb & aabb, const std::vector<Face*> & faces, std::stringstr
         std::vector<double> vectorX;
         std::vector<double> vectorY;
         std::vector<double> vectorZ;
-        for(int f = 0; f < faces.size(); f++){
+        for(std::size_t f = 0; f < faces.size(); ++f){
             Face & face = *faces.at(f);
-            if(std::find(vectorX.begin(), vectorX.end(), face.vCentroid.fX/* + (face.vBBmax.fX - face.vBBmin.fX)/2/**/) == vectorX.end()) vectorX.push_back(face.vCentroid.fX /*+ (face.vBBmax.fX - face.vBBmin.fX)/2/**/);
-            if(std::find(vectorY.begin(), vectorY.end(), face.vCentroid.fY/* + (face.vBBmax.fY - face.vBBmin.fY)/2/**/) == vectorY.end()) vectorY.push_back(face.vCentroid.fY /*+ (face.vBBmax.fY - face.vBBmin.fY)/2/**/);
-            if(std::find(vectorZ.begin(), vectorZ.end(), face.vCentroid.fZ/* + (face.vBBmax.fZ - face.vBBmin.fZ)/2/**/) == vectorZ.end()) vectorZ.push_back(face.vCentroid.fZ /*+ (face.vBBmax.fZ - face.vBBmin.fZ)/2/**/);
+            if(std::find(vectorX.begin(), vectorX.end(), face.vCentroid.fX) == vectorX.end()) vectorX.push_back(face.vCentroid.fX);
+            if(std::find(vectorY.begin(), vectorY.end(), face.vCentroid.fY) == vectorY.end()) vectorY.push_back(face.vCentroid.fY);
+            if(std::find(vectorZ.begin(), vectorZ.end(), face.vCentroid.fZ) == vectorZ.end()) vectorZ.push_back(face.vCentroid.fZ);
         }
         std::vector<AxisSort2> axispriority2;
         axispriority2.push_back(AxisSort2("X", vectorX.size()));
@@ -367,7 +453,7 @@ void BuildAabbTree(Aabb & aabb, const std::vector<Face*> & faces, std::stringstr
         Vector vDeviance;
         Vector vDeviance2;
         if(file != nullptr) *file << "Priority List 3: " << axispriority3.at(0).sName << ": " << axispriority3.at(0).fSort << ", " << axispriority3.at(1).sName << ": " << axispriority3.at(1).fSort << ", " << axispriority3.at(2).sName << ": " << axispriority3.at(2).fSort << "\n";
-        for(int f = 0; f < faces.size(); f++){
+        for(std::size_t f = 0; f < faces.size(); ++f){
             Face & face = *faces.at(f);
             vDeviance += face.vCentroid - vAverage;
             vDeviance2.fX += (face.vBBmin.fX + (face.vBBmax.fX - face.vBBmin.fX)/2.0 - vAverageBB.fX);
@@ -412,57 +498,36 @@ void BuildAabbTree(Aabb & aabb, const std::vector<Face*> & faces, std::stringstr
             ssFaces.str(std::string());
 
             //Fill centroids
-            int nNegative = 0;
-            for(int f = 0; f < faces.size(); f++){
+            for(std::size_t f = 0; f < faces.size(); ++f){
                 Face & face = *faces.at(f);
                 FaceSort newfs;
                 newfs.p_face = &face;
-                double fMax = 0.0, fMin = 0.0, fAverage = 0.0;
-
                 if(axispriority.at(nCurrentPriority).sName == "X"){
                     newfs.fMin = face.vBBmin.fX;
                     newfs.fMax = face.vBBmax.fX;
                     newfs.centroid = face.vCentroid.fX; //+ (face.vBBmax.fX - face.vBBmin.fX) / 2;
-                    //newfs.centroid = /**/face.vBBmin.fX +/**/ (face.vBBmax.fX - face.vBBmin.fX)/2;
-                    newfs.maxdiff = /**/face.vBBmin.fX +/**/ (face.vBBmax.fX - face.vBBmin.fX)/2;
-                    fMax = aabb.vBBmax.fX;
-                    fMin = aabb.vBBmin.fX;
-                    fAverage = vAverage.fX;
+                    //newfs.centroid = face.vBBmin.fX + (face.vBBmax.fX - face.vBBmin.fX)/2;
+                    newfs.maxdiff = face.vBBmin.fX + (face.vBBmax.fX - face.vBBmin.fX)/2;
                 }
                 else if(axispriority.at(nCurrentPriority).sName == "Y"){
                     newfs.fMin = face.vBBmin.fY;
                     newfs.fMax = face.vBBmax.fY;
                     newfs.centroid = face.vCentroid.fY; //+ (face.vBBmax.fY - face.vBBmin.fY) / 2;
-                    //newfs.centroid = /**/face.vBBmin.fY +/**/ (face.vBBmax.fY - face.vBBmin.fY)/2;
-                    newfs.maxdiff = /**/face.vBBmin.fY +/**/ (face.vBBmax.fY - face.vBBmin.fY)/2;
-                    fMax = aabb.vBBmax.fY;
-                    fMin = aabb.vBBmin.fY;
-                    fAverage = vAverage.fY;
+                    //newfs.centroid = face.vBBmin.fY + (face.vBBmax.fY - face.vBBmin.fY)/2;
+                    newfs.maxdiff = face.vBBmin.fY + (face.vBBmax.fY - face.vBBmin.fY)/2;
                 }
                 else if(axispriority.at(nCurrentPriority).sName == "Z"){
                     newfs.fMin = face.vBBmin.fZ;
                     newfs.fMax = face.vBBmax.fZ;
                     newfs.centroid = face.vCentroid.fZ; //+ (face.vBBmax.fZ - face.vBBmin.fZ) / 2;
-                    //newfs.centroid = /**/face.vBBmin.fZ +/**/ (face.vBBmax.fZ - face.vBBmin.fZ)/2;
-                    newfs.maxdiff = /**/face.vBBmin.fZ +/**/ (face.vBBmax.fZ - face.vBBmin.fZ)/2;
-                    fMax = aabb.vBBmax.fZ;
-                    fMin = aabb.vBBmin.fZ;
-                    fAverage = vAverage.fZ;
+                    //newfs.centroid = face.vBBmin.fZ + (face.vBBmax.fZ - face.vBBmin.fZ)/2;
+                    newfs.maxdiff = face.vBBmin.fZ + (face.vBBmax.fZ - face.vBBmin.fZ)/2;
                 }
                 else{
-                    Error("Aabb significant plane not assigned!");
-                    return;
+                    throw mdlexception("AABB tree: significant split axis was not assigned.");
                 }
-                //nNegative += (newfs.centroid < fMin + (fMax - fMin)/2)? -1 : 1;
-                //nNegative += (newfs.centroid < fAverage)? -1 : 1;
-                //nNegative += (newfs.maxdiff < fMin + (fMax - fMin)/2)? -1 : 1;
-                nNegative += (newfs.maxdiff < fAverage)? -1 : 1;
-                //nNegative += (newfs.fMin < fMin + (fMax - fMin)/2)? -1 : 1;
-                //nNegative += (newfs.fMin < fAverage)? -1 : 1;
                 centroids.push_back(std::move(newfs));
-                //ssFaces << "  " << centroids.back().centroid << " (" << fMin << " -> " << fMax << ") - face " << face.nID << "\n";
             }
-            //if(nNegative < 0) bNegative = true;
             //if(centroids.size() == 0) Error("Major error, centroid size 0!!");
             sort(centroids.begin(), centroids.end());
             bEven = (centroids.size() % 2 == 0);
@@ -483,7 +548,7 @@ void BuildAabbTree(Aabb & aabb, const std::vector<Face*> & faces, std::stringstr
             if(file != nullptr){
                 *file << "Priority: " << (bNegative? "-" : "+") << axispriority.at(nCurrentPriority).sName << "\n";
                 *file << "Faces:\n";
-                for(int c = 0; c < centroids.size(); c++){
+                for(std::size_t c = 0; c < centroids.size(); ++c){
                     ssFaces << "  " << centroids.at(c).centroid << ", " << centroids.at(c).fMin + (centroids.at(c).fMax - centroids.at(c).fMin)/2.0;
                     ssFaces << " (" << centroids.at(c).fMin << " -> " << centroids.at(c).fMax << ") - face " << centroids.at(c).p_face->nID << "\n";
                 }
@@ -498,14 +563,12 @@ void BuildAabbTree(Aabb & aabb, const std::vector<Face*> & faces, std::stringstr
                         if(!bNegative && centroids.size() > 2){
                             if(centroids.at(nIndex).maxdiff == centroids.at(nIndex-1).maxdiff){
                                 bNegative = true;
-                                if(file != nullptr) *file << "To negative\n";
                                 bOk = false;
                             }
                         }
                         else*/ if(centroids.size() > 2){
                             if(centroids.at(nIndex).centroid == centroids.at(nIndex-1).centroid){
                                 bNegative = false;
-                                if(file != nullptr) *file << "Increase priority\n";
                                 if(nCurrentPriority < 2) nCurrentPriority++;
                                 bOk = false;
                             }
@@ -517,13 +580,11 @@ void BuildAabbTree(Aabb & aabb, const std::vector<Face*> & faces, std::stringstr
                             if(//centroids.at(nIndex).maxdiff == centroids.at(nIndex+1).maxdiff ||
                                centroids.at(nIndex).maxdiff == centroids.at(nIndex-1).maxdiff){
                                 bNegative = true;
-                                if(file != nullptr) *file << "To negative\n";
                                 bOk = false;
                             }
                         }
-                        else*/ if(centroids.at(nIndex).maxdiff == centroids.at(nIndex+1).maxdiff && centroids.size() > 2){
+                        else*/ if(centroids.size() > 2 && static_cast<std::size_t>(nIndex + 1) < centroids.size() && centroids.at(nIndex).maxdiff == centroids.at(nIndex+1).maxdiff){
                             bNegative = false;
-                            if(file != nullptr) *file << "Increase priority\n";
                             if(nCurrentPriority < 2) nCurrentPriority++;
                             bOk = false;
                         }
@@ -533,7 +594,6 @@ void BuildAabbTree(Aabb & aabb, const std::vector<Face*> & faces, std::stringstr
                     nCurrentPriority = 0;
                     bNegative = false;
                     bOk = false;
-                    if(file != nullptr) *file << "Resetting\n";
                 }
             }
             nTry++;
@@ -559,8 +619,9 @@ void BuildAabbTree(Aabb & aabb, const std::vector<Face*> & faces, std::stringstr
         else if(axispriority.at(nCurrentPriority).sName == "Z" && bNegative) aabb.nProperty = AABB_NEGATIVE_Z;
         else aabb.nProperty = 0;
 
-        for(int c = 0; c < centroids.size(); c++){
-            if(c < nIndex) half1.push_back(centroids.at(c).p_face);
+        const std::size_t splitIndex = static_cast<std::size_t>(nIndex);
+        for(std::size_t c = 0; c < centroids.size(); ++c){
+            if(c < splitIndex) half1.push_back(centroids.at(c).p_face);
             else half2.push_back(centroids.at(c).p_face);
         }
         centroids.resize(0);
@@ -568,30 +629,47 @@ void BuildAabbTree(Aabb & aabb, const std::vector<Face*> & faces, std::stringstr
 
         if(!half1.empty() && !half2.empty()){
             aabb.Child1.resize(1);
-            BuildAabbTree(aabb.Child1.front(), half1, file);
+            BuildAabb(aabb.Child1.front(), half1, file);
             aabb.Child2.resize(1);
-            BuildAabbTree(aabb.Child2.front(), half2, file);
+            BuildAabb(aabb.Child2.front(), half2, file);
         }
         else{
             if(file != nullptr) *file << "ERROR: One of the halves is empty!\n";
-            Error("AABB tree: One of the halves is empty!");
+            throw mdlexception("AABB tree build failed: one of the split halves is empty.");
         }
     }
+
+    restoreAabb.Commit();
 }
 
-void LinearizeAabbTree(Aabb & aabbroot, std::vector<Aabb> & aabbarray){
-    unsigned int nIndex = aabbarray.size();
-    aabbroot.nExtra = 4;
-    aabbarray.push_back(std::move(aabbroot));
+void LinearizeAabb(const Aabb & aabbroot, std::vector<Aabb> & aabbarray){
+    if(aabbroot.Child1.size() > 1 || aabbroot.Child2.size() > 1){
+        throw mdlexception("Cannot linearize AABB tree: a node has more than one child in a binary child slot; refusing to drop extra child data.");
+    }
+    // Keep the source tree intact while producing the flat BWM AABB array.
+    // The previous implementation moved child nodes out of the source tree and
+    // then recursed through references to elements inside aabbarray. A vector
+    // reallocation during recursion could invalidate those references and
+    // corrupt the tree being linearized.
+    const bool bHasChild1 = !aabbroot.Child1.empty();
+    const bool bHasChild2 = !aabbroot.Child2.empty();
 
-    if(aabbarray.at(nIndex).Child1.size() > 0){
-        aabbarray.at(nIndex).nChild1 = aabbarray.size();
-        LinearizeAabbTree(aabbarray.at(nIndex).Child1.front(), aabbarray);
+    const unsigned int nIndex = CheckedFlatAabbIndex(aabbarray.size());
+    Aabb out = aabbroot;
+    out.nExtra = 4;
+    out.Child1.clear();
+    out.Child2.clear();
+    aabbarray.push_back(std::move(out));
+
+    if(bHasChild1){
+        aabbarray.at(nIndex).nChild1 = CheckedFlatAabbIndex(aabbarray.size());
+        LinearizeAabb(aabbroot.Child1.front(), aabbarray);
     }
-    else aabbarray.at(nIndex).nChild1 = -1;
-    if(aabbarray.at(nIndex).Child2.size() > 0){
-        aabbarray.at(nIndex).nChild2 = aabbarray.size();
-        LinearizeAabbTree(aabbarray.at(nIndex).Child2.front(), aabbarray);
+    else aabbarray.at(nIndex).nChild1 = static_cast<unsigned int>(~0u);
+
+    if(bHasChild2){
+        aabbarray.at(nIndex).nChild2 = CheckedFlatAabbIndex(aabbarray.size());
+        LinearizeAabb(aabbroot.Child2.front(), aabbarray);
     }
-    else aabbarray.at(nIndex).nChild2 = -1;
+    else aabbarray.at(nIndex).nChild2 = static_cast<unsigned int>(~0u);
 }

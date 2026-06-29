@@ -1,7 +1,7 @@
 #ifndef BEAD_WINCTRL_H_INCLUDED
 #define BEAD_WINCTRL_H_INCLUDED
 
-#include <windows.h>
+#include "win32_compat.h"
 #include <commctrl.h>
 #include <string> //for std::string
 

@@ -6,27 +6,14 @@
     RetrieveString()       // Helper
     AddMenuLines()         // frame.h
     DetermineDisplayText() // frame.h
-/**/
+*/
 
-std::string RetrieveString(std::vector<std::string> & items, unsigned nIndex){
-    if(nIndex >= items.size()) return "";
+std::string RetrieveString(std::vector<std::string> & items, int nIndex){
+    if(nIndex < 0 || nIndex >= static_cast<int>(items.size())) return "";
     return items.at(nIndex);
 }
 
-void AddMenuLines(MDL & Mdl, std::vector<std::string> cItem, LPARAM lParam, MenuLineAdder * pmla, int nFile){
-
-    if(bShowHex && lParam){
-        std::vector<DataRegion> * p_dataRegions = GetDataRegions(cItem, lParam);
-
-        if(p_dataRegions) for(DataRegion & region : *p_dataRegions){
-            if(TabCtrl_GetTabIndexByText(hTabs, region.sFile) == -1) continue;
-
-            InsertMenu(pmla->hMenu, pmla->nIndex, MF_BYPOSITION | MF_STRING, IDPM_SCROLL, "Scroll here");
-            pmla->nIndex++;
-
-            break;
-        }
-    }
+void AddMenuLines(MDL & Mdl, std::vector<std::string> cItem, LPARAM /*lParam*/, MenuLineAdder * pmla, int nFile){
 
     if(RetrieveString(cItem, 0) == "") return;
 
@@ -41,12 +28,10 @@ void AddMenuLines(MDL & Mdl, std::vector<std::string> cItem, LPARAM lParam, Menu
         pmla->nIndex++;
         InsertMenu(pmla->hMenu, pmla->nIndex, MF_BYPOSITION | MF_STRING, IDPM_OPEN_EDITOR, "Edit values");
         pmla->nIndex++;
-        /*
         if(bShowHex){
             InsertMenu(pmla->hMenu, pmla->nIndex, MF_BYPOSITION | MF_STRING, IDPM_SCROLL, "Scroll here");
             pmla->nIndex++;
         }
-        */
     }
     /// Animation
     else if(RetrieveString(cItem, 1) == "Animations"){
@@ -54,23 +39,19 @@ void AddMenuLines(MDL & Mdl, std::vector<std::string> cItem, LPARAM lParam, Menu
         pmla->nIndex++;
         InsertMenu(pmla->hMenu, pmla->nIndex, MF_BYPOSITION | MF_STRING, IDPM_OPEN_EDITOR, "Edit values");
         pmla->nIndex++;
-        /*
         if(bShowHex){
             InsertMenu(pmla->hMenu, pmla->nIndex, MF_BYPOSITION | MF_STRING, IDPM_SCROLL, "Scroll here");
             pmla->nIndex++;
         }
-        */
     }
     /// Animation Node
     else if((RetrieveString(cItem, 2) == "Animations") || ((RetrieveString(cItem, 4) == "Animations") && ((RetrieveString(cItem, 1) == "Children") || (safesubstr(RetrieveString(cItem, 0), 0, 7) == "Parent:")))){
         InsertMenu(pmla->hMenu, pmla->nIndex, MF_BYPOSITION | MF_STRING, IDPM_VIEW_ASCII, "View ascii");
         pmla->nIndex++;
-        /*
         if(bShowHex){
             InsertMenu(pmla->hMenu, pmla->nIndex, MF_BYPOSITION | MF_STRING, IDPM_SCROLL, "Scroll here");
             pmla->nIndex++;
         }
-        */
     }
     /// Controllers
     else if(RetrieveString(cItem, 1) == "Controllers"){
@@ -85,8 +66,8 @@ void AddMenuLines(MDL & Mdl, std::vector<std::string> cItem, LPARAM lParam, Menu
             RetrieveString(cItem, 0) == "Emitter" ||
             RetrieveString(cItem, 0) == "Reference" ||
             RetrieveString(cItem, 0) == "Mesh" ||
-            RetrieveString(cItem, 1) == "Vertices" && nFile == 0 ||
-            RetrieveString(cItem, 1) == "Faces" && nFile == 0 ||
+            (RetrieveString(cItem, 1) == "Vertices" && nFile == 0) ||
+            (RetrieveString(cItem, 1) == "Faces" && nFile == 0) ||
             RetrieveString(cItem, 1) == "Bones" ||
             RetrieveString(cItem, 0) == "Danglymesh" ||
             RetrieveString(cItem, 1) == "Danglymesh" ||
@@ -96,18 +77,15 @@ void AddMenuLines(MDL & Mdl, std::vector<std::string> cItem, LPARAM lParam, Menu
         pmla->nIndex++;
     }
     else if(RetrieveString(cItem, 0) == "Vertices" && nFile == 0){
-        /*
         if(Mdl.Mdx && bShowHex){
             InsertMenu(pmla->hMenu, pmla->nIndex, MF_BYPOSITION | MF_STRING, IDPM_SCROLL, "Scroll here (MDX)");
             pmla->nIndex++;
         }
-        */
     }
     else return;
 }
 
 void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPrint, LPARAM lParam){
-    if(DEBUG_LEVEL > 1000) std::cout << "Updating Display!";
     bool bMdl = false, bWok = false, bPwk = false, bDwk0 = false, bDwk1 = false, bDwk2 = false;
     for(int j = 0; !bMdl && !bWok && !bPwk && !bDwk0 && !bDwk1 && !bDwk2; j++){
         if(cItem.at(j) == to_ansi(Model.GetFilename())) bMdl = true;
@@ -189,7 +167,7 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             sPrint << "\r\n" << "-- Events --";
             sPrint << "\r\n" << "Offset: " << anim->EventArray.nOffset;
             sPrint << "\r\n" << "Count: " << anim->EventArray.nCount;
-            for(int e = 0; e < anim->Events.size(); e++){
+            for(int e = 0; e < static_cast<int>(anim->Events.size()); e++){
                 sPrint << "\r\n" << "Event " << e << ":  " << anim->Events.at(e).sName.c_str() << " at " << PrepareFloat(anim->Events.at(e).fTime);
             }
         }
@@ -206,20 +184,11 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             sPrint << "\r\n" << "Total Nodes: " << Data.MH.GH.nTotalNumberOfNodes << " (with Supermodel)";
             sPrint << "\r\n";
             sPrint << "\r\n" << "Layout Position: " << PrepareFloat(Data.MH.vLytPosition.fX) << " " << PrepareFloat(Data.MH.vLytPosition.fY) << " " << PrepareFloat(Data.MH.vLytPosition.fZ);
-            if(Data.MH.nTotalVertCount){
-                sPrint << "\r\n";
-                sPrint << "\r\n" << "Total Verts on Model: " << Data.MH.nTotalVertCount;
-                if(Data.MH.nExcludedVerts) sPrint << " (" << Data.MH.nTotalVertCount - Data.MH.nExcludedVerts << " without lightsaber verts)";
-                if(Data.MH.nTotalTangent1Count) sPrint << "\r\n" << "Total Verts with Tangent Space 1: " << Data.MH.nTotalTangent1Count;
-                if(Data.MH.nTotalTangent2Count) sPrint << "\r\n" << "Total Verts with Tangent Space 2: " << Data.MH.nTotalTangent2Count;
-                if(Data.MH.nTotalTangent3Count) sPrint << "\r\n" << "Total Verts with Tangent Space 3: " << Data.MH.nTotalTangent3Count;
-                if(Data.MH.nTotalTangent4Count) sPrint << "\r\n" << "Total Verts with Tangent Space 4: " << Data.MH.nTotalTangent4Count;
-            }
         }
 
         /// Node ///
         else if((((RetrieveString(cItem, 1) == "Geometry") || (RetrieveString(cItem, 2) == "Animations") || (RetrieveString(cItem, 1) == "Children") || (safesubstr(RetrieveString(cItem, 0), 0, 7) == "Parent:"))
-                 || (bModelHierarchy && (cItem.size() > 2 && cItem.at(cItem.size() - 2) == "Geometry" || cItem.size() > 3 && cItem.at(cItem.size() - 2) == "Animations"))) && !bWok){
+                 || (bModelHierarchy && ((cItem.size() > 2 && cItem.at(cItem.size() - 2) == "Geometry") || (cItem.size() > 3 && cItem.at(cItem.size() - 2) == "Animations")))) && !bWok){
             Node * node = (Node * ) lParam;
             //std::cout << "Current name in problematic position: " << RetrieveString(cItem, 0).c_str() << "\n";
             sPrint << "== " << Data.MH.Names[node->Head.nNameIndex].sName.c_str() << " ==";
@@ -243,18 +212,19 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             if(!node->nAnimation.Valid()){
                 sPrint << "\r\n";
                 sPrint << "\r\n" << "Position: " << PrepareFloat(node->Head.vPos.fX);
-                for(int cifra = 0; cifra < (13 - PrepareFloat(node->Head.vPos.fX).length()); cifra++) sPrint << " ";
+                for(int cifra = 0; cifra < (13 - static_cast<int>(PrepareFloat(node->Head.vPos.fX).length())); cifra++) sPrint << " ";
                 sPrint << " (" << PrepareFloat(node->Head.vFromRoot.fX) << ")";
                 sPrint << "\r\n" << "          " << PrepareFloat(node->Head.vPos.fY);
-                for(int cifra = 0; cifra < (13 - PrepareFloat(node->Head.vPos.fY).length()); cifra++) sPrint << " ";
+                for(int cifra = 0; cifra < (13 - static_cast<int>(PrepareFloat(node->Head.vPos.fY).length())); cifra++) sPrint << " ";
                 sPrint << " (" << PrepareFloat(node->Head.vFromRoot.fY) << ")";
                 sPrint << "\r\n" << "          " << PrepareFloat(node->Head.vPos.fZ);
-                for(int cifra = 0; cifra < (13 - PrepareFloat(node->Head.vPos.fZ).length()); cifra++) sPrint << " ";
+                for(int cifra = 0; cifra < (13 - static_cast<int>(PrepareFloat(node->Head.vPos.fZ).length())); cifra++) sPrint << " ";
                 sPrint << " (" << PrepareFloat(node->Head.vFromRoot.fZ) << ")";
-                sPrint << "\r\n" << "Orientation: " << PrepareFloat(node->Head.oOrient.GetQuaternion().vAxis.fX);// << " (AA " << PrepareFloat(node->Head.oOrient.GetAxisAngle().vAxis.fX) << ")";
-                sPrint << "\r\n" << "             " << PrepareFloat(node->Head.oOrient.GetQuaternion().vAxis.fY);// << " (AA " << PrepareFloat(node->Head.oOrient.GetAxisAngle().vAxis.fY) << ")";
-                sPrint << "\r\n" << "             " << PrepareFloat(node->Head.oOrient.GetQuaternion().vAxis.fZ);// << " (AA " << PrepareFloat(node->Head.oOrient.GetAxisAngle().vAxis.fZ) << ")";
-                sPrint << "\r\n" << "             " << PrepareFloat(node->Head.oOrient.GetQuaternion().fW);// << " (AA " << PrepareFloat(node->Head.oOrient.GetAxisAngle().fAngle) << ")";
+                Quaternion qOrientation = node->Head.oOrient.GetQuaternionValue();
+                sPrint << "\r\n" << "Orientation: " << PrepareFloat(qOrientation.vAxis.fX);// << " (AA " << PrepareFloat(node->Head.oOrient.GetAxisAngle().vAxis.fX) << ")";
+                sPrint << "\r\n" << "             " << PrepareFloat(qOrientation.vAxis.fY);// << " (AA " << PrepareFloat(node->Head.oOrient.GetAxisAngle().vAxis.fY) << ")";
+                sPrint << "\r\n" << "             " << PrepareFloat(qOrientation.vAxis.fZ);// << " (AA " << PrepareFloat(node->Head.oOrient.GetAxisAngle().vAxis.fZ) << ")";
+                sPrint << "\r\n" << "             " << PrepareFloat(qOrientation.fW);// << " (AA " << PrepareFloat(node->Head.oOrient.GetAxisAngle().fAngle) << ")";
             }
         }
         else if(RetrieveString(cItem, 0) == "Controllers"){
@@ -270,14 +240,12 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             sPrint << "\r\n" << "Count:  " << head->ControllerDataArray.nCount;
             if(fFloats.size() > 0){
                 //sPrint << "\r\n" << "Data:";
-                char cSpaces [10];
                 int i = 0;
-                while(i < fFloats.size()){
+                while(i < static_cast<int>(fFloats.size())){
                     //std::cout << string_format("Printing Controller Data float %i\n", i);
-                    if(fFloats[i] >= 0.0 || (!std::isfinite(fFloats[i]) && !(fFloats[i] < 0.0))) sprintf(cSpaces, " ");
-                    else sprintf(cSpaces, "");
-                    if(i < 10) strcat(cSpaces, " ");
-                    sPrint << "\r\n" << "Data " << i << ": " << cSpaces << " " << PrepareFloat(fFloats[i], false);
+                    std::string sSpaces = (fFloats[i] >= 0.0 || (!std::isfinite(fFloats[i]) && !(fFloats[i] < 0.0))) ? " " : "";
+                    if(i < 10) sSpaces += " ";
+                    sPrint << "\r\n" << "Data " << i << ": " << sSpaces << " " << PrepareFloat(fFloats[i], false);
                     i++;
                 }
             }
@@ -292,20 +260,18 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             sPrint << "\r\n" << "Value Count:   " << ctrl->nValueCount.Print();
             sPrint << "\r\n" << "Timekey Start: " << ctrl->nTimekeyStart.Print();
             sPrint << "\r\n" << "Data Start:    " << ctrl->nDataStart.Print();
-            if(!ctrl->nColumnCount.Valid()) throw mdlexception("Column count is not valid!");
             sPrint << "\r\n" << "Column Count:  " << (int) (ctrl->nColumnCount & 15);
             sPrint << "\r\n" << "Bezier: " << (ctrl->nColumnCount & 16 ? 1 : 0);
             sPrint << "\r\n";
-            if(!ctrl->nValueCount.Valid()) throw mdlexception("Value count is not valid!");
             sPrint << "\r\n" << "Value" << (ctrl->nValueCount > 1 ? "s" : "") << ":";
 
             Node * tempNode = nullptr;
             if(ctrl->nAnimation.Valid()){
                 Animation & anim = Data.MH.Animations.at(ctrl->nAnimation);
-                for(int an = 0; an < anim.ArrayOfNodes.size() && tempNode == nullptr; an++){
+                for(int an = 0; an < static_cast<int>(anim.ArrayOfNodes.size()) && tempNode == nullptr; an++){
                     Node & animNode = anim.ArrayOfNodes.at(an);
                     if(ctrl->nNameIndex == animNode.Head.nNameIndex){
-                        for(int ac = 0; ac < animNode.Head.Controllers.size() && tempNode == nullptr; ac++){
+                        for(int ac = 0; ac < static_cast<int>(animNode.Head.Controllers.size()) && tempNode == nullptr; ac++){
                             if(&animNode.Head.Controllers.at(ac) == ctrl) tempNode = &animNode;
                         }
                     }
@@ -325,7 +291,7 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
 
                         /// Compressed orientation
                         if(ctrl->nColumnCount == 2){
-                            Quaternion qCurrent = DecompressQuaternion(*(unsigned*) &node.Head.ControllerData.at(ctrl->nDataStart + n));
+                            Quaternion qCurrent = DecompressQuaternion(FloatBits(static_cast<float>(node.Head.ControllerData.at(ctrl->nDataStart + n))));
 
                             sPrint << PrepareFloat(qCurrent.vAxis.fX) << " " << PrepareFloat(qCurrent.vAxis.fY) << " " << PrepareFloat(qCurrent.vAxis.fZ) << " " << PrepareFloat(qCurrent.fW);
                         }
@@ -426,7 +392,7 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             sPrint << "\r\n" << "Flare:          " << light->nFlare;
             sPrint << "\r\n" << "Fading Light:   " << light->nFadingLight;
             sPrint << "\r\n";
-            sPrint << "\r\n" << "-- Lens Flares --";
+            sPrint << "\r\n" << "== Lens Flares ==";
             sPrint << "\r\n" << "Flare Radius: " << PrepareFloat(light->fFlareRadius);
             sPrint << "\r\n";
             sPrint << "\r\n" << "Sizes Offset: " << light->FlareSizeArray.nOffset;
@@ -451,11 +417,11 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             for(nPos = sName.length() - 1; nPos >= 0 && sName.at(nPos) != ' '; nPos--){}
             if(nPos == 0) return;
             try{ nIndex = stoi(sName.substr(nPos+1),(size_t*) NULL); }
-            catch(std::invalid_argument){
+            catch(const std::invalid_argument &){
                 std::cout << "DetermineTreeText - Lens Flare: There was an error converting the string: " << sName.substr(nPos) << ".\n";
                 return;
             }
-            if(!nIndex.Valid()) throw mdlexception("Lens flare index that should be retreived from the name in the tree item is invalid.");
+            if(!nIndex.Valid()) throw mdlexception("The label of the lens flare in the tree is not properly formatted!");
 
             sPrint << "== " << sName << " ==";
             try{ sPrint << "\r\n" << "Size:        " << PrepareFloat(light->FlareSizes.at(nIndex)); }
@@ -525,10 +491,10 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             sPrint << "== Mesh ==";
             sPrint << "\r\n" << "-- Textures --";
             sPrint << "\r\n" << "Texture Count: " << mesh->nTextureNumber;
-            sPrint << "\r\n" << "Texture 1: " << mesh->GetTexture(1);
-            sPrint << "\r\n" << "Texture 2: " << mesh->GetTexture(2);
-            sPrint << "\r\n" << "Texture 3: " << mesh->GetTexture(3);
-            sPrint << "\r\n" << "Texture 4: " << mesh->GetTexture(4);
+            sPrint << "\r\n" << "Texture 1: " << mesh->cTexture1.c_str();
+            sPrint << "\r\n" << "Texture 2: " << mesh->cTexture2.c_str();
+            sPrint << "\r\n" << "Texture 3: " << mesh->cTexture3.c_str();
+            sPrint << "\r\n" << "Texture 4: " << mesh->cTexture4.c_str();
             sPrint << "\r\n";
             sPrint << "\r\n" << "-- Trimesh Flags --";
             sPrint << "\r\n" << "Render:              " << (int) mesh->nRender;
@@ -710,19 +676,19 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             if(!Model.bXbox){
                 sPrint << "\r\n" << "-- MDL Data --";
                 sPrint << "\r\n" << "Vertex: " << PrepareFloat(vert->fX, false);
-                for(int cifra = 0; cifra < (13 - PrepareFloat(vert->fX, false).length()); cifra++) sPrint << " ";
+                for(int cifra = 0; cifra < (13 - static_cast<int>(PrepareFloat(vert->fX, false).length())); cifra++) sPrint << " ";
                 sPrint << " (" << PrepareFloat(vert->vFromRoot.fX, false) << ")";
                 sPrint << "\r\n" << "        " << PrepareFloat(vert->fY, false);
-                for(int cifra = 0; cifra < (13 - PrepareFloat(vert->fY, false).length()); cifra++) sPrint << " ";
+                for(int cifra = 0; cifra < (13 - static_cast<int>(PrepareFloat(vert->fY, false).length())); cifra++) sPrint << " ";
                 sPrint << " (" << PrepareFloat(vert->vFromRoot.fY, false) << ")";
                 sPrint << "\r\n" << "        " << PrepareFloat(vert->fZ, false);
-                for(int cifra = 0; cifra < (13 - PrepareFloat(vert->fZ, false).length()); cifra++) sPrint << " ";
+                for(int cifra = 0; cifra < (13 - static_cast<int>(PrepareFloat(vert->fZ, false).length())); cifra++) sPrint << " ";
                 sPrint << " (" << PrepareFloat(vert->vFromRoot.fZ, false) << ")";
             }
 
             VertexData * mdx = &vert->MDXData;
-            MdlInteger<unsigned short> nNodeIndex = Model.GetNodeIndexByNameIndex(mdx->nNameIndex);
-            if(!nNodeIndex.Valid()) throw mdlexception("tree display generation error: dealing with a name index that does not have a node in geometry.");
+            int nNodeIndex = Model.GetNodeIndexByNameIndex(mdx->nNameIndex);
+            if(nNodeIndex == -1) throw mdlexception("tree display generation error: dealing with a name index that does not have a node in geometry.");
             Node & node = Data.MH.ArrayOfNodes.at(nNodeIndex);
             if(!(node.Head.nType & NODE_SABER)){
                 if(node.Mesh.nMdxDataSize > 0 && Model.Mdx){
@@ -826,7 +792,7 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             sPrint << "\r\n" << "Indices Count: " << mesh->nVertIndicesCount << " (Offset: " << mesh->IndexCounterArray.nOffset << ")";
             sPrint << "\r\n" << "Indices Offset: " << mesh->nVertIndicesLocation << " (Offset: " << mesh->IndexLocationArray.nOffset << ")";
             //sPrint << "\r\n";
-            for(int n = 0; n < mesh->VertIndices.size(); n++){
+            for(int n = 0; n < static_cast<int>(mesh->VertIndices.size()); n++){
                 sPrint << "\r\n" << "Face " << n << ":  " << mesh->VertIndices.at(n).at(0) << ", " << mesh->VertIndices.at(n).at(1) << ", " << mesh->VertIndices.at(n).at(2);
             }
         }
@@ -869,19 +835,19 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             sPrint << "\r\n" << "-- Bone Indices --";
             for(int n = 0; n < 16; n++) sPrint << "\r\n" << "Index " << n+1 << ": " << skin->nBoneIndices[n];
             sPrint << "\r\n";
-            sPrint << "\r\n" << "-- Bonemap --";
+            sPrint << "\r\n" << "== Bonemap ==";
             sPrint << "\r\n" << "Offset: " << skin->nOffsetToBonemap;
             sPrint << "\r\n" << "Count:  " << skin->nNumberOfBonemap;
             sPrint << "\r\n";
-            sPrint << "\r\n" << "-- Q Bones --";
+            sPrint << "\r\n" << "== Q Bones ==";
             sPrint << "\r\n" << "Offset: " << skin->QBoneArray.nOffset;
             sPrint << "\r\n" << "Count:  " << skin->QBoneArray.nCount;
             sPrint << "\r\n";
-            sPrint << "\r\n" << "-- T Bones --";
+            sPrint << "\r\n" << "== T Bones ==";
             sPrint << "\r\n" << "Offset: " << skin->TBoneArray.nOffset;
             sPrint << "\r\n" << "Count:  " << skin->TBoneArray.nCount;
             sPrint << "\r\n";
-            sPrint << "\r\n" << "-- Array8 --";
+            sPrint << "\r\n" << "== Array8 ==";
             sPrint << "\r\n" << "Offset: " << skin->Array8Array.nOffset;
             sPrint << "\r\n" << "Count:  " << skin->Array8Array.nCount;
         }
@@ -892,10 +858,11 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             sPrint << "\r\n" << "TBone: " << PrepareFloat(bone->TBone.fX);
             sPrint << "\r\n" << "       " << PrepareFloat(bone->TBone.fY);
             sPrint << "\r\n" << "       " << PrepareFloat(bone->TBone.fZ);
-            sPrint << "\r\n" << "QBone: " << PrepareFloat(bone->QBone.GetQuaternion().vAxis.fX);
-            sPrint << "\r\n" << "       " << PrepareFloat(bone->QBone.GetQuaternion().vAxis.fY);
-            sPrint << "\r\n" << "       " << PrepareFloat(bone->QBone.GetQuaternion().vAxis.fZ);
-            sPrint << "\r\n" << "       " << PrepareFloat(bone->QBone.GetQuaternion().fW);
+            Quaternion qBone = bone->QBone.GetQuaternionValue();
+            sPrint << "\r\n" << "QBone: " << PrepareFloat(qBone.vAxis.fX);
+            sPrint << "\r\n" << "       " << PrepareFloat(qBone.vAxis.fY);
+            sPrint << "\r\n" << "       " << PrepareFloat(qBone.vAxis.fZ);
+            sPrint << "\r\n" << "       " << PrepareFloat(qBone.fW);
         }
 
         /// Danglymesh ///
@@ -923,11 +890,11 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             for(nPos = sName.length() - 1; nPos >= 0 && sName.at(nPos) != ' '; nPos--){}
             if(nPos == 0) return;
             try{ nIndex = stoi(sName.substr(nPos+1),(size_t*) NULL); }
-            catch(std::invalid_argument){
+            catch(const std::invalid_argument &){
                 std::cout << "DetermineTreeText - Dangly Vertices: There was an error converting the string: " << sName.substr(nPos) << ".\n";
                 return;
             }
-            if(!nIndex.Valid()) throw mdlexception("Dangly vert index that should be retreived from the name in the tree item is invalid.");
+            if(!nIndex.Valid()) throw mdlexception("The label of the vertex in the tree is not properly formatted!");
 
             sPrint <<           "== " << RetrieveString(cItem, 0).c_str() << " ==";
             sPrint << "\r\n" << "Constraint: " << PrepareFloat(dangly->Constraints.at(nIndex));
@@ -1044,7 +1011,6 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
             sPrint << "\r\n" << "2nd Child Property: " << aabb->nProperty.Print() << " (" << sProperty << ")";
             sPrint << "\r\n" << "Child 1 Index: " << aabb->nChild1.Print();
             sPrint << "\r\n" << "Child 2 Index: " << aabb->nChild2.Print();
-            sPrint << "\r\n" << "Unknown: " << aabb->nExtra;
         }
         else if((RetrieveString(cItem, 0) == "Vertices")){
             sPrint <<           "== Vertices ==";
@@ -1053,10 +1019,10 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
         }
         else if(RetrieveString(cItem, 1) == "Vertices"){
             Vector * vert = (Vector * ) lParam;
-            sPrint <<           "== " << RetrieveString(cItem, 0).c_str() << "==";
-            sPrint << "\r\n" << "x: " << PrepareFloat(vert->fX);
-            sPrint << "\r\n" << "y: " << PrepareFloat(vert->fY);
-            sPrint << "\r\n" << "z: " << PrepareFloat(vert->fZ);
+            sPrint <<           "== " << RetrieveString(cItem, 0).c_str() << " ==";
+            sPrint << "\r\n" << "Vertex:  " << PrepareFloat(vert->fX);
+            sPrint << "\r\n" << "         " << PrepareFloat(vert->fY);
+            sPrint << "\r\n" << "         " << PrepareFloat(vert->fZ);
         }
         else if((RetrieveString(cItem, 0) == "Faces")){
             sPrint <<           "== Faces ==";
@@ -1097,7 +1063,6 @@ void DetermineDisplayText(std::vector<std::string>cItem, std::stringstream & sPr
         else if(RetrieveString(cItem, 1) == "Edges"){
             sPrint <<           "== " << RetrieveString(cItem, 0).c_str() << " ==";
             sPrint << "\r\n" << "Index: " << ((Edge*) lParam)->nIndex.Print();
-            sPrint << "\r\n" << "Transition: " << ((Edge*) lParam)->nTransition.Print();
         }
         else if(RetrieveString(cItem, 0) == "Perimeters"){
             sPrint <<           "== Perimeters ==";

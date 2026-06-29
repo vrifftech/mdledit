@@ -2,6 +2,36 @@
 #include <windowsx.h>
 #include <algorithm>
 
+namespace {
+    std::string GetListViewTextString(HWND hControl, int nItem, int nSubItem, int nMaxChars = 256){
+        if(hControl == NULL || nItem < 0 || nSubItem < 0 || nMaxChars <= 1) return std::string();
+
+        std::string sText(static_cast<std::size_t>(nMaxChars), '\0');
+        LVITEMA item = {};
+        item.iSubItem = nSubItem;
+        item.pszText = &sText[0];
+        item.cchTextMax = nMaxChars;
+
+        const LRESULT nChars = SendMessageA(hControl, LVM_GETITEMTEXTA,
+                                            static_cast<WPARAM>(nItem),
+                                            reinterpret_cast<LPARAM>(&item));
+        if(nChars < 0) return std::string();
+
+        const std::size_t nLength = std::min<std::size_t>(static_cast<std::size_t>(nChars),
+                                                          sText.size() - 1u);
+        sText.resize(nLength);
+        return sText;
+    }
+
+    std::string GetWindowTextString(HWND hWnd, int nMaxChars = 256){
+        if(hWnd == NULL || nMaxChars <= 0) return std::string();
+        std::string sText(static_cast<std::size_t>(nMaxChars), '\0');
+        const int nChars = GetWindowText(hWnd, &sText[0], nMaxChars);
+        if(nChars < 0) return std::string();
+        sText.resize(static_cast<std::size_t>(nChars));
+        return sText;
+    }
+}
 INT_PTR CALLBACK TexturesProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam){
     static bool bChange = false;
     static bool bReady = false;
@@ -18,16 +48,16 @@ INT_PTR CALLBACK TexturesProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             //Create ListViews
             HWND hList1 = CreateWindowEx(WS_EX_CLIENTEDGE, WC_LISTVIEW, "", WS_CHILD | WS_VISIBLE | LVS_EDITLABELS | LVS_NOCOLUMNHEADER | LVS_REPORT | LVS_SINGLESEL,
                                          5, 25 + 5, 230, 180,
-                                         hwnd, (HMENU) IDC_TEXTURE_LISTVIEW1, NULL, NULL);
+                                         hwnd, (HMENU) IDC_TEXTURE_LISTVIEW1, nullptr, nullptr);
             HWND hList2 = CreateWindowEx(WS_EX_CLIENTEDGE, WC_LISTVIEW, "", WS_CHILD | WS_VISIBLE | LVS_EDITLABELS | LVS_NOCOLUMNHEADER | LVS_REPORT | LVS_SINGLESEL,
                                          240, 25 + 5, 230, 180,
-                                         hwnd, (HMENU) IDC_TEXTURE_LISTVIEW2, NULL, NULL);
+                                         hwnd, (HMENU) IDC_TEXTURE_LISTVIEW2, nullptr, nullptr);
             HWND hList3 = CreateWindowEx(WS_EX_CLIENTEDGE, WC_LISTVIEW, "", WS_CHILD | WS_VISIBLE | LVS_EDITLABELS | LVS_NOCOLUMNHEADER | LVS_REPORT | LVS_SINGLESEL,
                                          5, 25 + 190, 230, 60,
-                                         hwnd, (HMENU) IDC_TEXTURE_LISTVIEW3, NULL, NULL);
+                                         hwnd, (HMENU) IDC_TEXTURE_LISTVIEW3, nullptr, nullptr);
             HWND hList4 = CreateWindowEx(WS_EX_CLIENTEDGE, WC_LISTVIEW, "", WS_CHILD | WS_VISIBLE | LVS_EDITLABELS | LVS_NOCOLUMNHEADER | LVS_REPORT | LVS_SINGLESEL,
                                          240, 25 + 190, 230, 60,
-                                         hwnd, (HMENU) IDC_TEXTURE_LISTVIEW4, NULL, NULL);
+                                         hwnd, (HMENU) IDC_TEXTURE_LISTVIEW4, nullptr, nullptr);
             ListView_SetExtendedListViewStyle(hList1, LVS_EX_DOUBLEBUFFER /*| LVS_EX_AUTOSIZECOLUMNS */ | LVS_EX_CHECKBOXES);
             ListView_SetExtendedListViewStyle(hList2, LVS_EX_DOUBLEBUFFER /*| LVS_EX_AUTOSIZECOLUMNS */ | LVS_EX_CHECKBOXES);
             ListView_SetExtendedListViewStyle(hList3, LVS_EX_DOUBLEBUFFER /*| LVS_EX_AUTOSIZECOLUMNS */ | LVS_EX_CHECKBOXES);
@@ -49,57 +79,68 @@ INT_PTR CALLBACK TexturesProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
                     //std::cout << "Mdl has data\n";
                     FileHeader & Data = *Mdl->GetFileData();
                     int nCount1 = 0, nCount2 = 0, nCount3 = 0, nCount4 = 0;
-                    LVITEM item;
+                    LVITEM item = {};
                     item.mask = LVIF_TEXT | LVIF_STATE;
                     item.stateMask = 0;
                     item.iSubItem  = 0;
                     item.state     = 0;
-                    LVFINDINFO find;
+                    LVFINDINFO find = {};
                     find.flags = LVFI_STRING;
-                    std::string sSearch = std::string(32, '\0');
-                    find.psz = &sSearch.front();
-                    for(int n = 0; n < Data.MH.ArrayOfNodes.size(); n++){
+                    std::string sSearch;
+                    for(std::size_t n = 0; n < Data.MH.ArrayOfNodes.size(); ++n){
                         //std::cout << "Checking node\n";
                         Node & node = Data.MH.ArrayOfNodes.at(n);
                         if(node.Head.nType & NODE_MESH && !(node.Head.nType & NODE_AABB) && !(node.Head.nType & NODE_SABER)){
                             if(std::string(node.Mesh.cTexture1.c_str()) != "" && std::string(node.Mesh.cTexture1.c_str()) != "NULL"){
                                 sSearch = node.Mesh.cTexture1;
-                                std::transform(sSearch.begin(), sSearch.end(), sSearch.begin(), ::tolower);
+                                find.psz = const_cast<char*>(sSearch.c_str());
                                 if(ListView_FindItem(hList1, -1, &find) == -1){
-                                    item.pszText = &sSearch.front();
-                                    nCount1 = ListView_InsertItem(hList1, &item);
-                                    if(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT1) ListView_SetCheckState(hList1, nCount1, true);
-                                    nCount1++;
+                                    item.iItem = nCount1;
+                                    item.pszText = const_cast<char*>(sSearch.c_str());
+                                    const int nInserted = ListView_InsertItem(hList1, &item);
+                                    if(nInserted != -1){
+                                        if(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT1) ListView_SetCheckState(hList1, nInserted, true);
+                                        nCount1++;
+                                    }
                                 }
                             }
                             if(node.Mesh.cTexture2.c_str() != std::string("") && node.Mesh.cTexture2.c_str() != std::string("NULL")){
                                 sSearch = node.Mesh.cTexture2;
-                                std::transform(sSearch.begin(), sSearch.end(), sSearch.begin(), ::tolower);
+                                find.psz = const_cast<char*>(sSearch.c_str());
                                 if(ListView_FindItem(hList2, -1, &find) == -1){
-                                    item.pszText = &sSearch.front();
-                                    nCount2 = ListView_InsertItem(hList2, &item);
-                                    if(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT2) ListView_SetCheckState(hList2, nCount2, true);
-                                    nCount2++;
+                                    item.iItem = nCount2;
+                                    item.pszText = const_cast<char*>(sSearch.c_str());
+                                    const int nInserted = ListView_InsertItem(hList2, &item);
+                                    if(nInserted != -1){
+                                        if(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT2) ListView_SetCheckState(hList2, nInserted, true);
+                                        nCount2++;
+                                    }
                                 }
                             }
                             if(node.Mesh.cTexture3.c_str() != std::string("") && node.Mesh.cTexture3.c_str() != std::string("NULL")){
                                 sSearch = node.Mesh.cTexture3;
-                                std::transform(sSearch.begin(), sSearch.end(), sSearch.begin(), ::tolower);
+                                find.psz = const_cast<char*>(sSearch.c_str());
                                 if(ListView_FindItem(hList3, -1, &find) == -1){
-                                    item.pszText = &sSearch.front();
-                                    nCount3 = ListView_InsertItem(hList3, &item);
-                                    if(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT3) ListView_SetCheckState(hList3, nCount3, true);
-                                    nCount3++;
+                                    item.iItem = nCount3;
+                                    item.pszText = const_cast<char*>(sSearch.c_str());
+                                    const int nInserted = ListView_InsertItem(hList3, &item);
+                                    if(nInserted != -1){
+                                        if(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT3) ListView_SetCheckState(hList3, nInserted, true);
+                                        nCount3++;
+                                    }
                                 }
                             }
                             if(node.Mesh.cTexture4.c_str() != std::string("") && node.Mesh.cTexture4.c_str() != std::string("NULL")){
                                 sSearch = node.Mesh.cTexture4;
-                                std::transform(sSearch.begin(), sSearch.end(), sSearch.begin(), ::tolower);
+                                find.psz = const_cast<char*>(sSearch.c_str());
                                 if(ListView_FindItem(hList4, -1, &find) == -1){
-                                    item.pszText = &sSearch.front();
-                                    nCount4 = ListView_InsertItem(hList4, &item);
-                                    if(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT4) ListView_SetCheckState(hList4, nCount4, true);
-                                    nCount4++;
+                                    item.iItem = nCount4;
+                                    item.pszText = const_cast<char*>(sSearch.c_str());
+                                    const int nInserted = ListView_InsertItem(hList4, &item);
+                                    if(nInserted != -1){
+                                        if(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT4) ListView_SetCheckState(hList4, nInserted, true);
+                                        nCount4++;
+                                    }
                                 }
                             }
                         }
@@ -112,7 +153,7 @@ INT_PTR CALLBACK TexturesProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         case WM_NOTIFY:
         {
             NMHDR* hdr = (NMHDR*) lParam;
-            int nNotification = hdr->code;
+            const UINT nNotification = static_cast<UINT>(hdr->code);
             int nID = hdr->idFrom;
             HWND hControl = hdr->hwndFrom;
             switch(nID){
@@ -128,26 +169,24 @@ INT_PTR CALLBACK TexturesProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
                                 bool bChecked = ListView_GetCheckState(hControl, ia->iItem);
                                 //std::cout << "Model is good, bChecked=" << bChecked << "\n";
                                 FileHeader & Data = *Mdl->GetFileData();
-                                std::string sOldTex;
-                                sOldTex.resize(33);
-                                ListView_GetItemText(hControl, ia->iItem, 0, &sOldTex.front(), 33);
-                                for(int n = 0; n < Data.MH.ArrayOfNodes.size(); n++){
+                                std::string sOldTex = GetListViewTextString(hControl, ia->iItem, 0);
+                                for(std::size_t n = 0; n < Data.MH.ArrayOfNodes.size(); ++n){
                                     Node & node = Data.MH.ArrayOfNodes.at(n);
                                     if(node.Head.nType & NODE_MESH && !(node.Head.nType & NODE_AABB)){
-                                        if(nID == IDC_TEXTURE_LISTVIEW1 && StringEqual(sOldTex.c_str(), node.Mesh.cTexture1.c_str()) && (!bChecked != !(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT1))){
+                                        if(nID == IDC_TEXTURE_LISTVIEW1 && StringEqual(sOldTex.c_str(), node.Mesh.cTexture1.c_str(), true) && (!bChecked != !(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT1))){
                                             //std::cout << "Found difference. (" << Data.MH.Names.at(node.Head.nNameIndex).sName << ")\n";
                                             bChange = true;
                                             node.Mesh.nMdxDataBitmap = node.Mesh.nMdxDataBitmap ^ MDX_FLAG_TANGENT1;
                                         }
-                                        else if(nID == IDC_TEXTURE_LISTVIEW2 && StringEqual(sOldTex.c_str(), node.Mesh.cTexture2.c_str()) && (!bChecked != !(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT2))){
+                                        else if(nID == IDC_TEXTURE_LISTVIEW2 && StringEqual(sOldTex.c_str(), node.Mesh.cTexture2.c_str(), true) && (!bChecked != !(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT2))){
                                             bChange = true;
                                             node.Mesh.nMdxDataBitmap = node.Mesh.nMdxDataBitmap ^ MDX_FLAG_TANGENT2;
                                         }
-                                        else if(nID == IDC_TEXTURE_LISTVIEW3 && StringEqual(sOldTex.c_str(), node.Mesh.cTexture3.c_str()) && (!bChecked != !(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT3))){
+                                        else if(nID == IDC_TEXTURE_LISTVIEW3 && StringEqual(sOldTex.c_str(), node.Mesh.cTexture3.c_str(), true) && (!bChecked != !(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT3))){
                                             bChange = true;
                                             node.Mesh.nMdxDataBitmap = node.Mesh.nMdxDataBitmap ^ MDX_FLAG_TANGENT3;
                                         }
-                                        else if(nID == IDC_TEXTURE_LISTVIEW4 && StringEqual(sOldTex.c_str(), node.Mesh.cTexture4.c_str()) && (!bChecked != !(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT4))){
+                                        else if(nID == IDC_TEXTURE_LISTVIEW4 && StringEqual(sOldTex.c_str(), node.Mesh.cTexture4.c_str(), true) && (!bChecked != !(node.Mesh.nMdxDataBitmap & MDX_FLAG_TANGENT4))){
                                             bChange = true;
                                             node.Mesh.nMdxDataBitmap = node.Mesh.nMdxDataBitmap ^ MDX_FLAG_TANGENT4;
                                         }
@@ -157,24 +196,20 @@ INT_PTR CALLBACK TexturesProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
                         }
                     }
                     else if(nNotification == LVN_BEGINLABELEDIT){
-                        NMLVDISPINFO * info = (NMLVDISPINFO *) lParam;
                         HWND hEdit = ListView_GetEditControl(hControl);
-                        if(nID == IDC_TEXTURE_LISTVIEW3 || nID == IDC_TEXTURE_LISTVIEW4) SendMessage(hEdit, EM_LIMITTEXT, (WPARAM) 12, NULL);
-                        else SendMessage(hEdit, EM_LIMITTEXT, (WPARAM) 32, NULL);
+                        if(nID == IDC_TEXTURE_LISTVIEW3 || nID == IDC_TEXTURE_LISTVIEW4) SendMessage(hEdit, EM_LIMITTEXT, (WPARAM) 12, 0);
+                        else SendMessage(hEdit, EM_LIMITTEXT, (WPARAM) 32, 0);
                         return true; /// Allow the user to edit the label. Returning false would prevent it.
                     }
                     else if(nNotification == LVN_ENDLABELEDIT){
                         NMLVDISPINFO * info = (NMLVDISPINFO *) lParam;
-                        HWND hEdit = ListView_GetEditControl(hControl);
                         if(info->item.pszText != nullptr && Mdl !=nullptr){
                             std::string sNewTex = info->item.pszText;
-                            std::string sOldTex;
-                            sOldTex.resize(33);
-                            ListView_GetItemText(hControl, info->item.iItem, 0, &sOldTex.front(), 33);
+                            std::string sOldTex = GetListViewTextString(hControl, info->item.iItem, 0);
 
-                            LVFINDINFO find;
+                            LVFINDINFO find = {};
                             find.flags = LVFI_STRING;
-                            find.psz = &sNewTex.front();
+                            find.psz = const_cast<char*>(sNewTex.c_str());
                             bool bRemove = false;
                             bool bCancel = false;
                             if(ListView_FindItem(hControl, -1, &find) != -1){
@@ -186,7 +221,7 @@ INT_PTR CALLBACK TexturesProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
                             if(sNewTex != sOldTex && Mdl->GetFileData() && !bCancel){
                                 FileHeader & Data = *Mdl->GetFileData();
                                 if(sNewTex.size() > 16) MessageBox(hwnd, "Texture name is longer than 16 characters. This may or my not cause problems in the game.", "Warning", MB_ICONWARNING | MB_OK);
-                                for(int n = 0; n < Data.MH.ArrayOfNodes.size(); n++){
+                                for(std::size_t n = 0; n < Data.MH.ArrayOfNodes.size(); ++n){
                                     Node & node = Data.MH.ArrayOfNodes.at(n);
                                     if(node.Head.nType & NODE_MESH && !(node.Head.nType & NODE_AABB)){
                                         if(nID == IDC_TEXTURE_LISTVIEW1 && std::string(node.Mesh.cTexture1.c_str()) == std::string(sOldTex.c_str())) Mdl->UpdateTexture(node, sNewTex, 1);
@@ -196,7 +231,7 @@ INT_PTR CALLBACK TexturesProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
                                     }
                                 }
                                 if(bRemove) ListView_DeleteItem(hControl, info->item.iItem);
-                                else ListView_SetItemText(hControl, info->item.iItem, 0, &sNewTex.front());
+                                else ListView_SetItemText(hControl, info->item.iItem, 0, const_cast<char*>(sNewTex.c_str()));
                             }
                         }
                     }
@@ -207,13 +242,10 @@ INT_PTR CALLBACK TexturesProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         break;
         case WM_COMMAND:
         {
-            int nNotification = HIWORD(wParam);
-            int nID = LOWORD(wParam);
-            HWND hControl = (HWND) lParam;
+            (void)wParam;
+            (void)lParam;
             if(Mdl != nullptr){
-                switch(nID){
-
-                }
+                // Reserved for future texture-settings commands.
             }
         }
         break;
@@ -252,7 +284,7 @@ INT_PTR CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             nCrease = Mdl->nCreaseAngle;
             if(Mdl->bSmoothAngleWeighting) Button_SetCheck(GetDlgItem(hwnd, DLG_ID_ANGLE_WEIGHT), BST_CHECKED);
             if(Mdl->bSmoothAreaWeighting) Button_SetCheck(GetDlgItem(hwnd, DLG_ID_AREA_WEIGHT), BST_CHECKED);
-            if(Mdl->bBinaryPostProcess) Button_SetCheck(GetDlgItem(hwnd, DLG_ID_CALC_SMOOTHING), BST_CHECKED);
+            if(Mdl->bDetermineSmoothing) Button_SetCheck(GetDlgItem(hwnd, DLG_ID_CALC_SMOOTHING), BST_CHECKED);
             if(Mdl->bWriteAnimations) Button_SetCheck(GetDlgItem(hwnd, DLG_ID_DO_ANIMATIONS), BST_CHECKED);
             if(Mdl->bSkinToTrimesh) Button_SetCheck(GetDlgItem(hwnd, DLG_ID_SKIN_TRIMESH), BST_CHECKED);
             if(Mdl->bLightsaberToTrimesh) Button_SetCheck(GetDlgItem(hwnd, DLG_ID_SABER_TRIMESH), BST_CHECKED);
@@ -269,7 +301,6 @@ INT_PTR CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         break;
         case WM_COMMAND:
         {
-            int nNotification = HIWORD(wParam);
             int nID = LOWORD(wParam);
             HWND hControl = (HWND) lParam;
             MDL * Mdl = nullptr;
@@ -290,8 +321,8 @@ INT_PTR CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
                     break;
                     case DLG_ID_CALC_SMOOTHING:
                     {
-                        if(Button_GetCheck(hControl) == BST_CHECKED) Mdl->bBinaryPostProcess = true;
-                        else Mdl->bBinaryPostProcess = false;
+                        if(Button_GetCheck(hControl) == BST_CHECKED) Mdl->bDetermineSmoothing = true;
+                        else Mdl->bDetermineSmoothing = false;
                     }
                     break;
                     case DLG_ID_DO_ANIMATIONS:
@@ -362,9 +393,7 @@ INT_PTR CALLBACK SettingsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
                     break;
                     case DLG_ID_CREASE_ANGLE_DEG:
                     {
-                        std::string sBuff (255, 0);
-                        GetWindowText(GetDlgItem(hwnd, DLG_ID_CREASE_ANGLE_DEG), &sBuff.front(), 255);
-                        sBuff = sBuff.c_str();
+                        std::string sBuff = GetWindowTextString(GetDlgItem(hwnd, DLG_ID_CREASE_ANGLE_DEG));
                         if(sBuff == "") Mdl->nCreaseAngle = 60;
                         else Mdl->nCreaseAngle = stou(sBuff);
                     }

@@ -12,13 +12,19 @@ struct TokenDatum{
     unsigned int nMaxString = 0;
     int nBytes = 0;
     TokenDatum(){}
-    TokenDatum(const std::string & s1, const std::string & s2, const std::string & s3, void * ptr, int n1): sToken(s1), sDataType(s2), sFile(s3), data(ptr), nOffset(n1)
-    {
-        if(s2 == "bool" || s2 == "char" || s2 == "unsigned char" || s2 == "signed char") nBytes = 1;
-        else if(s2 == "short" || s2 == "unsigned short" || s2 == "signed short") nBytes = 2;
-        else if(s2 == "bitflag" || s2 == "double" || s2 == "int" || s2 == "unsigned int" || s2 == "signed int") nBytes = 4;
-    }
+    TokenDatum(const std::string & s1, const std::string & s2, const std::string & s3, void * ptr, int n1);
+    ~TokenDatum();
 };
+
+TokenDatum::TokenDatum(const std::string & s1, const std::string & s2, const std::string & s3, void * ptr, int n1): sToken(s1), sDataType(s2), sFile(s3), data(ptr), nOffset(n1)
+{
+    if(s2 == "bool" || s2 == "char" || s2 == "unsigned char" || s2 == "signed char") nBytes = 1;
+    else if(s2 == "short" || s2 == "unsigned short" || s2 == "signed short") nBytes = 2;
+    else if(s2 == "bitflag" || s2 == "double" || s2 == "int" || s2 == "unsigned int" || s2 == "signed int") nBytes = 4;
+}
+
+TokenDatum::~TokenDatum(){
+}
 
 class EditorDlgWindow: public TextFile{
     WNDCLASSEX WindowClass;
@@ -48,7 +54,7 @@ EditorDlgWindow::EditorDlgWindow(){
     // #1 Basics
     WindowClass.cbSize = sizeof(WNDCLASSEX); // Must always be sizeof(WNDCLASSEX)
     WindowClass.lpszClassName = cClassName; // Name of this class
-    WindowClass.hInstance = GetModuleHandle(NULL); // Instance of the application
+    WindowClass.hInstance = GetModuleHandle(nullptr); // Instance of the application
     WindowClass.lpfnWndProc = EditorDlgWindowProc; // Pointer to callback procedure
 
     // #2 Class styles
@@ -61,8 +67,8 @@ EditorDlgWindow::EditorDlgWindow(){
     WindowClass.hCursor = LoadCursor(NULL, IDC_ARROW); // Class cursor
 
     // #5 Icon
-    WindowClass.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Class Icon
-    WindowClass.hIconSm = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Small icon for this class
+    WindowClass.hIcon = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Class Icon
+    WindowClass.hIconSm = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_DLG_ICON)); //NULL; // Small icon for this class
 
     // #6 Menu
     WindowClass.lpszMenuName = MAKEINTRESOURCE(IDM_EDITOR_DLG); // Menu Resource
@@ -82,9 +88,9 @@ bool EditorDlgWindow::Run(){
         bRegistered = true;
     }
     //HMENU *has* to be NULL!!!!! Otherwise the function fails to create the window!
-    hMe = CreateWindowEx(NULL, WindowClass.lpszClassName, "", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    hMe = CreateWindowEx(0, WindowClass.lpszClassName, "", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                          CW_USEDEFAULT, CW_USEDEFAULT, 600, 300,
-                         HWND_DESKTOP, NULL, GetModuleHandle(NULL), this);
+                         HWND_DESKTOP, nullptr, GetModuleHandle(nullptr), this);
     if(!hMe) return false;
     ShowWindow(hMe, true);
     return true;
@@ -121,17 +127,15 @@ LRESULT CALLBACK EditorDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPA
                 "Consolas" 	// pointer to typeface name string
             );
             GetClientRect(hwnd, &rcClient);
-            hEdit = CreateWindowEx(NULL, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOHSCROLL | ES_AUTOVSCROLL | WS_VSCROLL,
+            hEdit = CreateWindowEx(0, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOHSCROLL | ES_AUTOVSCROLL | WS_VSCROLL,
                            rcClient.left+3, rcClient.top, rcClient.right-3, rcClient.bottom,
-                           hwnd, (HMENU) IDDB_EDIT, GetModuleHandle(NULL), NULL);
+                           hwnd, (HMENU) IDDB_EDIT, GetModuleHandle(nullptr), nullptr);
             SendMessage(hEdit, WM_SETFONT, (WPARAM) hFont1, MAKELPARAM(TRUE, 0));
         }
         break;
         case WM_COMMAND:
         {
-            int nNotification = HIWORD(wParam);
             int nID = LOWORD(wParam);
-            HWND hControl = (HWND) lParam;
             switch(nID){
                 case IDDB_SAVE:
                 {
@@ -158,12 +162,12 @@ LRESULT CALLBACK EditorDlgWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPA
         break;
         case WM_SIZE:
         {
-            SetWindowPos(hEdit, NULL, rcClient.left+3, rcClient.top, rcClient.right-3, rcClient.bottom, NULL);
+            SetWindowPos(hEdit, nullptr, rcClient.left+3, rcClient.top, rcClient.right-3, rcClient.bottom, 0);
         }
         break;
         case WM_DESTROY:
             SetWindowText(hEdit, "");
-            for(int i = 0; i < EditDlgs.size(); i++){
+            for(int i = 0; i < static_cast<int>(EditDlgs.size()); i++){
                 if(&EditDlgs.at(i) == editdlg) EditDlgs.erase(EditDlgs.begin() + i);
             }
         break;
@@ -185,19 +189,13 @@ bool EditorDlgWindow::GetTokenData(MDL & mdl, std::vector<std::string> sItems, L
         if(sItems.at(0) == "Header"){
             ssName << "Header";
             ModelHeader & MH = * (ModelHeader*) lParam;
-            TokenData.push_back(TokenDatum("model_name", "string", "MDL", (void*) &MH.GH.sName, 20));
-            TokenData.back().nMaxString = 32;
             TokenData.push_back(TokenDatum("supermodel", "string", "MDL", (void*) &MH.cSupermodelName, 148));
             TokenData.back().nMaxString = 32;
             TokenData.push_back(TokenDatum("classification", "unsigned char", "MDL", (void*) &MH.nClassification, 92));
-            TokenData.push_back(TokenDatum("unknown1", "unsigned char", "MDL", (void*) &MH.nSubclassification, 93));
             TokenData.push_back(TokenDatum("unknown2", "unsigned char", "MDL", (void*) &MH.nUnknown, 94));
-            TokenData.push_back(TokenDatum("affectedByFog", "unsigned char", "MDL", (void*) &MH.nAffectedByFog, 95));
             TokenData.push_back(TokenDatum("animation_scale", "double", "MDL", (void*) &MH.fScale, 144));
             TokenData.push_back(TokenDatum("bmin_x", "double", "MDL", (void*) &MH.vBBmin.fX, 116));
-            TokenData.push_back(TokenDatum("bmin_y", "double", "MDL", (void*) &MH.vBBmin.fY, 120));
             TokenData.push_back(TokenDatum("bmin_z", "double", "MDL", (void*) &MH.vBBmin.fZ, 124));
-            TokenData.push_back(TokenDatum("bmax_x", "double", "MDL", (void*) &MH.vBBmax.fX, 128));
             TokenData.push_back(TokenDatum("bmax_y", "double", "MDL", (void*) &MH.vBBmax.fY, 132));
             TokenData.push_back(TokenDatum("bmax_z", "double", "MDL", (void*) &MH.vBBmax.fZ, 136));
             TokenData.push_back(TokenDatum("radius", "double", "MDL", (void*) &MH.fRadius, 140));
@@ -211,7 +209,7 @@ bool EditorDlgWindow::GetTokenData(MDL & mdl, std::vector<std::string> sItems, L
             TokenData.push_back(TokenDatum("transition", "double", "MDL", (void*) &anim.fTransition, MDL_OFFSET + anim.nOffset + 84));
             TokenData.push_back(TokenDatum("animroot", "string", "MDL", (void*) &anim.sAnimRoot, MDL_OFFSET + anim.nOffset + 88));
             TokenData.back().nMaxString = 32;
-            for(int e = 0; e < anim.Events.size(); e++){
+            for(int e = 0; e < static_cast<int>(anim.Events.size()); e++){
                 TokenData.push_back(TokenDatum("event_" + std::to_string(e) + "_time", "double", "MDL", (void*) &anim.Events.at(e).fTime, MDL_OFFSET + anim.EventArray.nOffset + e * 36 + 0));
                 TokenData.push_back(TokenDatum("event_" + std::to_string(e) + "_name", "string", "MDL", (void*) &anim.Events.at(e).sName, MDL_OFFSET + anim.EventArray.nOffset + e * 36 + 4));
                 TokenData.back().nMaxString = 32;
@@ -248,7 +246,7 @@ bool EditorDlgWindow::GetTokenData(MDL & mdl, std::vector<std::string> sItems, L
             /// First let's get the number of the bone from its name.
             MdlInteger<unsigned int> nNum;
             if(safesubstr(sItems.at(0), 0, 11) == "Lens Flare "){
-                std::string sNum (safesubstr(sItems.at(0), 11, std::string::npos));
+                std::string sNum (safesubstr(sItems.at(0), 11));
                 try{
                     nNum = stoi(sNum, (size_t*) NULL);
                 }
@@ -385,15 +383,15 @@ bool EditorDlgWindow::GetTokenData(MDL & mdl, std::vector<std::string> sItems, L
         }
         else if(sItems.at(1) == "Vertices"){
             Vertex & vert = * (Vertex * ) lParam;
-            MdlInteger<unsigned short> nNodeIndex = mdl.GetNodeIndexByNameIndex(vert.MDXData.nNameIndex);
-            if(!nNodeIndex.Valid()) throw mdlexception("GetTokenData() error: dealing with a name index that does not have a node in geometry.");
+            int nNodeIndex = mdl.GetNodeIndexByNameIndex(vert.MDXData.nNameIndex);
+            if(nNodeIndex == -1) throw mdlexception("GetTokenData() error: dealing with a name index that does not have a node in geometry.");
             Node & node = Data.ArrayOfNodes.at(nNodeIndex);
             ssName << "Geometry > " << Data.Names.at(node.Head.nNameIndex).sName.c_str() << " > Mesh > Vertices > " << sItems.at(0);
 
             /// First let's get the number of the vertex from its name.
             MdlInteger<unsigned int> nNum;
             if(safesubstr(sItems.at(0), 0, 7) == "Vertex "){
-                std::string sNum (safesubstr(sItems.at(0), 7, std::string::npos));
+                std::string sNum (safesubstr(sItems.at(0), 7));
                 try{
                     nNum = stoi(sNum,(size_t*) NULL);
                 }
@@ -494,15 +492,15 @@ bool EditorDlgWindow::GetTokenData(MDL & mdl, std::vector<std::string> sItems, L
         }
         else if(sItems.at(1) == "Faces"){
             Face & face = * (Face*) lParam;
-            MdlInteger<unsigned short> nNodeIndex = mdl.GetNodeIndexByNameIndex(face.nNameIndex);
-            if(!nNodeIndex.Valid()) throw mdlexception("GetTokenData() error: dealing with a name index that does not have a node in geometry.");
+            int nNodeIndex = mdl.GetNodeIndexByNameIndex(face.nNameIndex);
+            if(nNodeIndex == -1) throw mdlexception("GetTokenData() error: dealing with a name index that does not have a node in geometry.");
             Node & node = Data.ArrayOfNodes.at(nNodeIndex);
             ssName << "Geometry > " << Data.Names.at(node.Head.nNameIndex).sName.c_str() << " > Mesh > Faces > " << sItems.at(0);
 
             /// First let's get the number of the bone from its name.
             MdlInteger<unsigned int> nNum;
             if(safesubstr(sItems.at(0), 0, 5) == "Face "){
-                std::string sNum (safesubstr(sItems.at(0), 5, std::string::npos));
+                std::string sNum (safesubstr(sItems.at(0), 5));
                 try{
                     nNum = stoi(sNum,(size_t*) NULL);
                 }
@@ -520,15 +518,15 @@ bool EditorDlgWindow::GetTokenData(MDL & mdl, std::vector<std::string> sItems, L
         }
         else if(sItems.at(1) == "Bones"){
             Bone & bone = * (Bone*) lParam;
-            MdlInteger<unsigned short> nNodeIndex = mdl.GetNodeIndexByNameIndex(bone.nNameIndex);
-            if(!nNodeIndex.Valid()) throw mdlexception("GetTokenData() error: dealing with a name index that does not have a node in geometry.");
+            int nNodeIndex = mdl.GetNodeIndexByNameIndex(bone.nNameIndex);
+            if(nNodeIndex == -1) throw mdlexception("GetTokenData() error: dealing with a name index that does not have a node in geometry.");
             Node & node = Data.ArrayOfNodes.at(nNodeIndex);
             ssName << "Geometry > " << Data.Names.at(node.Head.nNameIndex).sName.c_str() << " > Skin > Bones > " << sItems.at(0);
 
             /// First let's get the number of the bone from its name.
             MdlInteger<unsigned int> nNum;
             if(safesubstr(sItems.at(0), 0, 5) == "Bone "){
-                std::string sNum (safesubstr(sItems.at(0), 5, std::string::npos));
+                std::string sNum (safesubstr(sItems.at(0), 5));
                 nNum = mdl.GetNameIndex(sNum);
             }
             if(nNum.Valid()){
@@ -556,7 +554,7 @@ bool EditorDlgWindow::GetTokenData(MDL & mdl, std::vector<std::string> sItems, L
             /// First let's get the number of the vertex from its name.
             MdlInteger<unsigned int> nNum;
             if(safesubstr(sItems.at(0), 0, 14) == "Dangly Vertex "){
-                std::string sNum (safesubstr(sItems.at(0), 14, std::string::npos));
+                std::string sNum (safesubstr(sItems.at(0), 14));
                 try{
                     nNum = stoi(sNum,(size_t*) NULL);
                 }
@@ -580,15 +578,15 @@ bool EditorDlgWindow::GetTokenData(MDL & mdl, std::vector<std::string> sItems, L
         }
         else if(sItems.at(1) == "Lightsaber"){
             VertexData & vert = * (VertexData * ) lParam;
-            MdlInteger<unsigned short> nNodeIndex = mdl.GetNodeIndexByNameIndex(vert.nNameIndex);
-            if(!nNodeIndex.Valid()) throw mdlexception("GetTokenData() error: dealing with a name index that does not have a node in geometry.");
+            int nNodeIndex = mdl.GetNodeIndexByNameIndex(vert.nNameIndex);
+            if(nNodeIndex == -1) throw mdlexception("GetTokenData() error: dealing with a name index that does not have a node in geometry.");
             Node & node = Data.ArrayOfNodes.at(nNodeIndex);
             ssName << "Geometry > " << Data.Names.at(node.Head.nNameIndex).sName.c_str() << " > Lightsaber > " << sItems.at(0);
 
             /// First let's get the number of the vertex from its name.
             MdlInteger<unsigned int> nNum;
             if(safesubstr(sItems.at(0), 0, 18) == "Lightsaber Vertex "){
-                std::string sNum (safesubstr(sItems.at(0), 18, std::string::npos));
+                std::string sNum (safesubstr(sItems.at(0), 18));
                 try{
                     nNum = stoi(sNum,(size_t*) NULL);
                 }
@@ -609,16 +607,16 @@ bool EditorDlgWindow::GetTokenData(MDL & mdl, std::vector<std::string> sItems, L
         }
         else if(sItems.at(1) == "Controllers"){
             Controller & ctrl = * (Controller *) lParam;
-            MdlInteger<short unsigned> nNodeIndex = mdl.GetNodeIndexByNameIndex(ctrl.nNameIndex);
-            if(!nNodeIndex.Valid()) throw mdlexception("GetTokenData() error: dealing with a name index that does not have a node in geometry.");
+            int nNodeIndex = mdl.GetNodeIndexByNameIndex(ctrl.nNameIndex);
+            if(nNodeIndex == -1) throw mdlexception("GetTokenData() error: dealing with a name index that does not have a node in geometry.");
             Node & geonode = Data.ArrayOfNodes.at(nNodeIndex);
             Node * tempNode = nullptr;
             if(ctrl.nAnimation.Valid()){
                 Animation & anim = Data.Animations.at(ctrl.nAnimation);
-                for(int an = 0; an < anim.ArrayOfNodes.size() && tempNode == nullptr; an++){
+                for(int an = 0; an < static_cast<int>(anim.ArrayOfNodes.size()) && tempNode == nullptr; an++){
                     Node & animNode = anim.ArrayOfNodes.at(an);
                     if(ctrl.nNameIndex == animNode.Head.nNameIndex){
-                        for(int ac = 0; ac < animNode.Head.Controllers.size() && tempNode == nullptr; ac++){
+                        for(int ac = 0; ac < static_cast<int>(animNode.Head.Controllers.size()) && tempNode == nullptr; ac++){
                             if(&animNode.Head.Controllers.at(ac) == &ctrl) tempNode = &animNode;
                         }
                     }
@@ -634,7 +632,7 @@ bool EditorDlgWindow::GetTokenData(MDL & mdl, std::vector<std::string> sItems, L
             }
 
             std::string sCtrlName = ReturnControllerName(ctrl.nControllerType, geonode.Head.nType);
-            std::transform(sCtrlName.begin(), sCtrlName.end(), sCtrlName.begin(), ::tolower);
+            ToLowerInPlace(sCtrlName);
 
             std::vector<std::string> sComponents;
             if(sCtrlName == "position"){
@@ -710,22 +708,9 @@ bool EditorDlgWindow::GetTokenData(MDL & mdl, std::vector<std::string> sItems, L
 
         if(sItems.at(0) == "Header"){
             ssName << "Header";
-            TokenData.push_back(TokenDatum("walkmesh_type", "int", sBinFile, (void*) &bwm.nType, 8));
             TokenData.push_back(TokenDatum("use_hook_1_x", "double", sBinFile, (void*) &bwm.vUse1.fX, 12));
             TokenData.push_back(TokenDatum("use_hook_1_y", "double", sBinFile, (void*) &bwm.vUse1.fY, 16));
-            TokenData.push_back(TokenDatum("use_hook_1_z", "double", sBinFile, (void*) &bwm.vUse1.fZ, 20));
-            TokenData.push_back(TokenDatum("use_hook_2_x", "double", sBinFile, (void*) &bwm.vUse2.fX, 24));
-            TokenData.push_back(TokenDatum("use_hook_2_y", "double", sBinFile, (void*) &bwm.vUse2.fY, 28));
-            TokenData.push_back(TokenDatum("use_hook_2_z", "double", sBinFile, (void*) &bwm.vUse2.fZ, 32));
-            TokenData.push_back(TokenDatum("use_hook_3_x", "double", sBinFile, (void*) &bwm.vDwk1.fX, 36));
-            TokenData.push_back(TokenDatum("use_hook_3_y", "double", sBinFile, (void*) &bwm.vDwk1.fY, 40));
-            TokenData.push_back(TokenDatum("use_hook_3_z", "double", sBinFile, (void*) &bwm.vDwk1.fZ, 44));
-            TokenData.push_back(TokenDatum("use_hook_4_x", "double", sBinFile, (void*) &bwm.vDwk2.fX, 48));
-            TokenData.push_back(TokenDatum("use_hook_4_y", "double", sBinFile, (void*) &bwm.vDwk2.fY, 52));
             TokenData.push_back(TokenDatum("use_hook_4_z", "double", sBinFile, (void*) &bwm.vDwk2.fZ, 56));
-            TokenData.push_back(TokenDatum("position_x", "double", sBinFile, (void*) &bwm.vPosition.fX, 60));
-            TokenData.push_back(TokenDatum("position_y", "double", sBinFile, (void*) &bwm.vPosition.fY, 64));
-            TokenData.push_back(TokenDatum("position_z", "double", sBinFile, (void*) &bwm.vPosition.fZ, 68));
         }
     }
 
@@ -733,11 +718,6 @@ bool EditorDlgWindow::GetTokenData(MDL & mdl, std::vector<std::string> sItems, L
 }
 
 void OpenEditorDlg(MDL & Mdl, std::vector<std::string> cItem, LPARAM lParam, int nFile){
-    bool bVertex = false;
-    if(cItem[0].length() > 6){
-        if(cItem[0].substr(0, 6) == "Vertex") bVertex = true;
-    }
-
     EditDlgs.reserve(10);
     if(EditDlgs.size() >= 10) return; /// Don't open a new window if we have 10 already
 
@@ -753,7 +733,7 @@ void OpenEditorDlg(MDL & Mdl, std::vector<std::string> cItem, LPARAM lParam, int
     if(!EDW.GetTokenData(Mdl, cItem, lParam, sName, nFile)) return;
 
     /// Write out window contents
-    for(int t = 0; t < EDW.TokenData.size(); t++){
+    for(int t = 0; t < static_cast<int>(EDW.TokenData.size()); t++){
         TokenDatum & token = EDW.TokenData.at(t);
         sPrint << token.sToken << " ";
         if(token.sDataType == "bool") sPrint << (* (bool*) token.data ? 1 : 0);
@@ -769,7 +749,7 @@ void OpenEditorDlg(MDL & Mdl, std::vector<std::string> cItem, LPARAM lParam, int
         else if(token.sDataType == "double") sPrint << PrepareFloat(* (double*) token.data);
         else if(token.sDataType == "string") sPrint << ((std::string*) token.data)->c_str();
         else if(token.sDataType == "bitflag") sPrint << ((* (unsigned int*) token.data) & token.nBitflag ? 1 : 0);
-        if(t + 1 < EDW.TokenData.size()) sPrint << "\r\n";
+        if(t + 1 < static_cast<int>(EDW.TokenData.size())) sPrint << "\r\n";
         else sPrint << '\0';
     }
 
@@ -812,9 +792,9 @@ bool EditorDlgWindow::SaveData(){
             continue;
         }
 
-        std::transform(sID.begin(), sID.end(), sID.begin(), ::tolower);
+        ToLowerInPlace(sID);
 
-        for(int t = 0; t < TokenData.size(); t++){
+        for(int t = 0; t < static_cast<int>(TokenData.size()); t++){
             TokenDatum & token = TokenData.at(t);
             if(token.sToken != sID) continue;
 
@@ -871,7 +851,7 @@ bool EditorDlgWindow::SaveData(){
                     short * nVariable = (short*) token.data;
                     if(ReadInt(nConvert, &sGet)){
                         *nVariable = nConvert;
-                        ph_bb2 = *(unsigned short*)nVariable;
+                        std::memcpy(&ph_bb2, nVariable, sizeof(ph_bb2));
                         bWrite = true;
                     }
                 }
@@ -879,7 +859,7 @@ bool EditorDlgWindow::SaveData(){
                     unsigned short * nVariable = (unsigned short*) token.data;
                     if(ReadUInt(uConvert, &sGet)){
                         *nVariable = uConvert;
-                        ph_bb2 = *(unsigned short*)nVariable;
+                        std::memcpy(&ph_bb2, nVariable, sizeof(ph_bb2));
                         bWrite = true;
                     }
                 }
@@ -887,7 +867,7 @@ bool EditorDlgWindow::SaveData(){
                     signed short * nVariable = (signed short*) token.data;
                     if(ReadInt(nConvert, &sGet)){
                         *nVariable = nConvert;
-                        ph_bb2 = *(unsigned short*)nVariable;
+                        std::memcpy(&ph_bb2, nVariable, sizeof(ph_bb2));
                         bWrite = true;
                     }
                 }
@@ -908,7 +888,7 @@ bool EditorDlgWindow::SaveData(){
                     int * nVariable = (int*) token.data;
                     if(ReadInt(nConvert, &sGet)){
                         *nVariable = nConvert;
-                        ph_bb4 = *(unsigned*)nVariable;
+                        ph_bb4 = static_cast<unsigned>(*nVariable);
                         bWrite = true;
                     }
                 }
@@ -916,7 +896,7 @@ bool EditorDlgWindow::SaveData(){
                     unsigned int * nVariable = (unsigned int*) token.data;
                     if(ReadUInt(uConvert, &sGet)){
                         *nVariable = uConvert;
-                        ph_bb4 = *(unsigned*)nVariable;
+                        ph_bb4 = static_cast<unsigned>(*nVariable);
                         bWrite = true;
                     }
                 }
@@ -924,7 +904,7 @@ bool EditorDlgWindow::SaveData(){
                     signed int * nVariable = (signed int*) token.data;
                     if(ReadInt(nConvert, &sGet)){
                         *nVariable = nConvert;
-                        ph_bb4 = *(unsigned*)nVariable;
+                        ph_bb4 = static_cast<unsigned>(*nVariable);
                         bWrite = true;
                     }
                 }
@@ -935,7 +915,7 @@ bool EditorDlgWindow::SaveData(){
                         if(ssCompare.str() != sGet){
                             *fVariable = fConvert;
                             float fPH = (float) fConvert;
-                            ph_bb4 = *(unsigned*)&fPH;
+                            ph_bb4 = FloatBits(fPH);
                             bWrite = true;
                         }
                     }
@@ -945,7 +925,7 @@ bool EditorDlgWindow::SaveData(){
                     if(ReadInt(nConvert, &sGet)){
                         if(nConvert != 0) *nVariable = *nVariable | token.nBitflag;
                         else *nVariable = *nVariable & (~token.nBitflag);
-                        ph_bb4 = *(unsigned*)nVariable;
+                        ph_bb4 = static_cast<unsigned>(*nVariable);
                         bWrite = true;
                     }
                 }
@@ -969,11 +949,11 @@ bool EditorDlgWindow::SaveData(){
                 }
             }
           }
-          catch(std::invalid_argument){
+          catch(const std::invalid_argument &){
             Error("The value " + sGet + " is invalid for " + token.sToken + ".");
                 bError = true;
           }
-          catch(std::out_of_range){
+          catch(const std::out_of_range &){
             Error("The value " + sGet + " for " + token.sToken + " is out of range (data type: " + token.sDataType + ").");
                 bError = true;
           }

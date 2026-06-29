@@ -1,43 +1,81 @@
 #include "general.h"
+
 #include "file.h"
 #include <iostream>
 #include <fstream>
 #include <algorithm>
-#include <Shlwapi.h>
+#include <cwchar>
+#include <cstdint>
+#include <limits>
+#include <shlwapi.h>
 
-std::wstring Path::GetFullPath(){
-    return sFullPath;
+BB2 ByteBlock2;
+BB4 ByteBlock4;
+BB8 ByteBlock8;
+
+const std::string File::GetName(){
+    return "";
 }
-std::wstring Path::GetDirectory(){
-    std::wstring sReturn = sFullPath;
-    PathRemoveFileSpecW(&sReturn.front());
-    sReturn = sReturn.c_str();
-    sReturn += L"\\";
-    return sReturn;
+
+std::vector<char> & File::CreateBuffer(long unsigned nSize){
+    if(static_cast<std::size_t>(nSize) > sBuffer.max_size()){
+        throw mdlexception("Requested file buffer is too large.");
+    }
+    bDataLoaded = true;
+    nPosition = 0;
+    sBuffer.assign(static_cast<std::size_t>(nSize), 0);
+    return sBuffer;
 }
-std::wstring Path::GetFilename(){
-    std::wstring sReturn = sFullPath;    PathStripPathW(&sReturn.front());
-    sReturn = sReturn.c_str();
-    return sReturn;
+
+void File::FlushAll(){
+    bDataLoaded = false;
+    nPosition = 0;
+    std::vector<char>().swap(sBuffer);
 }
-std::wstring Path::GetFilenameNoExt(){
-    std::wstring sReturn = sFullPath;
-    sReturn = PathFindFileNameW(&sReturn.front());
-    PathRemoveExtensionW(&sReturn.front());
-    sReturn = sReturn.c_str();
-    return sReturn;
+
+File::~File(){}
+
+void File::Export(std::string &sExport){
+    sExport.assign(sBuffer.begin(), sBuffer.end());
 }
-std::wstring Path::GetExtension(){
-    std::wstring sReturn = sFullPath;
-    sReturn = PathFindExtensionW(&sReturn.front());
-    return sReturn;
+
+std::vector<char> & BinaryFile::CreateBuffer(long unsigned nSize){
+    const std::size_t nRequested = static_cast<std::size_t>(nSize);
+    if(nRequested > sBuffer.max_size() || nRequested > bKnown.max_size()){
+        throw mdlexception("Requested binary file buffer is too large.");
+    }
+    bDataLoaded = true;
+    nPosition = 0;
+    sBuffer.assign(nRequested, 0);
+    bKnown.assign(nRequested, 0);
+    return sBuffer;
+}
+
+void BinaryFile::FlushAll(){
+    bDataLoaded = false;
+    nPosition = 0;
+    std::vector<char>().swap(sBuffer);
+    std::vector<char>().swap(sCompareBuffer);
+    std::vector<int>().swap(bKnown);
+}
+
+BinaryFile::~BinaryFile(){}
+
+std::vector<char> & TextFile::CreateBuffer(long unsigned nSize){
+    nLine = 1;
+    return File::CreateBuffer(nSize);
+}
+
+void TextFile::FlushAll(){
+    nLine = 1;
+    File::FlushAll();
 }
 
 HANDLE bead_CreateReadFile(const std::string & sFilename){
-    return CreateFileA(sFilename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    return CreateFileA(sFilename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
 }
 HANDLE bead_CreateReadFile(const std::wstring & sFilename){
-    return CreateFileW(sFilename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    return CreateFileW(sFilename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
 }
 HANDLE bead_CreateWriteFile(const std::string & sFilename){
     return CreateFileA(sFilename.c_str(), GENERIC_WRITE, 0x00, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -46,122 +84,187 @@ HANDLE bead_CreateWriteFile(const std::wstring & sFilename){
     return CreateFileW(sFilename.c_str(), GENERIC_WRITE, 0x00, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 }
 long unsigned bead_GetFileLength(HANDLE hFile){
+    if(hFile == INVALID_HANDLE_VALUE) return 0;
+
     LARGE_INTEGER lnSize;
-    if(GetFileSizeEx(hFile, &lnSize)){
-        return static_cast<long unsigned>(lnSize.QuadPart);
+    if(GetFileSizeEx(hFile, &lnSize) && lnSize.QuadPart >= 0){
+        const unsigned long long nSize = static_cast<unsigned long long>(lnSize.QuadPart);
+        const unsigned long long nMax = static_cast<unsigned long long>(std::numeric_limits<long unsigned>::max());
+        if(nSize > nMax) return std::numeric_limits<long unsigned>::max();
+        return static_cast<long unsigned>(nSize);
     }
     return 0;
 }
 
-DWORD g_BytesTransferred = 0;
-VOID CALLBACK FileIOCompletionRoutine(DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED lpOverlapped){
-    std::cout << "Error code:\t" << dwErrorCode << "\n";
-    std::cout << "Number of bytes:\t" << dwNumberOfBytesTransfered << "\n";
-    g_BytesTransferred = dwNumberOfBytesTransfered;
-}
-
 bool bead_ReadFile(HANDLE hFile, std::vector<char> & sBuffer, unsigned long nToRead){
-    OVERLAPPED ol = {0};
+    if(hFile == INVALID_HANDLE_VALUE) return false;
+
+    const unsigned long fileLength = bead_GetFileLength(hFile);
     unsigned long length = nToRead;
-    if(nToRead > bead_GetFileLength(hFile)) length = bead_GetFileLength(hFile);
-    return ReadFileEx(hFile, &sBuffer.front(), length, &ol, FileIOCompletionRoutine);
+    if(length == ~0ul) length = fileLength;
+    if(length > fileLength) length = fileLength;
+
+    // Most full-file callers allocate the buffer before reading. This keeps
+    // that behavior, but also makes the helper safe for direct full-file reads
+    // into an empty buffer. Header probe reads still keep their fixed small
+    // buffers and explicit nToRead values.
+    if(nToRead == ~0ul && sBuffer.empty() && length > 0){
+        if(static_cast<std::size_t>(length) > sBuffer.max_size()) return false;
+        sBuffer.assign(static_cast<std::size_t>(length), 0);
+    }
+    if(length > sBuffer.size()) length = static_cast<unsigned long>(sBuffer.size());
+    if(length == 0) return true;
+    if(sBuffer.empty()) return false;
+
+    // Existing callers use bead_ReadFile both for header probes and for full-file
+    // reads on the same handle. Preserve the previous behavior by reading from
+    // the beginning of the file each time.
+    LARGE_INTEGER zero;
+    zero.QuadPart = 0;
+    if(!SetFilePointerEx(hFile, zero, nullptr, FILE_BEGIN)) return false;
+
+    unsigned long totalRead = 0;
+    while(totalRead < length){
+        DWORD chunk = static_cast<DWORD>(std::min<unsigned long>(length - totalRead, 0x7ffff000ul));
+        DWORD bytesRead = 0;
+        if(!ReadFile(hFile, sBuffer.data() + totalRead, chunk, &bytesRead, NULL)) return false;
+        if(bytesRead == 0) return false;
+        totalRead += bytesRead;
+    }
+    return true;
 }
+namespace {
+    bool bead_WriteRawBuffer(HANDLE hFile, const char * data, size_t bufferLength, unsigned long nToWrite){
+        if(hFile == INVALID_HANDLE_VALUE) return false;
+
+        size_t length = (nToWrite == ~0ul) ? bufferLength : static_cast<size_t>(nToWrite);
+        if(length > bufferLength) length = bufferLength;
+        if(length == 0) return true;
+        if(data == nullptr) return false;
+
+        size_t totalWritten = 0;
+        while(totalWritten < length){
+            DWORD chunk = static_cast<DWORD>(std::min<size_t>(length - totalWritten, 0x7ffff000ul));
+            DWORD bytesWritten = 0;
+            if(!WriteFile(hFile, data + totalWritten, chunk, &bytesWritten, NULL)) return false;
+            if(bytesWritten == 0) return false;
+            totalWritten += bytesWritten;
+        }
+        return true;
+    }
+}
+
 bool bead_WriteFile(HANDLE hFile, const std::string & sBuffer, unsigned long nToWrite){
-    OVERLAPPED ol = {0};
-    unsigned long length = nToWrite;
-    if(nToWrite > sBuffer.length()) length = sBuffer.length();
-    return WriteFileEx(hFile, &sBuffer.front(), length, &ol, FileIOCompletionRoutine);
+    return bead_WriteRawBuffer(hFile, sBuffer.data(), sBuffer.size(), nToWrite);
 }
 
-void File::SetFilePath(std::wstring & sPath){
-    path.Set(sPath);
+bool bead_WriteFile(HANDLE hFile, const std::vector<char> & sBuffer, unsigned long nToWrite){
+    return bead_WriteRawBuffer(hFile, sBuffer.empty() ? nullptr : sBuffer.data(), sBuffer.size(), nToWrite);
 }
 
-unsigned char * BinaryFile::ReadBytes(unsigned nBytes, int nMarking, const std::string & sDesc, unsigned * p_insert, bool bAdvancePlaceholder){
-    unsigned nCurPos = p_insert == nullptr ? nPosition : *p_insert;
+void File::SetFilePath(const std::wstring & sPath){
+    path.sFullPath = sPath;
+    const wchar_t * pFilename = PathFindFileNameW(path.sFullPath.c_str());
+    path.sFilename = pFilename != nullptr ? pFilename : L"";
+}
 
-    if(sDesc.length() && nBytes) positions.emplace_back(nCurPos, nBytes, sDesc);
-
-    if(nCurPos + nBytes > sBuffer.size()){
-        throw mdlexception("Attempting to read in " + GetName() + " at offset " + std::to_string(nCurPos) + ", which would read past the buffer size (" + std::to_string(sBuffer.size()) + ").");
+void BinaryFile::MarkDataBorder(unsigned nOffset){
+    if(nOffset >= bKnown.size()){
+        throw mdlexception("Attempting to mark a data border in " + GetName() + " outside the buffer.");
     }
-
-    MarkBytes(nCurPos, nBytes, nMarking);
-
-    if(p_insert == nullptr) nPosition += nBytes;
-    else if(bAdvancePlaceholder) *p_insert += nBytes;
-
-    return (unsigned char*) &sBuffer.at(nCurPos);
+    bKnown.at(nOffset) = bKnown.at(nOffset) | 0x20000;
 }
-/*
+
+void BinaryFile::MarkBytes(unsigned int nOffset, int nLength, int nClass){
+    //std::cout << "Setting known: offset " << nOffset << " length " << nLength << " class " << nClass << ".\n";
+    if(nOffset > sBuffer.size() || nOffset > bKnown.size()){
+        throw mdlexception("Attempting to mark data in " + GetName() + " outside the buffer.");
+    }
+    if(nOffset > 0) bKnown.at(nOffset - 1) = bKnown.at(nOffset - 1) | 0x10000;
+    if(nLength <= 0) return;
+    if(static_cast<unsigned>(nLength) > sBuffer.size() - nOffset || static_cast<unsigned>(nLength) > bKnown.size() - nOffset){
+        throw mdlexception("Attempting to mark data in " + GetName() + " outside the buffer.");
+    }
+    for(unsigned n = 0; n < static_cast<unsigned>(nLength); n++){
+        // Only bit 0 of the existing class word marks a duplicate
+        // interpretation.
+        int & nKnown = bKnown[nOffset + n];
+        if((nKnown & 0x1) != 0){
+            std::cout << "MarkBytes(): Warning! Data already interpreted as " << nKnown << " at offset " << nOffset + n << " in " << GetName() << "! Trying to reinterpret as " << nClass << ".\n";
+            throw mdlexception("Interpreting already interpreted data in " + GetName() + ".");
+        }
+        // The executable writes the new class word directly; it does not carry
+        // forward previous high marker bits except for the final-byte marker.
+        nKnown = (nClass & 0xFFFF);
+        if(n + 1 == static_cast<unsigned>(nLength)) nKnown |= 0x10000;
+    }
+}
+
+
+
+namespace {
+    inline void RequireBinaryRange(BinaryFile & file, const std::vector<char> & buffer, unsigned offset, unsigned length, const char * action){
+        if(offset > buffer.size() || length > buffer.size() - offset){
+            throw mdlexception(std::string("Attempting to ") + action + " in " + file.GetName() + ", which would read past the buffer size (" + std::to_string(buffer.size()) + ").");
+        }
+    }
+}
+
 int BinaryFile::ReadInt(unsigned int * nCurPos, int nMarking, int nBytes){
-    //std::cout << string_format("ReadInt() at position %i.\n", *nCurPos);
-    if(*nCurPos+nBytes > sBuffer.size()){
-        throw mdlexception("Attempting to read integer in " + GetName() + " at offset " + std::to_string(*nCurPos) + ", which would read past the buffer size (" + std::to_string(sBuffer.size()) + ").");
-        std::cout << "ReadInt(): Reading past buffer size in " << GetName() << ", aborting and returning -1.\n";
-        return -1;
+    if(nCurPos == nullptr) return -1;
+    if(nBytes != 1 && nBytes != 2 && nBytes != 4){
+        throw mdlexception("Attempting to read an integer in " + GetName() + " with an invalid byte width (" + std::to_string(nBytes) + ").");
     }
+    RequireBinaryRange(*this, sBuffer, *nCurPos, static_cast<unsigned>(nBytes), "read integer");
+
+    int nReturn = -1;
     if(nBytes == 4){
-        int n = 0;
-        while(n < 4){
-            ByteBlock4.bytes[n] = sBuffer[*nCurPos + n];
-            n++;
-        }
-        MarkBytes(*nCurPos, 4, nMarking);
-        *nCurPos += 4;
-        //std::cout << "ReadInt() return: " << ByteBlock4.i << "\n";
-        return ByteBlock4.i;
+        std::memcpy(&ByteBlock4.i, &sBuffer[*nCurPos], 4);
+        nReturn = ByteBlock4.i;
     }
-    else if(nBytes ==2){
-        int n = 0;
-        while(n < 2){
-            ByteBlock2.bytes[n] = sBuffer[*nCurPos + n];
-            n++;
-        }
-        MarkBytes(*nCurPos, 2, nMarking);
-        *nCurPos += 2;
-        return ByteBlock2.i;
+    else if(nBytes == 2){
+        std::memcpy(&ByteBlock2.i, &sBuffer[*nCurPos], 2);
+        nReturn = ByteBlock2.i;
     }
     else if(nBytes == 1){
-        int nReturn = (int) sBuffer[*nCurPos];
-        MarkBytes(*nCurPos, 1, nMarking);
-        *nCurPos += 1;
-        return nReturn;
+        nReturn = static_cast<int>(static_cast<signed char>(sBuffer[*nCurPos]));
     }
-    else return -1;
+    else{
+        return -1;
+    }
+
+    MarkBytes(*nCurPos, nBytes, nMarking);
+    *nCurPos += nBytes;
+    return nReturn;
 }
 
 float BinaryFile::ReadFloat(unsigned int * nCurPos, int nMarking, int nBytes){
-    //std::cout << string_format("ReadFloat() at position %i.\n", *nCurPos);
-    if(*nCurPos+nBytes > sBuffer.size()){
-        throw mdlexception("Attempting to read float in " + GetName() + " at offset " + std::to_string(*nCurPos) + ", which would read past the buffer size (" + std::to_string(sBuffer.size()) + ").");
-        std::cout << "ReadFloat(): Reading past buffer size in " << GetName() << ", aborting and returning -1.0.\n";
-        return -1.0;
-    }
-    int n = 0;
-    while(n < 4){
-        ByteBlock4.bytes[n] = sBuffer[*nCurPos + n];
-        n++;
-    }
+    if(nCurPos == nullptr) return -1.0f;
+    // nBytes is used for the range probe, while the read consumes one
+    // 32-bit float. Require at least four bytes.
+    unsigned nRange = static_cast<unsigned>(nBytes > 4 ? nBytes : 4);
+    RequireBinaryRange(*this, sBuffer, *nCurPos, nRange, "read float");
+
+    std::memcpy(&ByteBlock4.f, &sBuffer[*nCurPos], 4);
     MarkBytes(*nCurPos, 4, nMarking);
     *nCurPos += 4;
     return ByteBlock4.f;
 }
 
 Vector BinaryFile::ReadVector(unsigned int * nCurPos, int nMarking, int nBytes){
-    if(*nCurPos+nBytes*3 > sBuffer.size()){
-        throw mdlexception("Attempting to read vector in " + GetName() + " at offset " + std::to_string(*nCurPos) + ", which would read past the buffer size (" + std::to_string(sBuffer.size()) + ").");
-        std::cout << "ReadVector(): Reading past buffer size in " << GetName() << ", aborting and returning -1.0.\n";
-        return Vector(-1.0, -1.0, -1.0);
+    if(nCurPos == nullptr) return Vector(-1.0, -1.0, -1.0);
+    // nBytes is used for the range probe, while the read consumes three
+    // 32-bit floats. Clamp the probe to at least twelve bytes.
+    if(nBytes > 0 && static_cast<unsigned>(nBytes) > std::numeric_limits<unsigned>::max() / 3u){
+        throw mdlexception("Attempting to read a vector in " + GetName() + " with an oversized byte probe.");
     }
-    int n = 0;
+    unsigned nProbeBytes = nBytes > 0 ? static_cast<unsigned>(nBytes) * 3u : 0u;
+    if(nProbeBytes < 12u) nProbeBytes = 12u;
+    RequireBinaryRange(*this, sBuffer, *nCurPos, nProbeBytes, "read vector");
+
     double Coords[3];
     for(int m = 0; m < 3; m++){
-        n = 0;
-        while(n < 4){
-            ByteBlock4.bytes[n] = sBuffer[*nCurPos + m*4 + n];
-            n++;
-        }
+        std::memcpy(&ByteBlock4.f, &sBuffer[*nCurPos + m * 4], 4);
         Coords[m] = ByteBlock4.f;
         MarkBytes(*nCurPos + m * 4, 4, nMarking);
     }
@@ -170,194 +273,133 @@ Vector BinaryFile::ReadVector(unsigned int * nCurPos, int nMarking, int nBytes){
 }
 
 void BinaryFile::ReadString(std::string & sArray1, unsigned int * nCurPos, int nMarking, int nNumber){
-    if(*nCurPos+nNumber > sBuffer.size()){
-        throw mdlexception("Attempting to read string in " + GetName() + " at offset " + std::to_string(*nCurPos) + ", which would read past the buffer size (" + std::to_string(sBuffer.size()) + ").");
-        std::cout << "ReadString(): Reading past buffer size in " << GetName() << ", aborting.\n";
+    if(nCurPos == nullptr) return;
+    if(nNumber < 0){
+        throw mdlexception("Attempting to read a string in " + GetName() + " with a negative length (" + std::to_string(nNumber) + ").");
+    }
+    RequireBinaryRange(*this, sBuffer, *nCurPos, static_cast<unsigned>(nNumber), "read string");
+
+    if(nNumber == 0){
+        sArray1.clear();
+        MarkBytes(*nCurPos, 0, nMarking);
         return;
     }
-    sArray1.assign(&sBuffer[*nCurPos], nNumber);
-    //std::cout << "ReadString(): " << sArray1 << "\n";
+
+    sArray1.assign(sBuffer.data() + *nCurPos, static_cast<std::size_t>(nNumber));
     MarkBytes(*nCurPos, nNumber, nMarking);
     *nCurPos += nNumber;
 }
-*/
 
-void BinaryFile::MarkDataBorder(unsigned nOffset){
-    bKnown.at(nOffset) = bKnown.at(nOffset) | 0x20000;
-}
-
-void BinaryFile::MarkBytes(unsigned int nOffset, int nLength, int nClass){
-    //std::cout << "Setting known: offset " << nOffset << " length " << nLength << " class " << nClass << ".\n";
-    if(nOffset > 0) bKnown.at(nOffset - 1) = bKnown.at(nOffset - 1) | 0x10000;
-    for(unsigned n = 0; n < nLength && n < sBuffer.size(); n++){
-        if((bKnown.at(nOffset + n) & 0xFFFF) != 0){
-            std::cout << "MarkBytes(): Warning! Data already interpreted as " << bKnown.at(nOffset + n) << " at offset " << nOffset + n << " in " << GetName() << "! Trying to reinterpret as " << nClass << ".\n";
-            throw mdlexception("Interpreting already interpreted data in " + GetName() + ".");
-        }
-        bKnown.at(nOffset + n) = (nClass & 0xFFFF) + (bKnown.at(nOffset + n) & 0xFFFF0000);
-        if(n + 1 == nLength) bKnown.at(nOffset + n) = bKnown.at(nOffset + n) | 0x10000;
-    }
-}
-
-/**
-    Writes nBytes number of bytes from the pointer p_bytes. If p_insert is nullptr,
-    it appends the bytes to the buffer vector. If p_insert is valid, then it points
-    to a position in the buffer, and that's where the bytes will be written.
-**/
-unsigned BinaryFile::WriteBytes(unsigned char * p_bytes, unsigned nBytes, int nMarking, const std::string & sDesc, unsigned * p_insert){
-    //std::cout << "Writing data " << nBytes << " bytes long to " << (p_insert ? *p_insert : nPosition) << ".\n";
-    unsigned nReturn = nPosition;
-    for(int n = 0; n < nBytes; n++){
-        if(p_insert == nullptr){
-            sBuffer.push_back(*(p_bytes + n));
-            bKnown.push_back(nMarking | (n + 1 == nBytes ? 0x10000 : 0));
-        }
-        else sBuffer.at((*p_insert) + n) = *(p_bytes + n);
-    }
-    //if(nMarking > 0) MarkBytes(nReturn, nBytes, nMarking);
-    if(p_insert == nullptr){
-        if(sDesc.length() && nBytes) positions.emplace_back(nPosition, nBytes, sDesc);
-        nPosition += nBytes;
-    }
-    return nReturn;
-}
-/*
 void BinaryFile::WriteIntToPH(int nInt, int nPH, unsigned int & nContainer){
+    unsigned nOffset = static_cast<unsigned>(nPH);
+    RequireBinaryRange(*this, sBuffer, nOffset, 4, "write integer placeholder");
     ByteBlock4.i = nInt;
-    int n = 0;
-    for(n = 0; n < 4; n++){
-        sBuffer[nPH+n] = (ByteBlock4.bytes[n]);
-    }
-    nContainer = nInt;
+    std::memcpy(&sBuffer[nOffset], ByteBlock4.bytes, 4);
+    nContainer = static_cast<unsigned int>(nInt);
 }
 
 void BinaryFile::WriteAtOffset4(int nInt, unsigned int nOffset){
+    RequireBinaryRange(*this, sBuffer, nOffset, 4, "write integer");
     ByteBlock4.i = nInt;
-    for(int n = 0; n < 4; n++){
-        sBuffer[nOffset+n] = (ByteBlock4.bytes[n]);
-    }
+    std::memcpy(&sBuffer[nOffset], ByteBlock4.bytes, 4);
 }
+
 void BinaryFile::WriteAtOffset2(short nShort, unsigned int nOffset){
+    RequireBinaryRange(*this, sBuffer, nOffset, 2, "write short");
     ByteBlock2.i = nShort;
-    for(int n = 0; n < 2; n++){
-        sBuffer[nOffset+n] = (ByteBlock2.bytes[n]);
-    }
+    std::memcpy(&sBuffer[nOffset], ByteBlock2.bytes, 2);
 }
+
 void BinaryFile::WriteAtOffset1(char nChar, unsigned int nOffset){
+    RequireBinaryRange(*this, sBuffer, nOffset, 1, "write byte");
     sBuffer[nOffset] = nChar;
 }
+
 void BinaryFile::WriteAtOffset(float fFloat, unsigned int nOffset){
+    RequireBinaryRange(*this, sBuffer, nOffset, 4, "write float");
     ByteBlock4.f = fFloat;
-    for(int n = 0; n < 4; n++){
-        sBuffer[nOffset+n] = (ByteBlock4.bytes[n]);
-    }
+    std::memcpy(&sBuffer[nOffset], ByteBlock4.bytes, 4);
 }
+
 void BinaryFile::WriteAtOffset(const std::string & sString, unsigned int nOffset){
-    for(int n = 0; n < sString.length(); n++){
-        sBuffer[nOffset+n] = sString.at(n);
+    if(sString.length() > std::numeric_limits<unsigned>::max()){
+        throw mdlexception("Attempting to write an oversized string in " + GetName() + ".");
     }
+    RequireBinaryRange(*this, sBuffer, nOffset, static_cast<unsigned>(sString.length()), "write string");
+    if(!sString.empty()) std::memcpy(&sBuffer[nOffset], sString.data(), sString.length());
 }
 
 void BinaryFile::WriteInt(int nInt, int nKnown, int nBytes){
+    if(nBytes != 1 && nBytes != 2 && nBytes != 4 && nBytes != 8){
+        Error("Cannot convert an integer to anything but 1, 2, 4 and 8 byte representations!");
+        return;
+    }
+
+    unsigned char bytes[8] = {};
     if(nBytes == 1){
-        if(bKnown.size() > 0) bKnown.back() = bKnown.back() | 0x10000;
-        sBuffer.push_back((char) nInt);
-        bKnown.push_back(nKnown | 0x10000);
-        nPosition++;
+        const std::uint8_t value = static_cast<std::uint8_t>(nInt);
+        std::memcpy(bytes, &value, sizeof(value));
     }
     else if(nBytes == 2){
-        ByteBlock2.i = nInt;
-        if(bKnown.size() > 0) bKnown.back() = bKnown.back() | 0x10000;
-        int n = 0;
-        for(n = 0; n < 2; n++){
-            sBuffer.push_back(ByteBlock2.bytes[n]);
-            bKnown.push_back(nKnown | (n + 1 == 2 ? 0x10000 : 0));
-        }
-        nPosition+=n;
+        const std::uint16_t value = static_cast<std::uint16_t>(nInt);
+        std::memcpy(bytes, &value, sizeof(value));
     }
     else if(nBytes == 4){
-        ByteBlock4.i = nInt;
-        if(bKnown.size() > 0) bKnown.back() = bKnown.back() | 0x10000;
-        int n = 0;
-        for(n = 0; n < 4; n++){
-            sBuffer.push_back(ByteBlock4.bytes[n]);
-            bKnown.push_back(nKnown | (n + 1 == 4 ? 0x10000 : 0));
-        }
-        nPosition+=n;
+        const std::uint32_t value = static_cast<std::uint32_t>(nInt);
+        std::memcpy(bytes, &value, sizeof(value));
     }
     else if(nBytes == 8){
-        ByteBlock8.i = nInt;
-        if(bKnown.size() > 0) bKnown.back() = bKnown.back() | 0x10000;
-        int n = 0;
-        for(n = 0; n < 8; n++){
-            sBuffer.push_back(ByteBlock8.bytes[n]);
-            bKnown.push_back(nKnown | (n + 1 == 8 ? 0x10000 : 0));
-        }
-        nPosition+=n;
+        const std::uint64_t value = static_cast<std::uint64_t>(nInt);
+        std::memcpy(bytes, &value, sizeof(value));
     }
-    else Error("Cannot convert an integer to anything but 1, 2, 4 and 8 byte representations!");
+
+    WriteBytes(bytes, static_cast<unsigned>(nBytes), nKnown, "write integer");
 }
 
 void BinaryFile::WriteFloat(float fFloat, int nKnown, int nBytes){
-    ByteBlock4.f = fFloat;
-    if(bKnown.size() > 0) bKnown.back() = bKnown.back() | 0x10000;
-    int n = 0;
-    for(n = 0; n < 4; n++){
-        sBuffer.push_back(ByteBlock4.bytes[n]);
-        bKnown.push_back(nKnown | (n + 1 == 4 ? 0x10000 : 0));
-    }
-    nPosition+=n;
+    (void)nBytes;
+    unsigned char bytes[4] = {};
+    std::memcpy(bytes, &fFloat, sizeof(fFloat));
+    WriteBytes(bytes, sizeof(bytes), nKnown, "write float");
 }
 
-void BinaryFile::WriteString(std::string sString, int nKnown){
-    if(bKnown.size() > 0) bKnown.back() = bKnown.back() | 0x10000;
-    int n = 0;
-    for(n = 0; n < sString.length(); n++){
-        sBuffer.push_back(sString.at(n));
-        bKnown.push_back(nKnown | (n + 1 == sString.length() ? 0x10000 : 0));
+void BinaryFile::WriteString(const std::string & sString, int nKnown){
+    if(sString.length() > static_cast<std::size_t>(std::numeric_limits<unsigned>::max())){
+        throw mdlexception("Attempting to write an oversized string in " + GetName() + ".");
     }
-    nPosition+=n;
+    WriteBytes(reinterpret_cast<const unsigned char*>(sString.data()), static_cast<unsigned>(sString.length()), nKnown, "write string");
 }
 
 void BinaryFile::WriteByte(char cByte, int nKnown){
-    if(bKnown.size() > 0) bKnown.back() = bKnown.back() | 0x10000;
-    sBuffer.push_back(cByte);
-    bKnown.push_back(nKnown | 0x10000);
-    nPosition++;
+    WriteBytes(reinterpret_cast<const unsigned char*>(&cByte), 1, nKnown, "write byte");
 }
-*/
+
 bool TextFile::ReadFloat(double & fNew, std::string * sGet, bool bPrint){
     std::string sCheck;
-    //First skip all spaces
-    if(sBuffer[nPosition] == '#' ||
-       sBuffer[nPosition] == 0x0D ||
-       sBuffer[nPosition] == 0x0A ||
-       sBuffer[nPosition] == 0x00)
-    {
+    sCheck.reserve(32);
+
+    auto IsTerminator = [](char c){
+        return c == '#' || c == '\r' || c == '\n' || c == '\0';
+    };
+
+    if(nPosition >= sBuffer.size() || IsTerminator(sBuffer[nPosition])){
         if(bPrint || DEBUG_LEVEL > 5) std::cout << "Reading float at end of line!\n";
         return false;
     }
-    while(sBuffer[nPosition] == 0x20){
+
+    while(nPosition < sBuffer.size() && sBuffer[nPosition] == 0x20){
         nPosition++;
-        if(sBuffer[nPosition] == '#' ||
-           sBuffer[nPosition] == 0x0D ||
-           sBuffer[nPosition] == 0x0A ||
-           sBuffer[nPosition] == 0x00)
-        {
+        if(nPosition >= sBuffer.size() || IsTerminator(sBuffer[nPosition])){
             if(bPrint || DEBUG_LEVEL > 5) std::cout << "Reading float at end of line!\n";
             return false;
         }
     }
-    while(sBuffer[nPosition] != 0x20 &&
-            sBuffer[nPosition] != '#' &&
-            sBuffer[nPosition] != 0x0D &&
-            sBuffer[nPosition] != 0x0A &&
-            sBuffer[nPosition] != 0x00)
-    {
+
+    while(nPosition < sBuffer.size() && sBuffer[nPosition] != 0x20 && !IsTerminator(sBuffer[nPosition])){
         sCheck.push_back(sBuffer[nPosition]);
         nPosition++;
     }
-    if(sCheck.length() == 0) return false;
+    if(sCheck.empty()) return false;
 
     //Report
     if(bPrint || DEBUG_LEVEL > 5) std::cout << "TextFile::ReadFloat(): Reading: " << sCheck << ". ";
@@ -365,13 +407,17 @@ bool TextFile::ReadFloat(double & fNew, std::string * sGet, bool bPrint){
     if(sGet != nullptr) *sGet = sCheck;
 
     try{
-        fNew = std::stod(sCheck, (size_t*) NULL);
+        std::size_t nParsed = 0;
+        fNew = std::stod(sCheck, &nParsed);
+        if(nParsed != sCheck.size()){
+            throw std::invalid_argument("trailing characters");
+        }
     }
-    catch(std::invalid_argument){
+    catch(const std::invalid_argument &){
         std::cout << "TextFile::ReadFloat(): There was an error converting the string: " << sCheck << ". \n";
         throw mdlexception("Could not convert '" + sCheck + "' to float.");
     }
-    catch(std::out_of_range){
+    catch(const std::out_of_range &){
         std::cout << "TextFile::ReadFloat(): The float is out of range: " << sCheck << ".\n";
         throw mdlexception("The float " + sCheck + " is out of range.");
     }
@@ -385,36 +431,30 @@ bool TextFile::ReadFloat(double & fNew, std::string * sGet, bool bPrint){
 
 bool TextFile::ReadInt(int & nNew, std::string * sGet, bool bPrint){
     std::string sCheck;
-    //First skip all spaces
-    if(sBuffer[nPosition] == '#' ||
-       sBuffer[nPosition] == 0x0D ||
-       sBuffer[nPosition] == 0x0A ||
-       sBuffer[nPosition] == 0x00)
-    {
+    sCheck.reserve(32);
+
+    auto IsTerminator = [](char c){
+        return c == '#' || c == '\r' || c == '\n' || c == '\0';
+    };
+
+    if(nPosition >= sBuffer.size() || IsTerminator(sBuffer[nPosition])){
         if(bPrint || DEBUG_LEVEL > 5) std::cout << "Reading int at end of line!\n";
         return false;
     }
-    while(sBuffer[nPosition] == 0x20){
+
+    while(nPosition < sBuffer.size() && sBuffer[nPosition] == 0x20){
         nPosition++;
-        if(sBuffer[nPosition] == '#' ||
-           sBuffer[nPosition] == 0x0D ||
-           sBuffer[nPosition] == 0x0A ||
-           sBuffer[nPosition] == 0x00)
-        {
+        if(nPosition >= sBuffer.size() || IsTerminator(sBuffer[nPosition])){
             if(bPrint || DEBUG_LEVEL > 5) std::cout << "Reading int at end of line!\n";
             return false;
         }
     }
-    while(sBuffer[nPosition] != 0x20 &&
-            sBuffer[nPosition] != '#' &&
-            sBuffer[nPosition] != 0x0D &&
-            sBuffer[nPosition] != 0x0A &&
-            sBuffer[nPosition] != 0x00)
-    {
+
+    while(nPosition < sBuffer.size() && sBuffer[nPosition] != 0x20 && !IsTerminator(sBuffer[nPosition])){
         sCheck.push_back(sBuffer[nPosition]);
         nPosition++;
     }
-    if(sCheck.length() == 0) return false;
+    if(sCheck.empty()) return false;
 
     //Report
     if(bPrint || DEBUG_LEVEL > 5) std::cout << "TextFile::ReadInt(): Reading: " << sCheck << ". ";
@@ -422,13 +462,17 @@ bool TextFile::ReadInt(int & nNew, std::string * sGet, bool bPrint){
     if(sGet != nullptr) *sGet = sCheck;
 
     try{
-        nNew = stoi(sCheck,(size_t*) NULL);
+        std::size_t nParsed = 0;
+        nNew = std::stoi(sCheck, &nParsed);
+        if(nParsed != sCheck.size()){
+            throw std::invalid_argument("trailing characters");
+        }
     }
-    catch(std::invalid_argument){
+    catch(const std::invalid_argument &){
         std::cout << "TextFile::ReadInt(): There was an error converting the string: " << sCheck << ". Printing 0xFFFFFFFF. \n";
         throw mdlexception("Could not convert '" + sCheck + "' to integer.");
     }
-    catch(std::out_of_range){
+    catch(const std::out_of_range &){
         std::cout << "TextFile::ReadInt(): The integer is out of range: " << sCheck << ".\n";
         throw mdlexception("The integer " + sCheck + " is out of range.");
     }
@@ -442,36 +486,30 @@ bool TextFile::ReadInt(int & nNew, std::string * sGet, bool bPrint){
 
 bool TextFile::ReadUInt(unsigned int & nNew, std::string * sGet, bool bPrint){
     std::string sCheck;
-    //First skip all spaces
-    if(sBuffer[nPosition] == '#' ||
-       sBuffer[nPosition] == 0x0D ||
-       sBuffer[nPosition] == 0x0A ||
-       sBuffer[nPosition] == 0x00)
-    {
+    sCheck.reserve(32);
+
+    auto IsTerminator = [](char c){
+        return c == '#' || c == '\r' || c == '\n' || c == '\0';
+    };
+
+    if(nPosition >= sBuffer.size() || IsTerminator(sBuffer[nPosition])){
         if(bPrint || DEBUG_LEVEL > 5) std::cout << "Reading int at end of line!\n";
         return false;
     }
-    while(sBuffer[nPosition] == 0x20){
+
+    while(nPosition < sBuffer.size() && sBuffer[nPosition] == 0x20){
         nPosition++;
-        if(sBuffer[nPosition] == '#' ||
-           sBuffer[nPosition] == 0x0D ||
-           sBuffer[nPosition] == 0x0A ||
-           sBuffer[nPosition] == 0x00)
-        {
+        if(nPosition >= sBuffer.size() || IsTerminator(sBuffer[nPosition])){
             if(bPrint || DEBUG_LEVEL > 5) std::cout << "Reading int at end of line!\n";
             return false;
         }
     }
-    while(sBuffer[nPosition] != 0x20 &&
-            sBuffer[nPosition] != '#' &&
-            sBuffer[nPosition] != 0x0D &&
-            sBuffer[nPosition] != 0x0A &&
-            sBuffer[nPosition] != 0x00)
-    {
+
+    while(nPosition < sBuffer.size() && sBuffer[nPosition] != 0x20 && !IsTerminator(sBuffer[nPosition])){
         sCheck.push_back(sBuffer[nPosition]);
         nPosition++;
     }
-    if(sCheck.length() == 0) return false;
+    if(sCheck.empty()) return false;
 
     //Report
     if(bPrint || DEBUG_LEVEL > 5) std::cout << "TextFile::ReadInt(): Reading: " << sCheck << ". ";
@@ -479,13 +517,17 @@ bool TextFile::ReadUInt(unsigned int & nNew, std::string * sGet, bool bPrint){
     if(sGet != nullptr) *sGet = sCheck;
 
     try{
-        nNew = stou(sCheck,(size_t*) NULL);
+        unsigned int nParsed = 0;
+        nNew = stou(sCheck, &nParsed);
+        if(nParsed != sCheck.size()){
+            throw std::invalid_argument("trailing characters");
+        }
     }
-    catch(std::invalid_argument){
+    catch(const std::invalid_argument &){
         std::cout << "TextFile::ReadInt(): There was an error converting the string: " << sCheck << ". Printing 0xFFFFFFFF. \n";
         throw mdlexception("Could not convert '" + sCheck + "' to integer.");
     }
-    catch(std::out_of_range){
+    catch(const std::out_of_range &){
         std::cout << "TextFile::ReadInt(): The integer is out of range: " << sCheck << ".\n";
         throw mdlexception("The integer " + sCheck + " is out of range.");
     }
@@ -498,50 +540,37 @@ bool TextFile::ReadUInt(unsigned int & nNew, std::string * sGet, bool bPrint){
 }
 
 void TextFile::SkipLine(){
-    if(nPosition + 1 >= sBuffer.size()){
-        /// End of file, set position to eof
-        nPosition = sBuffer.size();
-        //throw mdlexception("Error: Trying to skip a line at the end of the file.");
+    if(nPosition >= sBuffer.size()){
+        nPosition = static_cast<unsigned int>(sBuffer.size());
+        return;
     }
 
-    while(nPosition + 1 < sBuffer.size()){
-        if(sBuffer[nPosition] != 0x0D && sBuffer[nPosition] != 0x0A) nPosition++;
-        else break;
+    while(nPosition < sBuffer.size() && sBuffer[nPosition] != 0x0D && sBuffer[nPosition] != 0x0A){
+        nPosition++;
     }
+
+    if(nPosition >= sBuffer.size()) return;
 
     if(sBuffer[nPosition] == 0x0A){
-        nPosition+=1;
+        nPosition += 1;
         nLine++;
         return;
     }
-    else if(sBuffer[nPosition] == 0x0D && sBuffer[nPosition+1] == 0x0A){
-        nPosition+=2;
+    else if(sBuffer[nPosition] == 0x0D && nPosition + 1 < sBuffer.size() && sBuffer[nPosition + 1] == 0x0A){
+        nPosition += 2;
         nLine++;
         return;
     }
     else if(sBuffer[nPosition] == 0x0D){
-        nPosition+=1;
+        nPosition += 1;
         nLine++;
         return;
     }
 }
 
-void File::SavePosition(unsigned n){
-    if(SavedPosition.size() <= n) SavedPosition.resize(n+1);
-    if(SavedLine.size() <= n) SavedLine.resize(n+1);
-    SavedPosition.at(n) = nPosition;
-    SavedLine.at(n) = nLine;
-}
-
-bool File::RestorePosition(unsigned n){
-    if(SavedPosition.size() <= n || SavedLine.size() <= n) return false;
-    nPosition = SavedPosition.at(n);
-    nLine = SavedLine.at(n);
-    return true;
-}
 
 bool TextFile::EmptyRow(){
-    int n = nPosition; //Do not use the iterator
+    std::size_t n = nPosition; //Do not use the iterator
     while( n < sBuffer.size() &&
            sBuffer[n] != 0x0A &&
            sBuffer[n] != 0x0D &&
@@ -555,7 +584,8 @@ bool TextFile::EmptyRow(){
 }
 
 bool TextFile::ReadUntilText(std::string & sHandle, bool bToLowercase){
-    sHandle = ""; //Make sure the handle is cleared
+    sHandle.clear(); //Make sure the handle is cleared
+    sHandle.reserve(32);
     while(nPosition < sBuffer.size() &&
           sBuffer[nPosition] != '#' &&
           sBuffer[nPosition] != 0x0A &&
@@ -576,10 +606,11 @@ bool TextFile::ReadUntilText(std::string & sHandle, bool bToLowercase){
                   sBuffer[nPosition] != 0x20 &&
                   sBuffer[nPosition] != '#' &&
                   sBuffer[nPosition] != 0x0D &&
-                  sBuffer[nPosition] != 0x0A);
+                  sBuffer[nPosition] != 0x0A &&
+                  sBuffer[nPosition] != 0x00);
 
             //convert to lowercase
-            if(bToLowercase) std::transform(sHandle.begin(), sHandle.end(), sHandle.begin(), ::tolower);
+            if(bToLowercase) ToLowerInPlace(sHandle);
 
             //Go back and tell them you've found something
             return true;
@@ -610,7 +641,8 @@ void IniFile::ReadIni(std::wstring & sIni){
     std::vector<char> & sBufferRef = CreateBuffer(bead_GetFileLength(fIni));
 
     //fIni.read(&sBufferRef[0], length);
-    if(!bead_ReadFile(fIni, sBufferRef)){ //if(!ReadFileEx(fIni, &sBufferRef.front(), length, NULL, NULL)){
+    if(!bead_ReadFile(fIni, sBufferRef)){
+        CloseHandle(fIni);
         throw mdlexception("Error reading .ini file.");
     }
 
@@ -632,7 +664,7 @@ void IniFile::ReadIni(std::wstring & sIni){
             ReadUntilText(sID, true);
             for(IniOption & option : Options){
                 std::string sToken = option.sToken;
-                std::transform(sToken.begin(), sToken.end(), sToken.begin(), ::tolower);
+                ToLowerInPlace(sToken);
 
                 if(sID != sToken) continue;
 
@@ -685,7 +717,8 @@ void IniFile::WriteIni(std::wstring & sIni){
         throw mdlexception("Error opening .ini file.");
     }
 
-    if(!bead_WriteFile(hIni, fIni.str())){ //if(!WriteFileEx(hIni, &fIni.str().front(), fIni.str().length(), NULL, NULL)){
+    if(!bead_WriteFile(hIni, fIni.str())){
+        CloseHandle(hIni);
         throw mdlexception("Error writing .ini file.");
     }
 

@@ -16,10 +16,9 @@ struct Vector{
 
     //Constructors
     Vector(): fX(0.0), fY(0.0), fZ(0.0) {}
-    Vector(const Vector & vec) : fX(vec.fX), fY(vec.fY), fZ(vec.fZ) {}
+    Vector(const Vector & vec) = default;
+    Vector & operator=(const Vector & vec) = default;
     Vector(const double & f1, const double & f2, const double & f3) : fX(f1), fY(f2), fZ(f3) {}
-    Vector(const POINT & pt) : fX(pt.x), fY(pt.y), fZ(0.0) {}
-    Vector(const double & f1, const double & f2) : fX(f1), fY(f2), fZ(0.0) {}
 
     //Operators
     Vector & operator*=(const Matrix22 & m);
@@ -51,7 +50,7 @@ Vector operator-(Vector v, const Vector & v2);
 double Angle(const Vector & v, const Vector & v2);
 double HeronFormulaVert(const Vector & v1, const Vector & v2, const Vector & v3);
 double HeronFormulaEdge(const Vector & e1, const Vector & e2, const Vector & e3);
-Vector Rotate(const Vector & v, const Quaternion & q);
+Vector Rotate(Vector v, const Quaternion & q);
 Vector DecompressVector(unsigned int nCompressed);
 unsigned int CompressVector(const Vector & v);
 
@@ -69,7 +68,6 @@ struct Quaternion{
     Quaternion & operator+=(const Quaternion & q);
     Quaternion & operator-=(const Quaternion & q);
     Quaternion & operator*=(const Quaternion & q);
-    Quaternion & operator*=(const Quaternion && q);
     //Quaternion & operator/=(const Quaternion & q);
     Quaternion & operator*=(const double & f);
     Quaternion & operator/=(const double & f);
@@ -135,17 +133,10 @@ class Orientation{
     Orientation(): quaternion(0.0, 0.0, 0.0, 1.0), axisangle(), bQuaternion(true), bAxisAngle(false) {}
     Orientation(const Quaternion & q) : quaternion(q), axisangle(), bQuaternion(true), bAxisAngle(false) {}
     Orientation(const AxisAngle & aa) : quaternion(), axisangle(aa), bQuaternion(false), bAxisAngle(true) {}
-    Orientation(const Quaternion && q) : quaternion(q), axisangle(), bQuaternion(true), bAxisAngle(false) {}
-    Orientation(const AxisAngle && aa) : quaternion(), axisangle(aa), bQuaternion(false), bAxisAngle(true) {}
     Orientation(const double & f1, const double & f2, const double & f3, const double & f4): quaternion(f1, f2, f3, f4), bQuaternion(true), bAxisAngle(false) {}
     void SetQuaternion(const double & f1, const double & f2, const double & f3, const double & f4);
     void SetAxisAngle(const double & f1, const double & f2, const double & f3, const double & f4);
     void SetQuaternion(const Quaternion & q){
-        quaternion = q;
-        bQuaternion = true;
-        bAxisAngle = false;
-    }
-    void SetQuaternion(const Quaternion && q){
         quaternion = q;
         bQuaternion = true;
         bAxisAngle = false;
@@ -155,12 +146,8 @@ class Orientation{
         bQuaternion = false;
         bAxisAngle = true;
     }
-    void SetAxisAngle(const AxisAngle && aa){
-        axisangle = aa;
-        bQuaternion = false;
-        bAxisAngle = true;
-    }
     const Quaternion & GetQuaternion();
+    Quaternion GetQuaternionValue() const;
     const AxisAngle & GetAxisAngle();
 };
 
