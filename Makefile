@@ -83,7 +83,7 @@ endif
 SOURCES := $(sort $(wildcard *.cpp))
 OBJECTS := $(patsubst %.cpp,$(OBJ_DIR)/%.o,$(SOURCES))
 DEPS := $(OBJECTS:.o=.d)
-RESOURCE_DEPS := resource.rc resource.h manifest.xml cursor.cur $(wildcard *.ico)
+RESOURCE_DEPS := resource.rc resource.h manifest.xml $(wildcard *.ico)
 FORCED_HEADERS := win32_compat.h
 RESOURCE_OBJECT := $(OBJ_DIR)/resource.o
 
