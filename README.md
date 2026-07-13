@@ -2,7 +2,7 @@
 
 ### What is this repository for? ###
 
-This repository contains the source code for mdledit, a binary-to-ASCII decompiler for KOTOR1 and KOTOR2 model files.
+This repository contains the source code for mdledit, a binary-to-ASCII decompiler for KOTOR1 and KOTOR2 model files orginially developed by bead-v.
 
 Current version: v1.0.5b BETA.
 
@@ -82,4 +82,4 @@ See `EMBEDDED_SUPERMODELS.md` and the reusable CSV/JSON files in `metadata/`.
 
 ### Who do I talk to? ###
 
-PM me on deadlystream.com (Vriff).
+PM me on deadlystream.com or discord (Vriff).
