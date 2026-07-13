@@ -2,7 +2,7 @@
 
 ### What is this repository for? ###
 
-This repository contains the source code for mdledit, a binary-to-ASCII decompiler for KOTOR1 and KOTOR2 model files orginially developed by bead-v.
+This repository contains the source code for mdledit, a binary-to-ASCII decompiler for KOTOR1 and KOTOR2 model files originally developed by bead-v.
 
 Current version: v1.0.5b BETA.
 
