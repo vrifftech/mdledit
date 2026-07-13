@@ -1,0 +1,50 @@
+name: Build Windows executable
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Windows x64 — MSYS2 UCRT64
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install MSYS2 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-gcc
+
+      - name: Build portable executable
+        run: make portable CXX=g++ WINDRES=windres OBJDUMP=objdump
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: mdledit-windows-x64-${{ github.sha }}
+          path: build/portable/mdledit.exe
+          if-no-files-found: error
+          retention-days: 14
