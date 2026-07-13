@@ -1,9 +1,11 @@
-name: Build Windows executable
+name: Build and release Windows executable
 
 on:
   push:
     branches:
       - master
+    tags:
+      - "v*"
   pull_request:
     branches:
       - master
@@ -48,3 +50,56 @@ jobs:
           path: build/portable/mdledit.exe
           if-no-files-found: error
           retention-days: 14
+
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-windows
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download executable
+        uses: actions/download-artifact@v8
+        with:
+          name: mdledit-windows-x64-${{ github.sha }}
+          path: release
+
+      - name: Generate SHA-256 checksum
+        working-directory: release
+        run: sha256sum mdledit.exe > mdledit.exe.sha256
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" \
+              release/mdledit.exe \
+              release/mdledit.exe.sha256 \
+              --clobber
+            exit 0
+          fi
+
+          release_flags=(
+            --verify-tag
+            --generate-notes
+            --title "MDLedit $tag"
+          )
+
+          case "$tag" in
+            *-alpha*|*-beta*|*-rc*|v*.*.*a|v*.*.*b)
+              release_flags+=(--prerelease)
+              ;;
+          esac
+
+          gh release create "$tag" \
+            release/mdledit.exe \
+            release/mdledit.exe.sha256 \
+            "${release_flags[@]}"
