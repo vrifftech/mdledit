@@ -19,6 +19,8 @@ CCACHE ?=
 OBJDUMP ?= objdump
 DIST_DIR ?= dist
 BUNDLE_DIR ?= $(DIST_DIR)/mdledit
+TEST_DIR := $(BUILD_ROOT)/tests
+ASCII_COMPAT_TEST := $(TEST_DIR)/ascii_compat_test.exe
 RM = rm -rf
 MKDIR_P ?= mkdir -p
 BUILD_DIR := $(BUILD_ROOT)/$(CONFIG)
@@ -88,7 +90,7 @@ FORCED_HEADERS := win32_compat.h
 RESOURCE_OBJECT := $(OBJ_DIR)/resource.o
 
 .PHONY: all release debug safe safe-dynamic fast portable standalone bundle bundle-runtime \
-        runtime-deps verify-portable clean distclean print-vars check-tools rebuild help
+        runtime-deps verify-portable test clean distclean print-vars check-tools rebuild help
 .DELETE_ON_ERROR:
 
 all: check-tools $(BIN)
@@ -181,6 +183,15 @@ bundle-runtime: $(BIN)
 	 done; \
 	 echo "Bundle created at $(BUNDLE_DIR) ($$copied runtime DLL(s) copied)."
 
+test: $(ASCII_COMPAT_TEST)
+	"$(ASCII_COMPAT_TEST)"
+
+$(ASCII_COMPAT_TEST): tests/ascii_compat_test.cpp ascii_compat.h | $(TEST_DIR)
+	$(CXX) -std=c++14 -Wall -Wextra -Werror -pipe $< -o $@
+
+$(TEST_DIR):
+	$(MKDIR_P) $@
+
 clean:
 	$(RM) $(BUILD_ROOT)
 
@@ -220,6 +231,7 @@ help:
 	@echo "  make rebuild    Clean then build"
 	@echo "  make clean      Remove build output"
 	@echo "  make runtime-deps List DLL imports for the selected CONFIG"
+	@echo "  make test       Run parser compatibility regression tests"
 	@echo "  make print-vars Show selected tools and flags"
 	@echo "  make check-tools Verify compiler/resource compiler are on PATH"
 	@echo "Variables:"

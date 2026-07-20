@@ -43,6 +43,9 @@ jobs:
       - name: Build portable executable
         run: make portable CXX=g++ WINDRES=windres OBJDUMP=objdump
 
+      - name: Run parser compatibility tests
+        run: make test CXX=g++
+
       - name: Upload executable
         uses: actions/upload-artifact@v7
         with:

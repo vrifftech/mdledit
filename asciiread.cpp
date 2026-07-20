@@ -1,4 +1,5 @@
 #include "MDL.h"
+#include "ascii_compat.h"
 #include <algorithm>
 #include <limits>
 #include <utility>
@@ -7,12 +8,12 @@
 //   TruncateLongName3216()
 //   ASCII::Read()
 
-void TruncateLongName3216(std::string & sID, const std::string & sContext, unsigned int nLine, bool bCheck16 = true){
+void TruncateLongName3216(std::string & sID, const std::string & sContext, unsigned int nLine, bool bWarnAt16 = true){
     if(sID.size() > 32){
         Warning(sContext + " (" + sID + ") at line " + std::to_string(nLine) + " is larger than the limit, 32 characters! Will truncate and continue.");
         sID.resize(32);
     }
-    else if(sID.size() > 16 && bCheck16){
+    else if(sID.size() > 16 && bWarnAt16){
         Warning(sContext + " (" + sID + ") at line " + std::to_string(nLine) + " is larger than 16 characters! This may or may not cause problems in the game.");
     }
 }
@@ -255,7 +256,9 @@ bool ASCII::Read(MDL & Mdl){
                 if(!ReadUntilText(sID, false)){
                     throw mdlexception("Malformed node/name declaration in ASCII name-index pass: name is missing at line " + std::to_string(nLine) + ".");
                 }
-                TruncateLongName3216(sID, "ASCII node/name table entry", nLine);
+                // v1.0.104b did not apply its 16-character warning to node
+                // identifiers. Keep accepting the full binary-safe width here.
+                TruncateLongName3216(sID, "ASCII node/name table entry", nLine, false);
 
                 //Got it! Now to save it the name array. Do the uniqueness check
                 // after enforcing the binary name width, otherwise two long
@@ -841,7 +844,7 @@ bool ASCII::Read(MDL & Mdl){
                             std::string sCheck (sID);
                             ToLowerInPlace(sCheck);
                             if(sCheck != "root" && sCheck != "null" && sCheck != "-1"){
-                                TruncateLongName3216(sID, "weight bone name", nLine);
+                                TruncateLongName3216(sID, "weight bone name", nLine, false);
                             }
 
                             // Resolve every active weight through the ASCII name table.
@@ -880,7 +883,7 @@ bool ASCII::Read(MDL & Mdl){
                         std::string sCheck(sID);
                         ToLowerInPlace(sCheck);
                         if(sCheck != "root" && sCheck != "null" && sCheck != "-1"){
-                            TruncateLongName3216(sID, "compactbonemap bone name", nLine);
+                            TruncateLongName3216(sID, "compactbonemap bone name", nLine, false);
                             sCheck = sID;
                             ToLowerInPlace(sCheck);
                         }
@@ -1322,7 +1325,7 @@ bool ASCII::Read(MDL & Mdl){
                             ReportMdl << "ASCII::Read(): Error at line " << nLine << "! " << "A node is without a name!\n";
                             throw mdlexception("Error reading node. No specified name.");
                         }
-                        TruncateLongName3216(sID, "ASCII node name", nLine);
+                        TruncateLongName3216(sID, "ASCII node name", nLine, false);
 
                         /// Because the names are read in the same order as the nodes, we get the Name Index just by counting how many nodes (and names)
                         /// we've read so far. Since the names must be unique, we could also do it by searching through the names, but that is potentially
@@ -1407,7 +1410,7 @@ bool ASCII::Read(MDL & Mdl){
                                 ToLowerInPlace(sParentCheck);
                                 if(sParentCheck == "null") node.Head.nParentIndex = -1;
                                 else{
-                                    TruncateLongName3216(sID, "parent node name", nLine);
+                                    TruncateLongName3216(sID, "parent node name", nLine, false);
                                     unsigned short nNameIndex = 0;
                                     /// if we found a name, loop through the name array to find our name index
                                     while(nNameIndex < Data.MH.Names.size()){
@@ -1438,7 +1441,7 @@ bool ASCII::Read(MDL & Mdl){
                                 ToLowerInPlace(sParentCheck);
                                 if(sParentCheck == "null") animnode.Head.nParentIndex = -1;
                                 else{
-                                    TruncateLongName3216(sID, "animation parent node name", nLine);
+                                    TruncateLongName3216(sID, "animation parent node name", nLine, false);
                                     unsigned short nNameIndex = 0;
                                     /// if we found a name, loop through the name array to find our name index
                                     while(nNameIndex < Data.MH.Names.size()){
@@ -2397,8 +2400,31 @@ bool ASCII::Read(MDL & Mdl){
                         if(DEBUG_LEVEL > 3) ReportMdl << "Reading " << sID << ".\n";
                         Node & node = Data.MH.ArrayOfNodes.at(nCurrentIndex);
 
-                        int nSavePos = nPosition; // Save position after the aabb token.
-                        if(ReadInt(nConvert)){
+                        const unsigned int nSavePos = nPosition; // Save position after the aabb token.
+                        std::string sFirstValue;
+                        const bool bHasInlineValue = ReadUntilText(sFirstValue, false);
+
+                        // Counted MDLedit ASCII has exactly one integer after the
+                        // keyword. Legacy NWMax ASCII places the first seven-value
+                        // AABB row on that same line, and its first coordinate can
+                        // itself look like an integer. Inspect the whole remainder
+                        // of the line before choosing a format, and do not probe a
+                        // floating-point coordinate with the throwing integer reader.
+                        std::size_t nRemainder = nPosition;
+                        while(nRemainder < sBuffer.size() && sBuffer[nRemainder] == 0x20) nRemainder++;
+                        const bool bAtLineEnd = nRemainder >= sBuffer.size() ||
+                                                sBuffer[nRemainder] == '#' ||
+                                                sBuffer[nRemainder] == 0x0D ||
+                                                sBuffer[nRemainder] == 0x0A ||
+                                                sBuffer[nRemainder] == 0x00;
+                        const bool bCountedFormat = ascii_compat::IsCountedAabbHeader(
+                            bHasInlineValue, sFirstValue, bAtLineEnd);
+
+                        nPosition = nSavePos;
+                        if(bCountedFormat){
+                            if(!ReadInt(nConvert)){
+                                throw mdlexception("aabb count is missing for node '" + Mdl.GetNodeName(node) + "'.");
+                            }
                             // New MDLedit ASCII writes an explicit AABB row count:
                             //   aabb <count>
                             //       <rows...>
@@ -2411,22 +2437,20 @@ bool ASCII::Read(MDL & Mdl){
                             SkipLine();
                         }
                         else{
-                            // Legacy ASCII did not carry a count and could put the first
-                            // row on the same line as the aabb token. Fall back to the
-                            // old face-count-derived length and preserve the inline row.
-                            nPosition = nSavePos;
+                            // The v1.0.104b reader did not read a count here. It used
+                            // (2 * face count - 1), float-probed the inline value, and
+                            // rewound when the first row started on the keyword line.
                             const std::size_t nFaceCount = node.Mesh.Faces.size();
-                            if(nFaceCount > (static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()) + 1u) / 2u){
+                            unsigned int nAabbAsciiCount = 0;
+                            if(!ascii_compat::InferLegacyAabbRowCount(nFaceCount, nAabbAsciiCount)){
                                 throw mdlexception("aabb inferred node count is too large for node '" + Mdl.GetNodeName(node) + "'.");
                             }
-                            const std::size_t nAabbAsciiCount = nFaceCount == 0u ? 0u : nFaceCount * 2u - 1u;
                             SetAsciiListCountSize(nDataMax, nAabbAsciiCount, sID);
                             node.Walkmesh.TempAabbNodes.clear();
                             node.Walkmesh.bPreserveAabbTree = false;
                             bAabb = true;
                             nDataCounter = 0;
-                            if(ReadFloat(fConvert)) nPosition = nSavePos; // The data starts on this line.
-                            else SkipLine(); // Data starts on the next line, or the list is empty.
+                            if(!bHasInlineValue) SkipLine(); // Data starts on the next line, or the list is empty.
                         }
                     }
                     else if(sID == "roomlinks" && nNode & NODE_AABB){
