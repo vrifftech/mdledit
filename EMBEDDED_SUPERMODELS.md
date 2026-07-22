@@ -46,6 +46,3 @@ The `metadata` directory contains:
 
 Use `node_path` or `relative_path` rather than `node_name` as the unique key. K2 `S_Male02` contains two nodes named `w_Longsword`, one under each hand.
 
-## Provenance
-
-The tables and compiled-in arrays were generated from the ten binary MDL files supplied for this change. SHA-256 hashes are recorded in the summary and node tables. The original binary models are not included in this repository.
