@@ -35,14 +35,3 @@ A neighboring binary remains authoritative so custom or modified supermodels con
 | K2 | `S_Female02` | `S_Female01` | 103 | 423 | 344 |
 | K2 | `S_Female03` | `S_Female02` | 101 | 525 | 345 |
 
-## Reusable tables
-
-The `metadata` directory contains:
-
-- `supermodel_summary.csv`: one row per game/supermodel.
-- `supermodel_nodes.csv`: every hierarchy node and supernode mapping.
-- `supermodel_k1_k2_comparison.csv`: path-based K1/K2 number comparison.
-- `supermodel_nodes.json`: nested machine-readable metadata.
-
-Use `node_path` or `relative_path` rather than `node_name` as the unique key. K2 `S_Male02` contains two nodes named `w_Longsword`, one under each hand.
-
