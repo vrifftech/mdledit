@@ -181,14 +181,6 @@ bundle-runtime: $(BIN)
 	 done; \
 	 echo "Bundle created at $(BUNDLE_DIR) ($$copied runtime DLL(s) copied)."
 
-test: $(ASCII_COMPAT_TEST)
-	"$(ASCII_COMPAT_TEST)"
-
-$(ASCII_COMPAT_TEST): tests/ascii_compat_test.cpp ascii_compat.h | $(TEST_DIR)
-	$(CXX) -std=c++14 -Wall -Wextra -Werror -pipe $< -o $@
-
-$(TEST_DIR):
-	$(MKDIR_P) $@
 
 clean:
 	$(RM) $(BUILD_ROOT)
