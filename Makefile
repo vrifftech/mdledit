@@ -221,7 +221,6 @@ help:
 	@echo "  make rebuild    Clean then build"
 	@echo "  make clean      Remove build output"
 	@echo "  make runtime-deps List DLL imports for the selected CONFIG"
-	@echo "  make test       Run parser compatibility regression tests"
 	@echo "  make print-vars Show selected tools and flags"
 	@echo "  make check-tools Verify compiler/resource compiler are on PATH"
 	@echo "Variables:"
