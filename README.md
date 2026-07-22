@@ -78,7 +78,6 @@ model still takes precedence, preserving support for custom supermodels.
 Otherwise MDLedit uses the destination game's embedded hierarchy/supernode
 metadata.
 
-See `EMBEDDED_SUPERMODELS.md` and the reusable CSV/JSON files in `metadata/`.
 
 ### Who do I talk to? ###
 
